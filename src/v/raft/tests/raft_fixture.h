@@ -92,6 +92,9 @@ struct raft_node_map {
       node_for(model::node_id) = 0;
 };
 
+using dispatch_callback_t
+  = ss::noncopyable_function<ss::future<>(model::node_id, msg_type)>;
+
 class in_memory_test_protocol : public consensus_client_protocol::impl {
 public:
     explicit in_memory_test_protocol(raft_node_map&, prefix_logger&);
@@ -129,7 +132,7 @@ public:
 
     channel& get_channel(model::node_id id);
 
-    void on_dispatch(ss::noncopyable_function<ss::future<>(msg_type)> f);
+    void on_dispatch(dispatch_callback_t f);
 
     ss::future<> stop();
 
@@ -138,8 +141,7 @@ private:
     ss::future<result<RespT>> dispatch(model::node_id, ReqT req);
     ss::gate _gate;
     absl::flat_hash_map<model::node_id, std::unique_ptr<channel>> _channels;
-    std::vector<ss::noncopyable_function<ss::future<>(msg_type)>>
-      _on_dispatch_handlers;
+    std::vector<dispatch_callback_t> _on_dispatch_handlers;
     raft_node_map& _nodes;
     prefix_logger& _logger;
 };
@@ -161,14 +163,16 @@ public:
       ss::sstring base_directory,
       raft_node_map& node_map,
       ss::sharded<features::feature_table>& feature_table,
-      leader_update_clb_t leader_update_clb);
+      leader_update_clb_t leader_update_clb,
+      bool enable_longest_log_detection);
 
     raft_node_instance(
       model::node_id id,
       model::revision_id revision,
       raft_node_map& node_map,
       ss::sharded<features::feature_table>& feature_table,
-      leader_update_clb_t leader_update_clb);
+      leader_update_clb_t leader_update_clb,
+      bool enable_longest_log_detection);
 
     raft_node_instance(const raft_node_instance&) = delete;
     raft_node_instance(raft_node_instance&&) noexcept = delete;
@@ -227,7 +231,7 @@ public:
     ///
     //// \param f The callback function to be invoked when a message is
     /// dispatched.
-    void on_dispatch(ss::noncopyable_function<ss::future<>(msg_type)> f);
+    void on_dispatch(dispatch_callback_t);
 
 private:
     model::node_id _id;
@@ -246,6 +250,7 @@ private:
     leader_update_clb_t _leader_clb;
     ss::lw_shared_ptr<consensus> _raft;
     bool started = false;
+    bool _enable_longest_log_detection;
 };
 
 class raft_fixture
@@ -460,6 +465,10 @@ public:
     ss::future<> reset_background_flushing() const;
     ss::future<> set_write_caching(bool) const;
 
+    void set_enable_longest_log_detection(bool value) {
+        _enable_longest_log_detection = value;
+    }
+
 private:
     void validate_leaders();
 
@@ -469,6 +478,7 @@ private:
     absl::flat_hash_map<model::node_id, leadership_status> _leaders_view;
 
     ss::sharded<features::feature_table> _features;
+    bool _enable_longest_log_detection = true;
 };
 
 std::ostream& operator<<(std::ostream& o, msg_type type);

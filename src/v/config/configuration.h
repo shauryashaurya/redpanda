@@ -10,6 +10,8 @@
  */
 
 #pragma once
+
+#include "cloud_storage_clients/types.h"
 #include "config/bounded_property.h"
 #include "config/broker_endpoint.h"
 #include "config/client_group_byte_rate_quota.h"
@@ -24,8 +26,8 @@
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "model/timestamp.h"
-#include "net/unresolved_address.h"
 #include "pandaproxy/schema_registry/schema_id_validation.h"
+#include "utils/unresolved_address.h"
 
 #include <seastar/core/sstring.hh>
 #include <seastar/net/inet_address.hh>
@@ -81,6 +83,8 @@ struct configuration final : public config_store {
     property<std::chrono::milliseconds>
       data_transforms_logging_flush_interval_ms;
     property<size_t> data_transforms_logging_line_max_bytes;
+    bounded_property<size_t> data_transforms_read_buffer_memory_percentage;
+    bounded_property<size_t> data_transforms_write_buffer_memory_percentage;
 
     // Controller
     bounded_property<std::optional<std::size_t>> topic_memory_per_partition;
@@ -107,6 +111,7 @@ struct configuration final : public config_store {
     property<std::optional<size_t>> raft_replica_max_pending_flush_bytes;
     property<std::chrono::milliseconds> raft_flush_timer_interval_ms;
     property<std::chrono::milliseconds> raft_replica_max_flush_delay_ms;
+    property<bool> raft_enable_longest_log_detection;
     // Kafka
     property<bool> enable_usage;
     bounded_property<size_t> usage_num_windows;
@@ -201,7 +206,7 @@ struct configuration final : public config_store {
     property<bool> raft_recovery_throttle_disable_dynamic_mode;
     property<std::optional<uint32_t>> raft_smp_max_non_local_requests;
     property<uint32_t> raft_max_concurrent_append_requests_per_follower;
-    enum_property<model::write_caching_mode> write_caching;
+    enum_property<model::write_caching_mode> write_caching_default;
 
     property<size_t> reclaim_min_size;
     property<size_t> reclaim_max_size;
@@ -237,6 +242,7 @@ struct configuration final : public config_store {
       storage_ignore_timestamps_in_future_sec;
     property<bool> storage_ignore_cstore_hints;
     bounded_property<int16_t> storage_reserve_min_segments;
+    property<std::optional<uint32_t>> debug_load_slice_warning_depth;
 
     deprecated_property tx_registry_log_capacity;
     property<int16_t> id_allocator_log_capacity;
@@ -303,6 +309,7 @@ struct configuration final : public config_store {
     property<std::optional<ss::sstring>> cloud_storage_region;
     property<std::optional<ss::sstring>> cloud_storage_bucket;
     property<std::optional<ss::sstring>> cloud_storage_api_endpoint;
+    enum_property<cloud_storage_clients::s3_url_style> cloud_storage_url_style;
     enum_property<model::cloud_credentials_source>
       cloud_storage_credentials_source;
     property<std::optional<ss::sstring>>
@@ -390,6 +397,8 @@ struct configuration final : public config_store {
     property<std::optional<ss::sstring>> cloud_storage_azure_shared_key;
     property<std::optional<ss::sstring>> cloud_storage_azure_adls_endpoint;
     property<std::optional<uint16_t>> cloud_storage_azure_adls_port;
+    property<std::optional<bool>>
+      cloud_storage_azure_hierarchical_namespace_enabled;
 
     // Archival upload controller
     property<std::chrono::milliseconds>
@@ -425,6 +434,7 @@ struct configuration final : public config_store {
     bounded_property<std::optional<double>, numeric_bounds>
       cloud_storage_cache_size_percent;
     property<uint32_t> cloud_storage_cache_max_objects;
+    property<uint32_t> cloud_storage_cache_trim_carryover_bytes;
     property<std::chrono::milliseconds> cloud_storage_cache_check_interval_ms;
     property<std::optional<uint32_t>>
       cloud_storage_max_segment_readers_per_shard;
@@ -458,6 +468,7 @@ struct configuration final : public config_store {
     property<size_t> kafka_qdc_max_depth;
     property<std::chrono::milliseconds> kafka_qdc_depth_update_ms;
     property<size_t> zstd_decompress_workspace_bytes;
+    property<bool> lz4_decompress_reusable_buffers_disabled;
     deprecated_property full_raft_configuration_recovery_pattern;
     property<bool> enable_auto_rebalance_on_node_add;
 
@@ -490,6 +501,7 @@ struct configuration final : public config_store {
     bounded_property<size_t> storage_space_alert_free_threshold_bytes;
     bounded_property<size_t> storage_min_free_bytes;
     property<bool> storage_strict_data_init;
+    property<std::chrono::milliseconds> alive_timeout_ms;
 
     // memory related settings
     property<bool> memory_abort_on_alloc_failure;

@@ -79,6 +79,7 @@ TEST_P_CORO(monitor_test_fixture, replication_monitor_wait) {
 }
 
 TEST_P_CORO(monitor_test_fixture, truncation_detection) {
+    set_enable_longest_log_detection(false);
     co_await create_simple_group(3);
     auto leader = co_await wait_for_leader(10s);
     co_await set_write_caching(write_caching());
@@ -90,7 +91,7 @@ TEST_P_CORO(monitor_test_fixture, truncation_detection) {
 
     for (auto& [id, node] : nodes()) {
         if (id == leader) {
-            node->on_dispatch([](raft::msg_type t) {
+            node->on_dispatch([](model::node_id, raft::msg_type t) {
                 if (
                   t == raft::msg_type::append_entries
                   || t == raft::msg_type::vote) {

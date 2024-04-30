@@ -882,6 +882,7 @@ class HighThroughputTest(PreallocNodesMixin, RedpandaCloudTest):
                 f"Low throughput while preparing for the test: {_throughput} MB/s"
             ) from None
 
+    @ignore
     @cluster(num_nodes=5, log_allow_list=RESTART_LOG_ALLOW_LIST)
     def test_decommission_and_add(self):
         """Decommission and add while under load.
@@ -1196,6 +1197,7 @@ class HighThroughputTest(PreallocNodesMixin, RedpandaCloudTest):
         # kubectl delete pvc shadow-index-cache-rp-clkd0n22nfn1jf7vd9t0-4 -n=redpanda
         self.redpanda.kubectl.cmd(['delete', 'pvc', pvc_name, '-n=redpanda'])
 
+    @ignore
     @cluster(num_nodes=5, log_allow_list=RESTART_LOG_ALLOW_LIST)
     def test_add_and_decommission(self):
         """Add a new node and then decommission it while under load.
@@ -1273,6 +1275,18 @@ class HighThroughputTest(PreallocNodesMixin, RedpandaCloudTest):
         )
         self._wait_cluster_ready_replicas(cluster_name, orig_replicas)
 
+    # This test is ignored because it is impractical at this time to write
+    # enough data to the cluster to trigger local storage eviction and read
+    # enough to trigger cache eviction that would lead to thrashing.
+    #
+    # A potential solution is to re-configure the cluster to have very small
+    # local retention and cache but it is blocked on:
+    # https://github.com/redpanda-data/core-internal/issues/1181
+    #
+    # Another potential solution is to allow per-topic overrides for
+    # strict/non-strict local storage retention and a cache quota so that
+    # we wouldn't have to reconfigure the entire cluster.
+    @ignore
     @cluster(num_nodes=3, log_allow_list=NOS3_LOG_ALLOW_LIST)
     def test_cloud_cache_thrash(self):
         """
@@ -1285,6 +1299,11 @@ class HighThroughputTest(PreallocNodesMixin, RedpandaCloudTest):
         segment_size = 16 * MiB  # Min segment size across all tiers
         self.adjust_topic_segment_properties(
             segment_bytes=segment_size, retention_local_bytes=segment_size)
+
+        initial_cloud_storage_cache_op_put = self.redpanda.metric_sum(
+            "redpanda_cloud_storage_cache_op_put_total",
+            metrics_endpoint=MetricsEndpoint.PUBLIC_METRICS)
+        self.logger.debug(f"{initial_cloud_storage_cache_op_put=}")
 
         with traffic_generator(self.test_context, self.redpanda,
                                self._advertised_max_ingress,
@@ -1315,6 +1334,20 @@ class HighThroughputTest(PreallocNodesMixin, RedpandaCloudTest):
                 self.logger.info(f"Stopping thrashing consumers")
                 consumer.stop()
                 consumer.wait(timeout_sec=600)
+
+            final_cloud_storage_cache_op_put = self.redpanda.metric_sum(
+                "redpanda_cloud_storage_cache_op_put_total",
+                metrics_endpoint=MetricsEndpoint.PUBLIC_METRICS)
+            self.logger.debug(f"{final_cloud_storage_cache_op_put=}")
+
+            # Make sure we did touch the cache at least once for each partition.
+            #
+            # The check is not ideal due to the cache metrics being per cluster
+            # rather than per topic or consumer.
+            expected_misses = self.topics[0].partition_count
+            actual_misses = final_cloud_storage_cache_op_put - initial_cloud_storage_cache_op_put
+            assert actual_misses >= expected_misses, "Expected at least {} cache misses, got {}".format(
+                expected_misses, actual_misses)
 
         self.redpanda.assert_cluster_is_reusable()
 
@@ -1439,7 +1472,6 @@ class HighThroughputTest(PreallocNodesMixin, RedpandaCloudTest):
     # The testcase occasionally fails on various parts:
     # - toing on `_consume_from_offset(self.topic, 1, p_id, "newest", 30)`
     # - failing to ensure all manifests are in the cloud in `stop_and_scrub_object_storage`
-    @ignore
     @cluster(num_nodes=7, log_allow_list=RESTART_LOG_ALLOW_LIST)
     def test_consume_miss_cache(self):
         # create default topics
@@ -1496,14 +1528,11 @@ class HighThroughputTest(PreallocNodesMixin, RedpandaCloudTest):
         partition_size_check: list[MetricCheck] = []
         partition_size_metric = "vectorized_storage_log_partition_size"
 
-        # https://github.com/redpanda-data/cloudv2/issues/10685#issuecomment-1893009486
-        raise NotImplementedError('partition_size_check not implemented')
-
-        for node in self.redpanda.nodes:
+        for pod in self.redpanda.pods:
             partition_size_check.append(
                 MetricCheck(self.logger,
                             self.redpanda,
-                            node,
+                            pod,
                             partition_size_metric,
                             reduce=sum))
 
@@ -1596,11 +1625,11 @@ class HighThroughputTest(PreallocNodesMixin, RedpandaCloudTest):
             "vectorized_storage_log_cached_read_bytes_total",
         ]
 
-        for node in self.redpanda.nodes:
+        for pod in self.redpanda.pods:
             check_batch_cache_reads.append(
                 MetricCheck(self.logger,
                             self.redpanda,
-                            node,
+                            pod,
                             cache_metrics,
                             reduce=sum))
 

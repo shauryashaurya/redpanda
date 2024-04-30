@@ -11,9 +11,9 @@
 
 #pragma once
 
+#include "ffi.h"
 #include "pandaproxy/schema_registry/types.h"
-#include "wasm/ffi.h"
-#include "wasm/schema_registry.h"
+#include "schema_registry.h"
 
 namespace wasm {
 
@@ -34,6 +34,7 @@ public:
     static constexpr std::string_view name = "redpanda_schema_registry";
 
     // Start ABI exports
+    void check_abi_version_0();
 
     ss::future<int32_t> get_schema_definition_len(
       pandaproxy::schema_registry::schema_id, uint32_t*);

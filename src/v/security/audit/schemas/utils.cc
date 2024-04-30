@@ -12,6 +12,7 @@
 
 #include "kafka/protocol/schemata/add_offsets_to_txn_request.h"
 #include "kafka/protocol/schemata/add_partitions_to_txn_request.h"
+#include "kafka/protocol/schemata/alter_client_quotas_request.h"
 #include "kafka/protocol/schemata/alter_configs_request.h"
 #include "kafka/protocol/schemata/alter_partition_reassignments_request.h"
 #include "kafka/protocol/schemata/create_acls_request.h"
@@ -22,6 +23,7 @@
 #include "kafka/protocol/schemata/delete_records_request.h"
 #include "kafka/protocol/schemata/delete_topics_request.h"
 #include "kafka/protocol/schemata/describe_acls_request.h"
+#include "kafka/protocol/schemata/describe_client_quotas_request.h"
 #include "kafka/protocol/schemata/describe_configs_request.h"
 #include "kafka/protocol/schemata/describe_groups_request.h"
 #include "kafka/protocol/schemata/describe_log_dirs_request.h"
@@ -49,7 +51,6 @@
 #include "kafka/protocol/schemata/txn_offset_commit_request.h"
 #include "kafka/protocol/types.h"
 #include "model/metadata.h"
-#include "net/unresolved_address.h"
 #include "security/acl.h"
 #include "security/audit/schemas/application_activity.h"
 #include "security/audit/schemas/iam.h"
@@ -62,6 +63,7 @@
 #include "security/oidc_authenticator.h"
 #include "security/request_auth.h"
 #include "security/scram_authenticator.h"
+#include "utils/unresolved_address.h"
 
 #include <seastar/core/lowres_clock.hh>
 #include <seastar/core/smp.hh>
@@ -419,6 +421,8 @@ event_type kafka_api_to_event_type(kafka::api_key key) {
         return event_type::management;
     case kafka::offset_delete_api::key:
         return event_type::management;
+    case kafka::alter_client_quotas_api::key:
+        return event_type::management;
     case kafka::add_partitions_to_txn_api::key:
         return event_type::produce;
     case kafka::end_txn_api::key:
@@ -468,6 +472,8 @@ event_type kafka_api_to_event_type(kafka::api_key key) {
     case kafka::describe_transactions_api::key:
         return event_type::describe;
     case kafka::list_transactions_api::key:
+        return event_type::describe;
+    case kafka::describe_client_quotas_api::key:
         return event_type::describe;
     case kafka::heartbeat_api::key:
         return event_type::heartbeat;

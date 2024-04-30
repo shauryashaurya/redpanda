@@ -8,33 +8,33 @@
  * the Business Source License, use of this software will be governed
  * by the Apache License, Version 2.0
  */
-#include "wasm/wasmtime.h"
+#include "wasmtime.h"
 
+#include "allocator.h"
 #include "base/vassert.h"
+#include "engine_probe.h"
+#include "ffi.h"
+#include "logger.h"
 #include "metrics/metrics.h"
 #include "model/record.h"
-#include "model/record_batch_reader.h"
 #include "model/timestamp.h"
 #include "model/transform.h"
 #include "prometheus/prometheus_sanitize.h"
+#include "schema_registry_module.h"
 #include "ssx/thread_worker.h"
 #include "storage/parser_utils.h"
+#include "transform_module.h"
 #include "utils/human.h"
 #include "utils/type_traits.h"
-#include "wasm/allocator.h"
+#include "wasi.h"
 #include "wasm/api.h"
-#include "wasm/engine_probe.h"
 #include "wasm/errc.h"
-#include "wasm/ffi.h"
-#include "wasm/logger.h"
 #include "wasm/parser/parser.h"
-#include "wasm/schema_registry_module.h"
-#include "wasm/transform_module.h"
 #include "wasm/transform_probe.h"
-#include "wasm/wasi.h"
 
 #include <seastar/core/align.hh>
 #include <seastar/core/future.hh>
+#include <seastar/core/internal/cpu_profiler.hh>
 #include <seastar/core/posix.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/shared_ptr.hh>
@@ -49,17 +49,14 @@
 
 #include <absl/algorithm/container.h>
 #include <absl/strings/escaping.h>
-#include <wasmtime/store.h>
 
 #include <alloca.h>
-#include <cmath>
 #include <csignal>
 #include <exception>
 #include <limits>
 #include <memory>
 #include <optional>
 #include <pthread.h>
-#include <span>
 #include <unistd.h>
 #include <utility>
 #include <variant>
@@ -155,10 +152,10 @@ public:
 
     ss::future<> stop() override;
 
-    ss::future<ss::shared_ptr<factory>>
-    make_factory(model::transform_metadata meta, iobuf buf) override;
+    ss::future<ss::shared_ptr<factory>> make_factory(
+      model::transform_metadata meta, model::wasm_binary_iobuf buf) override;
 
-    ss::future<> validate(iobuf buf) override;
+    ss::future<> validate(model::wasm_binary_iobuf buf) override;
 
     wasm_engine_t* engine() const;
 
@@ -603,7 +600,13 @@ private:
         // Poll the call future to completion, yielding to the scheduler when
         // the future yields.
         auto start = ss::steady_clock_type::now();
+        // Disable profiling backtraces inside the VM - at the time of writing
+        // backtraces lead to segfaults causing deadlock in Seastar's signal
+        // handlers.
+        auto _ = ss::internal::scoped_disable_profile_temporarily();
         while (!wasmtime_call_future_poll(fut.get())) {
+            // Re-enable stacktraces before we yield control to the scheduler.
+            ss::internal::profiler_drop_stacktraces(false);
             auto end = ss::steady_clock_type::now();
             _probe.increment_cpu_time(end - start);
             if (_pending_host_function) {
@@ -613,6 +616,8 @@ private:
                 co_await ss::coroutine::maybe_yield();
             }
             start = ss::steady_clock_type::now();
+            // Disable stacktraces as we enter back into Wasmtime
+            ss::internal::profiler_drop_stacktraces(true);
         }
         auto end = ss::steady_clock_type::now();
         _probe.increment_cpu_time(end - start);
@@ -1281,6 +1286,7 @@ void register_sr_module(
     // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
 #define REG_HOST_FN(name)                                                      \
     host_function<&schema_registry_module::name>::reg(linker, #name, ssc)
+    REG_HOST_FN(check_abi_version_0);
     REG_HOST_FN(get_schema_definition);
     REG_HOST_FN(get_schema_definition_len);
     REG_HOST_FN(get_subject_schema);
@@ -1454,8 +1460,8 @@ ss::future<> wasmtime_runtime::stop() {
     co_await _stack_allocator.stop();
 }
 
-ss::future<ss::shared_ptr<factory>>
-wasmtime_runtime::make_factory(model::transform_metadata meta, iobuf buf) {
+ss::future<ss::shared_ptr<factory>> wasmtime_runtime::make_factory(
+  model::transform_metadata meta, model::wasm_binary_iobuf buf) {
     auto preinitialized = ss::make_lw_shared<preinitialized_instance>();
 
     // Enable strict stack checking only if tracking is enabled.
@@ -1468,11 +1474,11 @@ wasmtime_runtime::make_factory(model::transform_metadata meta, iobuf buf) {
                      : nullptr,
     };
     size_t memory_usage_size = co_await _alien_thread.submit(
-      [this, &meta, &buf, &preinitialized, &ssc] {
+      [this, &meta, buf = buf().get(), &preinitialized, &ssc] {
           vlog(wasm_log.debug, "compiling wasm module {}", meta.name);
           // This can be a large contiguous allocation, however it happens
           // on an alien thread so it bypasses the seastar allocator.
-          bytes b = iobuf_to_bytes(buf);
+          bytes b = iobuf_to_bytes(*buf);
           wasmtime_module_t* user_module_ptr = nullptr;
           handle<wasmtime_error_t, wasmtime_error_delete> error{
             wasmtime_module_new(
@@ -1498,7 +1504,12 @@ wasmtime_runtime::make_factory(model::transform_metadata meta, iobuf buf) {
           check_error(error.get());
 
           size_t start = 0, end = 0;
-          wasmtime_module_image_range(user_module.get(), &start, &end);
+          // NOLINTBEGIN(*-reinterpret-*)
+          wasmtime_module_image_range(
+            user_module.get(),
+            reinterpret_cast<void**>(&start),
+            reinterpret_cast<void**>(&end));
+          // NOLINTEND(*-reinterpret-*)
           return end - start;
       });
     _total_executable_memory += memory_usage_size;
@@ -1603,6 +1614,7 @@ wasmtime_error_t* wasmtime_runtime::allocate_heap_memory(
         size_t used_memory;
         wasm::heap_allocator* allocator;
     };
+    // NOLINTNEXTLINE(cppcoreguidelines-owning-memory)
     memory_ret->env = new linear_memory{
       .underlying = *std::move(memory),
       .used_memory = req.minimum,
@@ -1664,10 +1676,27 @@ bool is_transform_abi_check_fn(const parser::module_import& mod_import) {
     });
 }
 
-ss::future<> wasmtime_runtime::validate(iobuf buf) {
+// Schema registry is optional, so only check that the function is not using an
+// unsupported version.
+bool is_invalid_sr_abi_check_fn(const parser::module_import& mod_import) {
+    if (mod_import.module_name != schema_registry_module::name) {
+        return false;
+    }
+    if (!mod_import.item_name.starts_with("check_abi_version_")) {
+        return false;
+    }
+    const auto void_fn = parser::import_description{
+      parser::declaration::function{}};
+    if (mod_import.description != void_fn) {
+        return true;
+    }
+    return mod_import.item_name != "check_abi_version_0";
+}
+
+ss::future<> wasmtime_runtime::validate(model::wasm_binary_iobuf buf) {
     parser::module_declarations decls;
     try {
-        decls = co_await parser::extract_declarations(std::move(buf));
+        decls = co_await parser::extract_declarations(std::move(*buf()));
     } catch (const parser::module_too_large_exception& ex) {
         vlog(wasm_log.warn, "invalid module (too large): {}", ex);
         throw wasm_exception(ex.what(), errc::invalid_module);
@@ -1709,7 +1738,12 @@ ss::future<> wasmtime_runtime::validate(iobuf buf) {
     for (const auto& module_import : decls.imports) {
         if (is_transform_abi_check_fn(module_import)) {
             has_abi_check_fn = true;
-            break;
+        }
+        if (is_invalid_sr_abi_check_fn(module_import)) {
+            vlog(wasm_log.warn, "invalid module: unsupported sr abi function");
+            throw wasm_exception(
+              "invalid module: unsupported schema registry ABI",
+              errc::invalid_module_unsupported_sr);
         }
         co_await ss::coroutine::maybe_yield();
     }

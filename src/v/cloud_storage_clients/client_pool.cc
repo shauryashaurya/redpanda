@@ -19,9 +19,12 @@
 #include <seastar/core/smp.hh>
 
 #include <algorithm>
+#include <chrono>
 #include <optional>
 #include <random>
 #include <utility>
+
+using namespace std::chrono_literals;
 
 namespace {
 constexpr auto self_configure_attempts = 3;
@@ -118,7 +121,7 @@ client_pool::do_client_self_configure(http_client_ptr client) {
 
             if (result.error() == cloud_storage_clients::error_outcome::retry) {
                 vlog(
-                  pool_log.error,
+                  pool_log.warn,
                   "Self configuration attempt {}/{} failed with retryable "
                   "error. "
                   "Will retry in {}s.",

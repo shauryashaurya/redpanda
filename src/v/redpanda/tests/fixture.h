@@ -41,7 +41,6 @@
 #include "model/namespace.h"
 #include "model/timeout_clock.h"
 #include "net/dns.h"
-#include "net/unresolved_address.h"
 #include "pandaproxy/rest/configuration.h"
 #include "pandaproxy/schema_registry/configuration.h"
 #include "redpanda/application.h"
@@ -54,6 +53,7 @@
 #include "test_utils/async.h"
 #include "test_utils/fixture.h"
 #include "test_utils/logs.h"
+#include "utils/unresolved_address.h"
 
 #include <seastar/core/future.hh>
 #include <seastar/core/loop.hh>
@@ -282,6 +282,7 @@ public:
         s3conf.access_key = cloud_roles::public_key_str("acess-key");
         s3conf.secret_key = cloud_roles::private_key_str("secret-key");
         s3conf.region = cloud_roles::aws_region_name("us-east-1");
+        s3conf.url_style = cloud_storage_clients::s3_url_style::virtual_host;
         s3conf.server_addr = server_addr;
         return s3conf;
     }
@@ -821,7 +822,7 @@ public:
           .key = kafka::fetch_handler::api::key,
           .version = kafka::fetch_handler::max_supported};
 
-        return make_request_context(request, header);
+        return make_request_context(std::move(request), header);
     }
 
     iobuf rand_iobuf(size_t data_size) const {

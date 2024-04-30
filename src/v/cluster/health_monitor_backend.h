@@ -31,8 +31,8 @@
 namespace cluster {
 
 using health_node_cb_t = ss::noncopyable_function<void(
-  node_health_report const&,
-  std::optional<std::reference_wrapper<const node_health_report>>)>;
+  const node_health_report&,
+  std::optional<ss::lw_shared_ptr<const node_health_report>>)>;
 
 /**
  * Health monitor backend is responsible for collecting cluster health status
@@ -68,8 +68,12 @@ public:
     ss::future<storage::disk_space_alert> get_cluster_disk_health(
       force_refresh refresh, model::timeout_clock::time_point deadline);
 
-    ss::future<result<node_health_report>>
-      collect_current_node_health(node_report_filter);
+    ss::future<result<node_health_report>> collect_current_node_health();
+    /**
+     * Return cached version of current node health of collects it if it is not
+     * available in cache.
+     */
+    ss::future<result<node_health_report>> get_current_node_health();
 
     cluster::notification_id_type register_node_callback(health_node_cb_t cb);
     void unregister_node_callback(cluster::notification_id_type id);
@@ -110,8 +114,8 @@ private:
     };
 
     using status_cache_t = absl::node_hash_map<model::node_id, reply_status>;
-    using report_cache_t
-      = absl::node_hash_map<model::node_id, node_health_report>;
+    using nhr_ptr = ss::lw_shared_ptr<const node_health_report>;
+    using report_cache_t = absl::node_hash_map<model::node_id, nhr_ptr>;
 
     void tick();
     ss::future<std::error_code> collect_cluster_health();
@@ -123,11 +127,10 @@ private:
 
     cluster_health_report build_cluster_report(const cluster_report_filter&);
 
-    std::optional<node_health_report>
+    std::optional<node_health_report_ptr>
     build_node_report(model::node_id, const node_report_filter&);
 
-    ss::future<chunked_vector<topic_status>>
-      collect_topic_status(partitions_filter);
+    ss::future<chunked_vector<topic_status>> collect_topic_status();
 
     result<node_health_report>
       process_node_reply(model::node_id, result<get_node_health_reply>);
@@ -191,6 +194,8 @@ private:
     std::vector<std::pair<cluster::notification_id_type, health_node_cb_t>>
       _node_callbacks;
     cluster::notification_id_type _next_callback_id{0};
+
+    mutex _report_collection_mutex{"health_report_collection"};
 
     friend struct health_report_accessor;
 };

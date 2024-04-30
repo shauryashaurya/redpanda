@@ -32,6 +32,7 @@
 #include "cluster/feature_manager.h"
 #include "cluster/fwd.h"
 #include "cluster/health_manager.h"
+#include "cluster/health_monitor_backend.h"
 #include "cluster/health_monitor_frontend.h"
 #include "cluster/logger.h"
 #include "cluster/members_backend.h"
@@ -76,6 +77,8 @@
 #include <seastar/core/smp.hh>
 #include <seastar/core/thread.hh>
 #include <seastar/util/later.hh>
+
+#include <chrono>
 
 namespace cluster {
 
@@ -196,7 +199,8 @@ ss::future<> controller::start(
   ss::shared_ptr<cluster::cloud_metadata::producer_id_recovery_manager>
     producer_id_recovery,
   ss::shared_ptr<cluster::cloud_metadata::offsets_recovery_requestor>
-    offsets_recovery) {
+    offsets_recovery,
+  std::chrono::milliseconds application_start_time) {
     auto initial_raft0_brokers = discovery.founding_brokers();
     std::vector<model::node_id> seed_nodes;
     seed_nodes.reserve(initial_raft0_brokers.size());
@@ -218,7 +222,7 @@ ss::future<> controller::start(
       .then([this] { return _partition_leaders.start(std::ref(_tp_state)); })
       .then(
         [this] { return _drain_manager.start(std::ref(_partition_manager)); })
-      .then([this] {
+      .then([this, application_start_time] {
           return _members_manager.start_single(
             _raft0,
             std::ref(_stm),
@@ -229,7 +233,8 @@ ss::future<> controller::start(
             std::ref(_storage),
             std::ref(_drain_manager),
             std::ref(_partition_balancer_state),
-            std::ref(_as));
+            std::ref(_as),
+            application_start_time);
       })
       .then([this] {
           return _feature_backend.start_single(
@@ -564,6 +569,8 @@ ss::future<> controller::start(
             _raft0->self().id(),
             config::shard_local_cfg().internal_topic_replication_factor(),
             config::shard_local_cfg().health_manager_tick_interval(),
+            config::shard_local_cfg()
+              .partition_autobalancing_concurrent_moves.bind(),
             std::ref(_tp_state),
             std::ref(_tp_frontend),
             std::ref(_partition_allocator),
@@ -609,7 +616,14 @@ ss::future<> controller::start(
             _raft0);
           return _leader_balancer->start();
       })
-      .then([this] { return _hm_frontend.start(std::ref(_hm_backend)); })
+      .then([this] {
+          return _hm_frontend.start(
+            std::ref(_hm_backend),
+            std::ref(_node_status_table),
+            ss::sharded_parameter([]() {
+                return config::shard_local_cfg().alive_timeout_ms.bind();
+            }));
+      })
       .then([this] {
           return _hm_frontend.invoke_on_all(&health_monitor_frontend::start);
       })
@@ -632,6 +646,7 @@ ss::future<> controller::start(
             std::ref(_config_frontend),
             std::ref(_feature_table),
             std::ref(_roles),
+            std::addressof(_plugin_table),
             std::ref(_as));
       })
       .then([this] {

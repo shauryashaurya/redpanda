@@ -40,7 +40,7 @@ set(Seastar_API_LEVEL 6 CACHE STRING "" FORCE)
 set(Seastar_CXX_FLAGS -Wno-error)
 fetch_dep(seastar
   REPO https://github.com/redpanda-data/seastar.git
-  TAG v23.3.x
+  TAG v24.1.x
   PATCH_COMMAND sed -i "s/add_subdirectory (tests/# add_subdirectory (tests/g" CMakeLists.txt)
 
 fetch_dep(avro
@@ -115,7 +115,7 @@ list(APPEND WASMTIME_USER_CARGO_BUILD_OPTIONS --features=wat)
 FetchContent_Declare(
   wasmtime
   GIT_REPOSITORY https://github.com/bytecodealliance/wasmtime
-  GIT_TAG v16.0.0
+  GIT_TAG v20.0.0
   GIT_PROGRESS TRUE
   USES_TERMINAL_DOWNLOAD TRUE
   OVERRIDE_FIND_PACKAGE

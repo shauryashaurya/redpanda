@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "container/fragmented_vector.h"
 #include "kafka/client/assignment_plans.h"
 #include "kafka/client/broker.h"
 #include "kafka/client/brokers.h"
@@ -26,9 +27,9 @@
 #include "kafka/protocol/fetch.h"
 #include "kafka/protocol/list_offsets.h"
 #include "kafka/types.h"
-#include "net/unresolved_address.h"
 #include "ssx/semaphore.h"
 #include "utils/retry.h"
+#include "utils/unresolved_address.h"
 
 #include <seastar/core/condition-variable.hh>
 
@@ -138,9 +139,9 @@ public:
     ss::future<> subscribe_consumer(
       const group_id& group_id,
       const member_id& member_id,
-      std::vector<model::topic> topics);
+      chunked_vector<model::topic> topics);
 
-    ss::future<std::vector<model::topic>>
+    ss::future<chunked_vector<model::topic>>
     consumer_topics(const group_id& g_id, const member_id& m_id);
 
     ss::future<assignment>

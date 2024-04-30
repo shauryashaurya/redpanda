@@ -48,6 +48,7 @@
 #include "config/configuration.h"
 #include "config/endpoint_tls_config.h"
 #include "container/fragmented_vector.h"
+#include "container/lw_shared_container.h"
 #include "features/feature_table.h"
 #include "finjector/hbadger.h"
 #include "finjector/stress_fiber.h"
@@ -62,7 +63,6 @@
 #include "model/timeout_clock.h"
 #include "net/dns.h"
 #include "net/tls_certificate_probe.h"
-#include "net/unresolved_address.h"
 #include "pandaproxy/rest/api.h"
 #include "pandaproxy/schema_registry/api.h"
 #include "pandaproxy/schema_registry/schema_id_validation.h"
@@ -91,6 +91,7 @@
 #include "strings/string_switch.h"
 #include "strings/utf8.h"
 #include "transform/api.h"
+#include "utils/unresolved_address.h"
 #include "wasm/errc.h"
 
 #include <seastar/core/coroutine.hh>
@@ -147,7 +148,6 @@ using namespace std::chrono_literals;
 
 using admin::apply_validator;
 using admin::get_boolean_query_param;
-using admin::lw_shared_container;
 
 ss::logger adminlog{"admin_api_server"};
 
@@ -914,55 +914,46 @@ get_brokers(cluster::controller* const controller) {
               }
               b.membership_status = fmt::format(
                 "{}", nm.state.get_membership_state());
+              b.is_alive = controller->get_health_monitor().local().is_alive(id)
+                           == cluster::alive::yes;
 
               // These fields are defaults that will be overwritten with
               // data from the health report.
-              b.is_alive = true;
               b.maintenance_status = fill_maintenance_status(nm.state);
               b.internal_rpc_address = nm.broker.rpc_address().host();
               b.internal_rpc_port = nm.broker.rpc_address().port();
+              b.in_fips_mode = nm.broker.properties().in_fips_mode;
 
               broker_map[id] = b;
           }
 
           // Enrich the broker information with data from the health report.
-          for (auto& ns : h_report.value().node_states) {
-              auto it = broker_map.find(ns.id);
+          for (auto& node_report : h_report.value().node_reports) {
+              auto it = broker_map.find(node_report->id);
               if (it == broker_map.end()) {
                   continue;
               }
 
-              it->second.is_alive = static_cast<bool>(ns.is_alive);
+              it->second.version = node_report->local_state.redpanda_version;
+              it->second.recovery_mode_enabled
+                = node_report->local_state.recovery_mode_enabled;
+              auto nm = members_table.get_node_metadata_ref(node_report->id);
+              if (nm && node_report->drain_status) {
+                  it->second.maintenance_status = fill_maintenance_status(
+                    nm.value().get().state, node_report->drain_status.value());
+              }
 
-              auto r_it = std::find_if(
-                h_report.value().node_reports.begin(),
-                h_report.value().node_reports.end(),
-                [id = ns.id](const cluster::node_health_report& nhr) {
-                    return nhr.id == id;
-                });
-
-              if (r_it != h_report.value().node_reports.end()) {
-                  it->second.version = r_it->local_state.redpanda_version;
-                  it->second.recovery_mode_enabled
-                    = r_it->local_state.recovery_mode_enabled;
-                  auto nm = members_table.get_node_metadata_ref(r_it->id);
-                  if (nm && r_it->drain_status) {
-                      it->second.maintenance_status = fill_maintenance_status(
-                        nm.value().get().state, r_it->drain_status.value());
-                  }
-
-                  auto add_disk = [&ds_list = it->second.disk_space](
-                                    const storage::disk& ds) {
-                      ss::httpd::broker_json::disk_space_info dsi;
-                      dsi.path = ds.path;
-                      dsi.free = ds.free;
-                      dsi.total = ds.total;
-                      ds_list.push(dsi);
-                  };
-                  add_disk(r_it->local_state.data_disk);
-                  if (!r_it->local_state.shared_disk()) {
-                      add_disk(r_it->local_state.get_cache_disk());
-                  }
+              auto add_disk =
+                [&ds_list = it->second.disk_space](const storage::disk& ds) {
+                    ss::httpd::broker_json::disk_space_info dsi;
+                    dsi.path = ds.path;
+                    dsi.free = ds.free;
+                    dsi.total = ds.total;
+                    ds_list.push(dsi);
+                };
+              add_disk(node_report->local_state.data_disk);
+              if (!node_report->local_state.shared_disk()) {
+                  add_disk(node_report->local_state.get_cache_disk());
               }
           }
 
@@ -1128,6 +1119,7 @@ ss::future<> admin_server::throw_on_error(
         case rpc::errc::disconnected_endpoint:
         case rpc::errc::exponential_backoff:
         case rpc::errc::shutting_down:
+        case rpc::errc::service_unavailable:
         case rpc::errc::missing_node_rpc_client:
             throw ss::httpd::base_exception(
               fmt::format("Not ready: {}", ec.message()),
@@ -1149,8 +1141,13 @@ ss::future<> admin_server::throw_on_error(
         case wasm::errc::invalid_module_missing_abi:
             throw ss::httpd::bad_request_exception(
               "Invalid WebAssembly - the binary is missing required transform "
-              "functions. Does the broker support this version of the Data "
-              "Transforms SDK?");
+              "functions. Check the broker support for the version of the Data "
+              "Transforms SDK being used.");
+        case wasm::errc::invalid_module_unsupported_sr:
+            throw ss::httpd::bad_request_exception(
+              "Invalid WebAssembly - the binary is using an unsupported Schema "
+              "Registry client. Does the broker support this version of the "
+              "Data Transforms Schema Registry SDK?");
         case wasm::errc::invalid_module_missing_wasi:
             throw ss::httpd::bad_request_exception(
               "invalid WebAssembly - missing required WASI functions");
@@ -1563,12 +1560,11 @@ void config_multi_property_validation(
         } break;
         case model::cloud_credentials_source::aws_instance_metadata:
         case model::cloud_credentials_source::gcp_instance_metadata:
-        case model::cloud_credentials_source::sts:
-        case model::cloud_credentials_source::azure_aks_oidc_federation: {
-            // basic config checks for cloud_storage. for sts and
-            // azure_aks_oidc_federation it is expected to receive part of the
-            // configuration via env variables, while aws_instance_metadata and
-            // gcp_instance_metadata do not require extra configuration
+        case model::cloud_credentials_source::sts: {
+            // basic config checks for cloud_storage. for sts it is expected to
+            // receive part of the configuration via env variables, while
+            // aws_instance_metadata and gcp_instance_metadata do not require
+            // extra configuration
             config_properties_seq properties = {
               std::ref(updated_config.cloud_storage_region),
               std::ref(updated_config.cloud_storage_bucket),
@@ -1576,8 +1572,28 @@ void config_multi_property_validation(
 
             for (auto& p : properties) {
                 if (p() == std::nullopt) {
+                    errors[ss::sstring(p.get().name())] = ssx::sformat(
+                      "Must be set when cloud storage enabled with "
+                      "cloud_storage_credentials_source = {}",
+                      updated_config.cloud_storage_credentials_source.value());
+                }
+            }
+        } break;
+        case model::cloud_credentials_source::azure_aks_oidc_federation: {
+            // for azure_aks_oidc_federation it is expected to receive part of
+            // the configuration via env variables. this check is just for
+            // related cluster properties
+            config_properties_seq properties = {
+              std::ref(updated_config.cloud_storage_azure_storage_account),
+              std::ref(updated_config.cloud_storage_azure_container),
+            };
+
+            for (auto& p : properties) {
+                if (p() == std::nullopt) {
                     errors[ss::sstring(p.get().name())]
-                      = "Must be set when cloud storage enabled";
+                      = "Must be set when cloud storage enabled with "
+                        "cloud_storage_credentials_source = "
+                        "azure_aks_oidc_federation";
                 }
             }
         } break;
@@ -1585,15 +1601,17 @@ void config_multi_property_validation(
             // azure_vm_instance_metadata requires an client_id to work
             // correctly
             config_properties_seq properties = {
-              std::ref(updated_config.cloud_storage_region),
-              std::ref(updated_config.cloud_storage_bucket),
+              std::ref(updated_config.cloud_storage_azure_storage_account),
+              std::ref(updated_config.cloud_storage_azure_container),
               std::ref(updated_config.cloud_storage_azure_managed_identity_id),
             };
 
             for (auto& p : properties) {
                 if (p() == std::nullopt) {
                     errors[ss::sstring(p.get().name())]
-                      = "Must be set when cloud storage enabled";
+                      = "Must be set when cloud storage enabled with "
+                        "cloud_storage_credentials_source = "
+                        "azure_vm_instance_metadata";
                 }
             }
         } break;

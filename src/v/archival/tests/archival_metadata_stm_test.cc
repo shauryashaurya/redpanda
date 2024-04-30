@@ -18,11 +18,11 @@
 #include "model/metadata.h"
 #include "model/record.h"
 #include "model/timestamp.h"
+#include "raft/fundamental.h"
 #include "raft/persisted_stm.h"
 #include "raft/state_machine_manager.h"
 #include "raft/tests/raft_group_fixture.h"
 #include "raft/tests/simple_raft_fixture.h"
-#include "raft/types.h"
 #include "storage/tests/utils/disk_log_builder.h"
 #include "test_utils/async.h"
 
@@ -78,6 +78,7 @@ struct archival_metadata_stm_base_fixture
         conf.access_key = cloud_roles::public_key_str("acess-key");
         conf.secret_key = cloud_roles::private_key_str("secret-key");
         conf.region = cloud_roles::aws_region_name("us-east-1");
+        conf.url_style = cloud_storage_clients::s3_url_style::virtual_host;
         conf.server_addr = server_addr;
         conf._probe = ss::make_shared<cloud_storage_clients::client_probe>(
           net::metrics_disabled::yes,

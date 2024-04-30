@@ -183,7 +183,7 @@ class Anomalies:
 
 
 class CloudStorageScrubberTest(RedpandaTest):
-    scrub_timeout = 90
+    scrub_timeout = 200
     partition_count = 3
     message_size = 16 * 1024  # 16KiB
     segment_size = 1024 * 1024  # 1MiB
@@ -191,28 +191,25 @@ class CloudStorageScrubberTest(RedpandaTest):
     topics = [TopicSpec(partition_count=partition_count)]
 
     def __init__(self, test_context):
-        self.si_settings = SISettings(
-            test_context,
-            log_segment_size=self.segment_size,
-            cloud_storage_spillover_manifest_max_segments=10,
-            cloud_storage_housekeeping_interval_ms=1000 * 10,
-            fast_uploads=True)
-
         super().__init__(
             test_context=test_context,
             extra_rp_conf={
-                "cloud_storage_enable_scrubbing": True,
-                "cloud_storage_partial_scrub_interval_ms": 1000,
+                "cloud_storage_partial_scrub_interval_ms": 100,
                 "cloud_storage_full_scrub_interval_ms": 1000,
-                "cloud_storage_scrubbing_interval_jitter_ms": 100,
+                "cloud_storage_scrubbing_interval_jitter_ms": 50,
                 # Small quota forces partial scrubs
-                "cloud_storage_background_jobs_quota": 30,
+                "cloud_storage_background_jobs_quota": 40,
                 # Disable segment merging since it can reupload
                 # the deleted segment and remove the gap
                 "cloud_storage_enable_segment_merging": False,
                 "cloud_storage_spillover_manifest_size": None,
             },
-            si_settings=self.si_settings)
+            si_settings=SISettings(
+                test_context,
+                log_segment_size=self.segment_size,
+                cloud_storage_spillover_manifest_max_segments=10,
+                cloud_storage_housekeeping_interval_ms=1000 * 10,
+                fast_uploads=True))
 
         self.bucket_name = self.si_settings.cloud_storage_bucket
         self.rpk = RpkTool(self.redpanda)

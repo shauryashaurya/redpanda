@@ -251,6 +251,7 @@ func TestStartCommand(t *testing.T) {
 				"fetch_reads_debounce_timeout":  10,
 				"group_initial_rebalance_delay": 0,
 				"log_segment_size_min":          1,
+				"write_caching_default":         "true",
 			}
 			expYAML, err := yaml.Marshal(c)
 			require.NoError(st, err)
@@ -1536,6 +1537,7 @@ func TestStartCommand(t *testing.T) {
 				"fetch_reads_debounce_timeout":  10,
 				"group_initial_rebalance_delay": 0,
 				"log_segment_size_min":          1,
+				"write_caching_default":         "true",
 			}
 			require.Equal(st, expectedClusterFields, y.Redpanda.Other)
 		},
@@ -1588,6 +1590,7 @@ func TestStartCommand(t *testing.T) {
 				"fetch_reads_debounce_timeout":  10,
 				"group_initial_rebalance_delay": 0,
 				"log_segment_size_min":          1,
+				"write_caching_default":         "true",
 			}
 			require.Nil(st, y.Redpanda.ID)
 			require.Equal(st, true, y.Redpanda.DeveloperMode)
@@ -1631,6 +1634,7 @@ func TestStartCommand(t *testing.T) {
 				"fetch_reads_debounce_timeout":  10,
 				"group_initial_rebalance_delay": 0,
 				"log_segment_size_min":          1,
+				"write_caching_default":         "true",
 			}
 			require.Exactly(st, expectedClusterFields, y.Redpanda.Other)
 		},

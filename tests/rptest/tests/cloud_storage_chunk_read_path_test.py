@@ -26,17 +26,15 @@ class CloudStorageChunkReadTest(PreallocNodesTest):
         self.log_segment_size = 1048576 * 5
         self.test_context = test_context
         self.message_size = 1024
-        self.si_settings = SISettings(
-            test_context=test_context,
-            log_segment_size=self.log_segment_size,
-        )
-        self.si_settings.load_context(self.logger, test_context=test_context)
 
         self.default_chunk_size = 1024 * 256
         super().__init__(test_context=test_context,
                          node_prealloc_count=1,
                          num_brokers=3,
-                         si_settings=self.si_settings,
+                         si_settings=SISettings(
+                             test_context=test_context,
+                             log_segment_size=self.log_segment_size,
+                         ),
                          extra_rp_conf={
                              'cloud_storage_cache_chunk_size':
                              self.default_chunk_size
@@ -185,7 +183,9 @@ class CloudStorageChunkReadTest(PreallocNodesTest):
     def test_read_chunks(self):
         self.default_chunk_size = 1048576
         self._set_params_and_start_redpanda(
-            cloud_storage_cache_chunk_size=self.default_chunk_size)
+            cloud_storage_cache_chunk_size=self.default_chunk_size,
+            # Disable leader balancer to have stable node to fetch metrics from.
+            enable_leader_balancer=False)
 
         self._produce_baseline()
 
@@ -235,7 +235,9 @@ class CloudStorageChunkReadTest(PreallocNodesTest):
         self.log_segment_size = 1048576 * 10
         self.topics[0].segment_bytes = self.log_segment_size
         self._set_params_and_start_redpanda(
-            cloud_storage_chunk_prefetch=prefetch)
+            cloud_storage_chunk_prefetch=prefetch,
+            # Disable leader balancer to have stable node to fetch metrics from.
+            enable_leader_balancer=False)
 
         # Smaller messages mean chunks are closer to requested limit. We need more messages to be able
         # to produce the required number of segments

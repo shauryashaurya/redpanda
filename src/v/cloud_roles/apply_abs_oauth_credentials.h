@@ -11,6 +11,7 @@
 #pragma once
 
 #include "cloud_roles/apply_credentials.h"
+#include "signature.h"
 
 namespace cloud_roles {
 
@@ -25,9 +26,11 @@ public:
 
     void reset_creds(credentials creds) override;
     std::ostream& print(std::ostream& os) const override;
+    bool is_oauth() const override { return true; }
 
 private:
     oauth_token_str _oauth_token;
+    time_source _timesource;
 };
 
 } // namespace cloud_roles

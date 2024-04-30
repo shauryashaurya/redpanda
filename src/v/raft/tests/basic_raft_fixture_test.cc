@@ -53,11 +53,11 @@ TEST_F_CORO(raft_fixture, test_multi_nodes_cluster_can_elect_leader) {
     });
 }
 
-// Empty writes should return an error rather than passing silently
-// with incorrect results.
-TEST_F_CORO(raft_fixture, test_empty_writes) {
-    co_await create_simple_group(5);
-    auto leader = co_await wait_for_leader(10s);
+// Empty writes should crash rather than passing silently with incorrect
+// results.
+TEST_F(raft_fixture, test_empty_writes) {
+    create_simple_group(5).get();
+    auto leader = wait_for_leader(10s).get();
 
     auto replicate = [&](auto reader) {
         return node(leader).raft()->replicate(
@@ -70,14 +70,8 @@ TEST_F_CORO(raft_fixture, test_empty_writes) {
     auto reader = model::make_memory_record_batch_reader(
       std::move(builder).build());
 
-    auto result = co_await replicate(std::move(reader));
-    ASSERT_TRUE_CORO(result.has_error());
-    ASSERT_EQ_CORO(result.error(), errc::invalid_input_records);
-
-    // empty batch.
-    result = co_await replicate(make_batches({}));
-    ASSERT_TRUE_CORO(result.has_error());
-    ASSERT_EQ_CORO(result.error(), errc::invalid_input_records);
+    EXPECT_DEATH(
+      replicate(std::move(reader)).get(), "Assert failure.+Empty batch");
 }
 
 struct test_parameters {
@@ -123,6 +117,24 @@ TEST_P_CORO(all_acks_fixture, validate_replication) {
 
     ASSERT_EQ_CORO(all_batches.size(), 3);
 
+    co_await assert_logs_equal();
+}
+
+TEST_P_CORO(all_acks_fixture, single_node_replication) {
+    co_await create_simple_group(1);
+
+    auto params = GetParam();
+    co_await set_write_caching(params.write_caching);
+
+    auto leader = co_await wait_for_leader(10s);
+    auto& leader_node = node(leader);
+
+    auto result = co_await leader_node.raft()->replicate(
+      make_batches({{"k_1", "v_1"}}), replicate_options(params.c_lvl));
+    ASSERT_TRUE_CORO(result.has_value());
+
+    // wait for committed offset to propagate
+    co_await wait_for_committed_offset(result.value().last_offset, 5s);
     co_await assert_logs_equal();
 }
 
@@ -279,7 +291,7 @@ TEST_P_CORO(
     co_await set_write_caching(params.write_caching);
 
     for (auto& [_, node] : nodes()) {
-        node->on_dispatch([](raft::msg_type t) {
+        node->on_dispatch([](model::node_id, raft::msg_type t) {
             if (
               t == raft::msg_type::append_entries
               && random_generators::get_int(1000) > 800) {
@@ -401,6 +413,11 @@ TEST_P_CORO(
  * the offsets to appear.
  */
 TEST_P_CORO(quorum_acks_fixture, test_progress_on_truncation) {
+    /**
+     * Truncation detection test is expected to experience a log truncation,
+     * hence we disable longest log detection
+     */
+    set_enable_longest_log_detection(false);
     co_await create_simple_group(3);
     auto leader_id = co_await wait_for_leader(10s);
     auto params = GetParam();
@@ -411,7 +428,7 @@ TEST_P_CORO(quorum_acks_fixture, test_progress_on_truncation) {
     // truncation.
     for (auto& [id, node] : nodes()) {
         if (id == leader_id) {
-            node->on_dispatch([](raft::msg_type t) {
+            node->on_dispatch([](model::node_id, raft::msg_type t) {
                 if (
                   t == raft::msg_type::append_entries
                   || t == raft::msg_type::vote) {
@@ -472,3 +489,47 @@ INSTANTIATE_TEST_SUITE_P(
       .c_lvl = consistency_level::quorum_ack, .write_caching = false},
     test_parameters{
       .c_lvl = consistency_level::quorum_ack, .write_caching = true}));
+
+TEST_F_CORO(raft_fixture, test_prioritizing_longest_log) {
+    co_await create_simple_group(3);
+
+    /**
+     * Enable write
+     */
+    co_await set_write_caching(true);
+    auto r = co_await retry_with_leader(
+      10s + model::timeout_clock::now(),
+      [this](raft_node_instance& leader_node) {
+          return leader_node.raft()->replicate(
+            make_batches(10, 10, 128),
+            replicate_options(consistency_level::quorum_ack));
+      });
+    ASSERT_TRUE_CORO(r.has_value());
+    /**
+     * wait for all nodes
+     */
+    auto visible_offset = r.value().last_offset;
+    co_await wait_for_visible_offset(visible_offset, 10s);
+
+    /**
+     * Stop all nodes
+     */
+    auto ids_set = all_ids();
+    std::vector<model::node_id> ids(ids_set.begin(), ids_set.end());
+    auto survivor = random_generators::random_choice(ids);
+
+    for (auto& id : ids) {
+        auto data_dir = node(id).raft()->log()->config().base_directory();
+        co_await stop_node(
+          id, survivor == id ? remove_data_dir::no : remove_data_dir::yes);
+        add_node(id, model::revision_id(0), std::move(data_dir));
+    }
+
+    for (auto& [id, n] : nodes()) {
+        co_await n->init_and_start(all_vnodes());
+    }
+
+    auto leader_id = wait_for_leader(10s);
+
+    co_await wait_for_visible_offset(visible_offset, 10s);
+}

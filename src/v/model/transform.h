@@ -17,18 +17,43 @@
 #include "model/namespace.h"
 #include "model/record.h"
 #include "serde/envelope.h"
+#include "serde/rw/variant.h"
 #include "utils/named_type.h"
 
 #include <seastar/core/chunked_fifo.hh>
+#include <seastar/core/sharded.hh>
 #include <seastar/core/sstring.hh>
 
 #include <absl/container/btree_map.h>
 #include <absl/container/flat_hash_map.h>
 
 #include <cstdint>
+#include <memory>
 #include <type_traits>
 
 namespace model {
+
+/**
+ * Wasm binaries are large and can be fetched from different cores, so wrap them
+ * in foreign_ptr over doing copies.
+ */
+using wasm_binary_iobuf
+  = named_type<ss::foreign_ptr<std::unique_ptr<iobuf>>, struct wasm_binary>;
+
+/** Share the underlying iobuf. */
+wasm_binary_iobuf share_wasm_binary(const wasm_binary_iobuf&);
+
+/** Serde support for wasm_binary_iobuf - it has the same format as iobuf. */
+void tag_invoke(
+  serde::tag_t<serde::read_tag>,
+  iobuf_parser& in,
+  wasm_binary_iobuf& t,
+  std::size_t const bytes_left_limit);
+
+/** Serde support for wasm_binary_iobuf - it has the same format as iobuf. */
+void tag_invoke(
+  serde::tag_t<serde::write_tag>, iobuf& out, wasm_binary_iobuf t);
+
 /**
  * An ID for a transform, these get allocated globally, to allow for users to
  * re-use names of transforms.
@@ -46,12 +71,48 @@ using transform_name_view
   = named_type<std::string_view, struct transform_name_view_tag>;
 
 /**
+ * The options related to the offset at which transforms are at.
+ *
+ * Currently, this struct only supports specifying an initial position, but in
+ * the future it may be expanded to support resetting the offset at which
+ * transforms are at.
+ */
+struct transform_offset_options
+  : serde::envelope<
+      transform_offset_options,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    // Signifies that a transform should start at the latest offset available.
+    //
+    // This is the default, but is expected to only be used for legacy deployed
+    // transforms. New deployed transforms should start their offsets at a fixed
+    // point from a deploy.
+    struct latest_offset
+      : serde::
+          envelope<latest_offset, serde::version<0>, serde::compat_version<0>> {
+        bool operator==(const latest_offset&) const = default;
+    };
+    // A transform can either start at the latest offset or at a timestamp.
+    //
+    // When a timestamp is used, a timequery is used to resolve the offset for
+    // each partition.
+    serde::variant<latest_offset, model::timestamp> position;
+
+    bool operator==(const transform_offset_options&) const = default;
+
+    friend std::ostream&
+    operator<<(std::ostream&, const transform_offset_options&);
+
+    auto serde_fields() { return std::tie(position); }
+};
+
+/**
  * Metadata for a WebAssembly powered data transforms.
  */
 struct transform_metadata
   : serde::envelope<
       transform_metadata,
-      serde::version<0>,
+      serde::version<1>,
       serde::compat_version<0>> {
     // The user specified name of the transform.
     transform_name name;
@@ -69,6 +130,8 @@ struct transform_metadata
     uuid_t uuid;
     // The offset of the committed WASM source in the wasm_binary topic.
     model::offset source_ptr;
+    // The options related to the offset that the transform processor.
+    transform_offset_options offset_options;
 
     friend bool operator==(const transform_metadata&, const transform_metadata&)
       = default;
@@ -77,7 +140,13 @@ struct transform_metadata
 
     auto serde_fields() {
         return std::tie(
-          name, input_topic, output_topics, environment, uuid, source_ptr);
+          name,
+          input_topic,
+          output_topics,
+          environment,
+          uuid,
+          source_ptr,
+          offset_options);
     }
 };
 

@@ -23,9 +23,9 @@
 #include "prometheus/prometheus_sanitize.h"
 #include "raft/consensus_utils.h"
 #include "raft/errc.h"
+#include "raft/fundamental.h"
 #include "raft/persisted_stm.h"
 #include "raft/state_machine_base.h"
-#include "raft/types.h"
 #include "ssx/future-util.h"
 #include "storage/parser_utils.h"
 #include "storage/record_batch_builder.h"
@@ -221,6 +221,27 @@ rm_stm::parse_tx_control_batch(const model::record_batch& b) {
     return parse_control_batch(b);
 }
 
+void rm_stm::log_state::forget(const model::producer_identity& pid) {
+    auto it = fence_pid_epoch.find(pid.get_id());
+    if (it != fence_pid_epoch.end() && it->second == pid.get_epoch()) {
+        fence_pid_epoch.erase(pid.get_id());
+    }
+    ongoing_map.erase(pid);
+    current_txes.erase(pid);
+    expiration.erase(pid);
+}
+
+void rm_stm::log_state::reset() {
+    fence_pid_epoch.clear();
+    ongoing_map.clear();
+    ongoing_set.clear();
+    current_txes.clear();
+    expiration.clear();
+    aborted.clear();
+    abort_indexes.clear();
+    last_abort_snapshot = {model::offset(-1)};
+}
+
 rm_stm::rm_stm(
   ss::logger& logger,
   raft::consensus* c,
@@ -234,7 +255,6 @@ rm_stm::rm_stm(
         map<absl::flat_hash_map, model::producer_id, ss::lw_shared_ptr<mutex>>(
           _tx_root_tracker.create_child("tx-locks")))
   , _log_state(_tx_root_tracker)
-  , _mem_state(_tx_root_tracker)
   , _sync_timeout(config::shard_local_cfg().rm_sync_timeout_ms.value())
   , _tx_timeout_delay(config::shard_local_cfg().tx_timeout_delay_ms.value())
   , _abort_interval_ms(config::shard_local_cfg()
@@ -330,7 +350,6 @@ void rm_stm::cleanup_producer_state(model::producer_identity pid) {
         // No active transactions for this producer.
         // note: this branch can be removed once we port tx state
         // into producer_state.
-        _mem_state.forget(pid);
         _log_state.forget(pid);
     }
     _producers.erase(pid);
@@ -898,34 +917,41 @@ ss::future<result<rm_stm::transaction_set>> rm_stm::get_transactions() {
     if (!co_await sync(_sync_timeout)) {
         co_return errc::not_leader;
     }
-
     transaction_set ans;
-
-    // When redpanda starts writing the first batch of a transaction it
-    // estimates its offset and only when the write passes it updates the offset
-    // to the exact value; so for a short period of time (while tx is in the
-    // initiating state) lso_bound is the offset of the last operation known at
-    // moment the transaction started and when the first tx batch is written
-    // it's updated to the first offset of the transaction
-    for (auto& [id, offset] : _mem_state.estimated) {
-        transaction_info tx_info;
-        tx_info.lso_bound = offset;
-        tx_info.status = rm_stm::transaction_info::status_t::initiating;
-        tx_info.info = get_expiration_info(id);
-        tx_info.seq = get_seq_number(id);
-        ans.emplace(id, tx_info);
-    }
-
     for (auto& [id, offset] : _log_state.ongoing_map) {
         transaction_info tx_info;
         tx_info.lso_bound = offset.first;
-        tx_info.status = transaction_info::status_t::ongoing;
+        tx_info.status = offset.last > offset.first
+                           ? transaction_info::status_t::ongoing
+                           : transaction_info::status_t::initiating;
         tx_info.info = get_expiration_info(id);
         tx_info.seq = get_seq_number(id);
         ans.emplace(id, tx_info);
     }
 
     co_return ans;
+}
+
+void rm_stm::update_tx_offsets(
+  producer_ptr producer, const model::record_batch_header& header) {
+    const auto& pid = producer->id();
+    const auto base_offset = header.base_offset;
+    const auto last_offset = header.last_offset();
+    auto ongoing_it = _log_state.ongoing_map.find(pid);
+    if (ongoing_it != _log_state.ongoing_map.end()) {
+        // transaction already known, update the end offset.
+        if (ongoing_it->second.last < last_offset) {
+            ongoing_it->second.last = last_offset;
+        }
+    } else {
+        // we do no have to check if the value is empty as it is already
+        // done with ongoing map
+        producer->update_current_txn_start_offset(from_log_offset(base_offset));
+
+        _log_state.ongoing_map.emplace(
+          pid, tx_range{.pid = pid, .first = base_offset, .last = last_offset});
+        _log_state.ongoing_set.insert(header.base_offset);
+    }
 }
 
 ss::future<std::error_code> rm_stm::mark_expired(model::producer_identity pid) {
@@ -956,7 +982,7 @@ ss::future<result<kafka_result>> rm_stm::do_sync_and_transactional_replicate(
   producer_ptr producer,
   model::batch_identity bid,
   model::record_batch_reader rdr,
-  ssx::semaphore_units) {
+  ssx::semaphore_units units) {
     if (!co_await sync(_sync_timeout)) {
         vlog(
           _ctx_log.trace,
@@ -976,6 +1002,8 @@ ss::future<result<kafka_result>> rm_stm::do_sync_and_transactional_replicate(
           bid.first_seq,
           bid.last_seq);
         if (result.error() == errc::sequence_out_of_order) {
+            // no need to hold while the barrier is in progress.
+            units.return_all();
             auto barrier = co_await _raft->linearizable_barrier();
             if (!barrier) {
                 co_return errc::not_leader;
@@ -1014,13 +1042,6 @@ ss::future<result<kafka_result>> rm_stm::do_transactional_replicate(
     auto tx_seq = _log_state.current_txes[bid.pid].tx_seq;
     vlog(_ctx_log.trace, "found tx_seq:{} for pid:{}", tx_seq, bid.pid);
 
-    if (_mem_state.estimated.contains(bid.pid)) {
-        // we received second produce request while the first is still
-        // being processed.
-        vlog(_ctx_log.warn, "Too frequent produce with same pid:{}", bid.pid);
-        co_return errc::generic_tx_error;
-    }
-
     // For the first batch of a transaction, reset sequence tracking to handle
     // an edge case where client reuses sequence number after an aborted
     // transaction see https://github.com/redpanda-data/redpanda/pull/5026
@@ -1037,7 +1058,6 @@ ss::future<result<kafka_result>> rm_stm::do_transactional_replicate(
         co_return co_await req_ptr->result();
     }
     req_ptr->mark_request_in_progress();
-    _mem_state.estimated[bid.pid] = last_applied_offset();
 
     auto expiration_it = _log_state.expiration.find(bid.pid);
     if (expiration_it == _log_state.expiration.end()) {
@@ -1069,7 +1089,6 @@ ss::future<result<kafka_result>> rm_stm::do_transactional_replicate(
         req_ptr->set_value(errc::timeout);
         co_return tx_errc::timeout;
     }
-    _mem_state.estimated.erase(bid.pid);
     auto result = kafka_result{
       .last_offset = from_log_offset(r.value().last_offset)};
     req_ptr->set_value(result);
@@ -1123,6 +1142,10 @@ ss::future<result<kafka_result>> rm_stm::do_sync_and_idempotent_replicate(
           bid.first_seq,
           bid.last_seq);
         if (result.error() == errc::sequence_out_of_order) {
+            // release the lock so it is not held for the duration of the
+            // barrier, other requests can make progress if they are
+            // in the right sequence.
+            units.return_all();
             // Ensure we are actually the leader and request didn't
             // ooosn on a stale state. If we are not the leader return
             // a retryable error code to the client.
@@ -1283,15 +1306,9 @@ model::offset rm_stm::last_stable_offset() {
         if (!_log_state.ongoing_set.empty()) {
             first_tx_start = *_log_state.ongoing_set.begin();
         }
-
-        for (auto& entry : _mem_state.estimated) {
-            first_tx_start = std::min(first_tx_start, entry.second);
-        }
     }
 
-    auto synced_leader = _raft->is_leader() && _raft->term() == _insync_term
-                         && _mem_state.term == _insync_term;
-
+    auto synced_leader = _raft->is_leader() && _raft->term() == _insync_term;
     model::offset lso{-1};
     auto last_visible_index = _raft->last_visible_index();
     auto next_to_apply = model::next_offset(last_applied);
@@ -1309,8 +1326,8 @@ model::offset rm_stm::last_stable_offset() {
         // should not advance lso beyond last_applied
         lso = next_to_apply;
     }
-    _mem_state.last_lso = std::max(_mem_state.last_lso, lso);
-    return _mem_state.last_lso;
+    _last_known_lso = std::max(_last_known_lso, lso);
+    return _last_known_lso;
 }
 
 static void filter_intersecting(
@@ -1382,11 +1399,11 @@ rm_stm::do_aborted_transactions(model::offset from, model::offset to) {
 }
 
 ss::future<bool> rm_stm::sync(model::timeout_clock::duration timeout) {
+    auto current_insync_term = _insync_term;
     auto ready = co_await persisted_stm::sync(timeout);
     if (ready) {
-        if (_mem_state.term != _insync_term) {
-            _mem_state = mem_state{_tx_root_tracker};
-            _mem_state.term = _insync_term;
+        if (current_insync_term != _insync_term) {
+            _last_known_lso = model::offset{-1};
         }
     }
     co_return ready;
@@ -1427,9 +1444,6 @@ ss::future<> rm_stm::do_abort_old_txes() {
     }
 
     fragmented_vector<model::producer_identity> pids;
-    for (auto& [k, _] : _mem_state.estimated) {
-        pids.push_back(k);
-    }
     for (auto& [k, _] : _log_state.ongoing_map) {
         pids.push_back(k);
     }
@@ -1654,8 +1668,10 @@ void rm_stm::try_arm(time_point_type deadline) {
     }
 }
 
-void rm_stm::apply_fence(model::record_batch&& b) {
+void rm_stm::apply_fence(model::producer_identity pid, model::record_batch b) {
+    auto producer = maybe_create_producer(pid);
     auto batch_base_offset = b.base_offset();
+    auto header = b.header();
     auto batch_data = read_fence_batch(std::move(b));
     vlog(
       _ctx_log.trace,
@@ -1667,6 +1683,7 @@ void rm_stm::apply_fence(model::record_batch&& b) {
       _highest_producer_id, batch_data.bid.pid.get_id());
     auto [fence_it, _] = _log_state.fence_pid_epoch.try_emplace(
       batch_data.bid.pid.get_id(), batch_data.bid.pid.get_epoch());
+    update_tx_offsets(producer, header);
     // using less-or-equal to update tx_seqs on every transaction
     if (fence_it->second <= batch_data.bid.pid.get_epoch()) {
         fence_it->second = batch_data.bid.pid.get_epoch();
@@ -1687,9 +1704,10 @@ void rm_stm::apply_fence(model::record_batch&& b) {
 
 ss::future<> rm_stm::apply(const model::record_batch& b) {
     const auto& hdr = b.header();
+    const auto bid = model::batch_identity::from(hdr);
 
     if (hdr.type == model::record_batch_type::tx_fence) {
-        apply_fence(b.copy());
+        apply_fence(bid.pid, b.copy());
     } else if (hdr.type == model::record_batch_type::tx_prepare) {
         // prepare phase was used pre-transactions GA. Ideally these
         // batches should not appear anymore and should not be a part
@@ -1701,7 +1719,6 @@ ss::future<> rm_stm::apply(const model::record_batch& b) {
           b.base_offset(),
           b.header().producer_id);
     } else if (hdr.type == model::record_batch_type::raft_data) {
-        auto bid = model::batch_identity::from(hdr);
         if (hdr.attrs.is_control()) {
             apply_control(bid.pid, parse_control_batch(b));
         } else {
@@ -1745,7 +1762,6 @@ void rm_stm::apply_control(
             _log_state.ongoing_map.erase(pid);
         }
 
-        _mem_state.forget(pid);
         _log_state.expiration.erase(pid);
 
         if (
@@ -1762,8 +1778,6 @@ void rm_stm::apply_control(
             _log_state.ongoing_set.erase(offset_it->second.first);
             _log_state.ongoing_map.erase(pid);
         }
-
-        _mem_state.forget(pid);
         _log_state.expiration.erase(pid);
     }
 }
@@ -1784,7 +1798,6 @@ void rm_stm::apply_data(
   model::batch_identity bid, const model::record_batch_header& header) {
     if (bid.is_idempotent()) {
         _highest_producer_id = std::max(_highest_producer_id, bid.pid.get_id());
-        const auto last_offset = header.last_offset();
         const auto last_kafka_offset = from_log_offset(header.last_offset());
         auto producer = maybe_create_producer(bid.pid);
         auto needs_touch = producer->update(bid, last_kafka_offset);
@@ -1799,28 +1812,9 @@ void rm_stm::apply_data(
               "[{},{}], last kafka offset: {}",
               bid,
               header.base_offset,
-              last_offset,
+              header.last_offset(),
               last_kafka_offset);
-            auto ongoing_it = _log_state.ongoing_map.find(bid.pid);
-            if (ongoing_it != _log_state.ongoing_map.end()) {
-                if (ongoing_it->second.last < last_offset) {
-                    ongoing_it->second.last = last_offset;
-                }
-            } else {
-                // we do no have to check if the value is empty as it is already
-                // done with ongoing map
-                producer->update_current_txn_start_offset(
-                  from_log_offset(header.base_offset));
-
-                _log_state.ongoing_map.emplace(
-                  bid.pid,
-                  tx_range{
-                    .pid = bid.pid,
-                    .first = header.base_offset,
-                    .last = last_offset});
-                _log_state.ongoing_set.insert(header.base_offset);
-                _mem_state.estimated.erase(bid.pid);
-            }
+            update_tx_offsets(producer, header);
         }
     }
 }
@@ -2274,7 +2268,6 @@ ss::future<> rm_stm::apply_raft_snapshot(const iobuf&) {
       "Resetting all state, reason: log eviction, offset: {}",
       _raft->start_offset());
     _log_state.reset();
-    _mem_state = mem_state{_tx_root_tracker};
     co_await reset_producers();
     set_next(_raft->start_offset());
     co_return;
@@ -2287,11 +2280,6 @@ std::ostream& operator<<(std::ostream& o, const rm_stm::abort_snapshot& as) {
       as.first,
       as.last,
       as.aborted.size());
-    return o;
-}
-
-std::ostream& operator<<(std::ostream& o, const rm_stm::mem_state& state) {
-    fmt::print(o, "{{ estimated: {} }} ", state.estimated.size());
     return o;
 }
 
@@ -2361,11 +2349,7 @@ ss::future<> rm_stm::maybe_log_tx_stats() {
     _ctx_log.debug(
       "tx mem tracker breakdown: {}", _tx_root_tracker.pretty_print_json());
     auto units = co_await _state_lock.hold_read_lock();
-    _ctx_log.debug(
-      "tx memory snapshot stats: {{mem_state: {}, log_state: "
-      "{}}}",
-      _mem_state,
-      _log_state);
+    _ctx_log.debug("tx memory snapshot stats: {{log_state: {}}}", _log_state);
 }
 
 void rm_stm::log_tx_stats() {

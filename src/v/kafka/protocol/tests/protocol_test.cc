@@ -64,17 +64,21 @@ bytes invoke_franz_harness(
           }),
           boost::process::std_out > is);
 
-        /// If the program doesn't exit with success, issue is with test binary
-        /// fail hard as author should fix to account for diff in feature set
         c.wait();
-        vassert(
-          c.exit_code() == 0,
-          "kafka-request-generator exited with non-zero status");
 
         /// Capture data on stdout
         std::stringstream ss;
         ss << is.rdbuf();
         stdout = ss.str();
+
+        /// If the program doesn't exit with success, issue is with test binary
+        /// fail hard as author should fix to account for diff in feature set
+        vassert(
+          c.exit_code() == 0,
+          "kafka-request-generator exited with non-zero status, status: {}, "
+          "output: {}",
+          c.exit_code(),
+          stdout);
     }
     auto result = ss::uninitialized_string<bytes>(stdout.size());
     std::copy_n(stdout.begin(), stdout.size(), result.begin());
@@ -244,7 +248,15 @@ long create_default_and_non_default_data(
   decltype(api_versions_response::data)& non_default_data,
   decltype(api_versions_response::data)& default_data) {
     non_default_data.finalized_features_epoch = 0;
-    default_data = non_default_data;
+    default_data = {
+      .error_code = non_default_data.error_code,
+      .api_keys = non_default_data.api_keys.copy(),
+      .throttle_time_ms = non_default_data.throttle_time_ms,
+      .supported_features = non_default_data.supported_features.copy(),
+      .finalized_features_epoch = non_default_data.finalized_features_epoch,
+      .finalized_features = non_default_data.finalized_features.copy(),
+      .unknown_tags = non_default_data.unknown_tags,
+    };
     default_data.finalized_features_epoch = -1;
 
     // int64 (8 bytes) + tag (2 bytes)

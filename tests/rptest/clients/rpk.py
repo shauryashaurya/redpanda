@@ -18,6 +18,7 @@ from collections import namedtuple
 from typing import Iterator, Optional
 from ducktape.cluster.cluster import ClusterNode
 from rptest.clients.types import TopicSpec
+from rptest.services.redpanda_types import SSL_SECURITY, KafkaClientSecurity, check_username_password
 from rptest.util import wait_until_result
 from rptest.services import tls
 from ducktape.errors import TimeoutError
@@ -44,7 +45,7 @@ class RpkException(Exception):
         self.returncode = returncode
         # Useful for when its desired to still propogate parsed stdout
         # to caller when when rpk exits 1
-        self.parsed_output = None
+        self.parsed_output: list[RpkOffsetDeleteResponsePartition] | None = None
 
     def __str__(self):
         if self.stderr:
@@ -107,10 +108,10 @@ class RpkGroupPartition(typing.NamedTuple):
     log_end_offset: Optional[int]
     lag: Optional[int]
     member_id: str
-    instance_id: str
+    instance_id: str | None
     client_id: str
     host: str
-    error: str
+    error: str | None
 
 
 class RpkGroup(typing.NamedTuple):
@@ -148,12 +149,12 @@ class RpkClusterInfoNode:
 class RpkMaintenanceStatus(typing.NamedTuple):
     node_id: int
     enabled: bool
-    finished: bool
-    errors: bool
-    partitions: int
-    eligible: int
-    transferring: int
-    failed: int
+    finished: bool | None
+    errors: bool | None
+    partitions: int | None
+    eligible: int | None
+    transferring: int | None
+    failed: int | None
 
 
 class RpkOffsetDeleteResponsePartition(typing.NamedTuple):
@@ -292,24 +293,43 @@ class RpkTool:
     """
     def __init__(self,
                  redpanda,
-                 username: str = None,
-                 password: str = None,
-                 sasl_mechanism: str = None,
+                 username: str | None = None,
+                 password: str | None = None,
+                 sasl_mechanism: str | None = None,
                  tls_cert: Optional[tls.Certificate] = None,
                  tls_enabled: Optional[bool] = None):
         self._redpanda = redpanda
-        self._username = username
-        self._password = password
-        self._sasl_mechanism = sasl_mechanism
+
+        check_username_password(username, password)
+
+        sasl_set = any(
+            [v is not None for v in (username, password, sasl_mechanism)])
+
+        if tls_cert:
+            assert tls_enabled is not False, 'using tls_cert implies tls_enabled'
+            tls_enabled = True
+
+        default_security: KafkaClientSecurity = redpanda.kafka_client_security(
+        )
+
+        if not sasl_set and tls_cert:
+            # By convention, if none of the SASL properties are set and tls_cert
+            # is set, we treat this as using mTLS authentication & mapping and so
+            # do not merge in in the default SASL credentials.
+            self._security = SSL_SECURITY
+        else:
+            # integrate any provided credentials with the default redpanda ones
+            self._security = default_security.override(username, password,
+                                                       sasl_mechanism,
+                                                       tls_enabled)
+
         self._tls_cert = tls_cert
-        self._tls_enabled = tls_enabled
 
-        # if testing redpanda cloud, override with default superuser
-        if hasattr(redpanda, 'GLOBAL_CLOUD_CLUSTER_CONFIG'):
-            self._username, self._password, self._sasl_mechanism = redpanda._superuser
-            self._tls_enabled = True
-
-    def create_topic(self, topic, partitions=1, replicas=None, config=None):
+    def create_topic(self,
+                     topic: str,
+                     partitions: int = 1,
+                     replicas: int | None = None,
+                     config=None):
         def create_topic():
             try:
                 cmd = ["create", topic]
@@ -363,7 +383,8 @@ class RpkTool:
                                    username: Optional[str] = None,
                                    password: Optional[str] = None,
                                    mechanism: Optional[str] = None,
-                                   deny=False):
+                                   deny=False,
+                                   ptype: str = "principal"):
 
         username = username if username is not None else self._username
         password = password if password is not None else self._password
@@ -378,7 +399,7 @@ class RpkTool:
         else:
             raise Exception(f"unknown resource: {resource}")
 
-        perm = '--allow-principal' if not deny else '--deny-principal'
+        perm = f'--allow-{ptype}' if not deny else f'--deny-{ptype}'
 
         cmd = [
             "acl", "create", perm, principal, "--operation",
@@ -394,6 +415,18 @@ class RpkTool:
     def sasl_deny_principal(self, *args, **kwargs):
         self._sasl_set_principal_access(*args, **kwargs, deny=True)
 
+    def sasl_allow_role(self, *args, **kwargs):
+        self._sasl_set_principal_access(*args,
+                                        **kwargs,
+                                        deny=False,
+                                        ptype="role")
+
+    def sasl_deny_role(self, *args, **kwargs):
+        self._sasl_set_principal_access(*args,
+                                        **kwargs,
+                                        deny=True,
+                                        ptype="role")
+
     def allow_principal(self, principal, operations, resource, resource_name):
         if resource == "topic":
             resource = "--topic"
@@ -403,8 +436,9 @@ class RpkTool:
             raise Exception(f"unknown resource: {resource}")
 
         cmd = [
-            "acl", "create", "--allow-principal", principal, "--operation",
-            ",".join(operations), resource, resource_name, "--brokers",
+            "security", "acl", "create", "--allow-principal", principal,
+            "--operation", ",".join(operations), resource, resource_name,
+            "--brokers",
             self._redpanda.brokers()
         ]
         return self._run(cmd)
@@ -418,13 +452,14 @@ class RpkTool:
             raise Exception(f"unknown resource: {resource}")
 
         cmd = [
-            "acl", "delete", "--allow-principal", principal, "--operation",
-            ",".join(operations), resource, resource_name, "--no-confirm"
+            "security", "acl", "delete", "--allow-principal", principal,
+            "--operation", ",".join(operations), resource, resource_name,
+            "--no-confirm"
         ] + self._kafka_conn_settings()
         return self._run(cmd)
 
     def _sasl_create_user_cmd(self, new_username, new_password, mechanism):
-        cmd = ["acl", "user", "create", new_username]
+        cmd = ["security", "user", "create", new_username]
         cmd += ["--api-urls", self._redpanda.admin_endpoints()]
         cmd += ["--mechanism", mechanism]
 
@@ -442,7 +477,7 @@ class RpkTool:
         return self._run(cmd)
 
     def sasl_list_users(self):
-        cmd = ["acl", "user", "list"]
+        cmd = ["security", "user", "list"]
         cmd += ["--api-urls", self._redpanda.admin_endpoints()]
 
         return self._run(cmd)
@@ -1213,6 +1248,8 @@ class RpkTool:
             "brokers=" + self._redpanda.brokers(),
         ]
         if self._username:
+            # u, p and mechanism must always be all set or all unset
+            assert self._password and self._sasl_mechanism
             flags += [
                 "-X",
                 "user=" + self._username,
@@ -1224,7 +1261,7 @@ class RpkTool:
         flags += self._tls_settings()
         return flags
 
-    def acl_list(self, request_timeout_overhead=None):
+    def acl_list(self, flags: list[str] = [], request_timeout_overhead=None):
         """
         Run `rpk acl list` and return the results.
 
@@ -1239,7 +1276,7 @@ class RpkTool:
             self._rpk_binary(),
             "acl",
             "list",
-        ] + self._kafka_conn_settings()
+        ] + flags + self._kafka_conn_settings()
 
         # How long rpk will wait for a response from the broker, default is 5s
         if request_timeout_overhead is not None:
@@ -1348,16 +1385,14 @@ class RpkTool:
             regex = re.compile(
                 r"\s*(?P<topic>\S*)\s*(?P<partition>\d*)\s*(?P<status>\w+):?(?P<error>.*)"
             )
-            matched = [regex.match(x) for x in output]
-            failed_matches = any([x for x in matched if x is None])
-            if failed_matches:
-                raise RuntimeError("Failed to parse offset-delete output")
-            return [
-                RpkOffsetDeleteResponsePartition(x['topic'],
-                                                 int(x['partition']),
-                                                 x['status'], x['error'])
-                for x in matched
-            ]
+
+            def make(x: re.Match[str] | None):
+                if not x:
+                    raise RuntimeError("Failed to parse offset-delete output")
+                return RpkOffsetDeleteResponsePartition(
+                    x['topic'], int(x['partition']), x['status'], x['error'])
+
+            return [make(regex.match(x)) for x in output]
 
         def try_offset_delete(retries=5):
             while retries > 0:
@@ -1519,6 +1554,7 @@ class RpkTool:
             "registry.hosts=" + self._schema_registry_host(),
         ]
         if self._username:
+            assert self._password and self._sasl_mechanism
             flags += [
                 "-X",
                 "user=" + self._username,
@@ -1656,19 +1692,16 @@ class RpkTool:
     def deploy_wasm(self,
                     name,
                     input_topic,
-                    output_topic,
+                    output_topics,
                     file="tinygo/identity.wasm"):
-        self._run_wasm([
-            "deploy",
-            "--name",
-            name,
-            "--input-topic",
-            input_topic,
-            "--output-topic",
-            output_topic,
-            "--file",
-            f"/opt/transforms/{file}",
-        ])
+        cmd = [
+            "deploy", "--name", name, "--input-topic", input_topic, "--file",
+            f"/opt/transforms/{file}"
+        ]
+        assert len(output_topics) > 0, "missing output topics"
+        for topic in output_topics:
+            cmd += ["--output-topic", topic]
+        self._run_wasm(cmd)
 
     def delete_wasm(self, name):
         self._run_wasm(["delete", name, "--no-confirm"])
@@ -1755,3 +1788,52 @@ class RpkTool:
         else:
             cmd += ["-X", "admin.hosts=" + self._admin_host()]
         return self._execute(cmd)
+
+    @property
+    def _username(self):
+        return self._security.username
+
+    @property
+    def _password(self):
+        return self._security.password
+
+    @property
+    def _sasl_mechanism(self):
+        return self._security.mechanism
+
+    @property
+    def _tls_enabled(self):
+        return self._security.tls_enabled
+
+    def create_role(self, role_name):
+        return self._run_role(["create", role_name])
+
+    def list_roles(self):
+        return self._run_role(["list"])
+
+    def delete_role(self, role_name):
+        cmd = ["delete", role_name, "--no-confirm"
+               ] + self._kafka_conn_settings()
+        return self._run_role(cmd)
+
+    def assign_role(self, role_name, principals):
+        cmd = ["assign", role_name, "--principal", ",".join(principals)]
+        return self._run_role(cmd)
+
+    def unassign_role(self, role_name, principals):
+        cmd = ["unassign", role_name, "--principal", ",".join(principals)]
+        return self._run_role(cmd)
+
+    def describe_role(self, role_name):
+        return self._run_role(["describe", role_name] +
+                              self._kafka_conn_settings())
+
+    def _run_role(self, cmd, output_format="json"):
+        cmd = [
+            self._rpk_binary(), "security", "role", "--format", output_format,
+            "-X", "admin.hosts=" + self._redpanda.admin_endpoints()
+        ] + cmd
+
+        out = self._execute(cmd)
+
+        return json.loads(out) if output_format == "json" else out

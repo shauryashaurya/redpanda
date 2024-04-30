@@ -28,7 +28,6 @@
 #include "model/transform.h"
 #include "net/server.h"
 #include "net/types.h"
-#include "net/unresolved_address.h"
 #include "random/generators.h"
 #include "rpc/backoff_policy.h"
 #include "rpc/connection_cache.h"
@@ -41,6 +40,7 @@
 #include "transform/rpc/logger.h"
 #include "transform/rpc/serde.h"
 #include "transform/rpc/service.h"
+#include "utils/unresolved_address.h"
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/chunked_fifo.hh>
@@ -339,6 +339,14 @@ public:
     explicit fake_partition_manager(fake_offset_tracker* fot)
       : _offset_tracker(fot) {}
 
+    std::optional<ss::shard_id> shard_owner(const model::ktp& ktp) final {
+        auto it = _shard_locations.find(ktp);
+        if (it == _shard_locations.end()) {
+            return std::nullopt;
+        }
+        return it->second;
+    };
+
     std::optional<ss::shard_id> shard_owner(const model::ntp& ntp) final {
         auto it = _shard_locations.find(ntp);
         if (it == _shard_locations.end()) {
@@ -366,11 +374,12 @@ public:
         return batches;
     }
 
-    ss::future<cluster::errc> invoke_on_shard(
+    template<typename R, typename N>
+    ss::future<result<R, cluster::errc>> invoke_on_shard_impl(
       ss::shard_id shard_id,
-      const model::ntp& ntp,
+      const N& ntp,
       ss::noncopyable_function<
-        ss::future<cluster::errc>(kafka::partition_proxy*)> fn) final {
+        ss::future<result<R, cluster::errc>>(kafka::partition_proxy*)> fn) {
         auto owner = shard_owner(ntp);
         if (!owner || shard_id != *owner) {
             co_return cluster::errc::not_leader;
@@ -382,6 +391,37 @@ public:
         auto pp = kafka::partition_proxy(
           std::make_unique<in_memory_proxy>(ntp, &_produced_batches));
         co_return co_await fn(&pp);
+    }
+
+    ss::future<result<model::wasm_binary_iobuf, cluster::errc>> invoke_on_shard(
+      ss::shard_id shard_id,
+      const model::ntp& ntp,
+      ss::noncopyable_function<
+        ss::future<result<model::wasm_binary_iobuf, cluster::errc>>(
+          kafka::partition_proxy*)> fn) final {
+        return invoke_on_shard_impl(shard_id, ntp, std::move(fn));
+    }
+    ss::future<result<model::wasm_binary_iobuf, cluster::errc>> invoke_on_shard(
+      ss::shard_id shard_id,
+      const model::ktp& ktp,
+      ss::noncopyable_function<
+        ss::future<result<model::wasm_binary_iobuf, cluster::errc>>(
+          kafka::partition_proxy*)> fn) final {
+        return invoke_on_shard_impl(shard_id, ktp, std::move(fn));
+    }
+    ss::future<result<model::offset, cluster::errc>> invoke_on_shard(
+      ss::shard_id shard_id,
+      const model::ktp& ktp,
+      ss::noncopyable_function<ss::future<result<model::offset, cluster::errc>>(
+        kafka::partition_proxy*)> fn) final {
+        return invoke_on_shard_impl(shard_id, ktp, std::move(fn));
+    }
+    ss::future<result<model::offset, cluster::errc>> invoke_on_shard(
+      ss::shard_id shard_id,
+      const model::ntp& ntp,
+      ss::noncopyable_function<ss::future<result<model::offset, cluster::errc>>(
+        kafka::partition_proxy*)> fn) final {
+        return invoke_on_shard_impl(shard_id, ntp, std::move(fn));
     }
 
     ss::future<find_coordinator_response> invoke_on_shard(
@@ -501,6 +541,11 @@ public:
 private:
     class in_memory_proxy : public kafka::partition_proxy::impl {
     public:
+        in_memory_proxy(
+          const model::ktp& ktp,
+          ss::chunked_fifo<produced_batch>* produced_batches)
+          : _ntp(ktp.to_ntp())
+          , _produced_batches(produced_batches) {}
         in_memory_proxy(
           model::ntp ntp, ss::chunked_fifo<produced_batch>* produced_batches)
           : _ntp(std::move(ntp))
@@ -803,10 +848,11 @@ public:
     }
 
     result<stored_wasm_binary_metadata, cluster::errc>
-    store_wasm_binary(iobuf b) {
+    store_wasm_binary(model::wasm_binary_iobuf b) {
         return client()->store_wasm_binary(std::move(b), test_timeout).get();
     }
-    result<iobuf, cluster::errc> load_wasm_binary(model::offset o) {
+    result<model::wasm_binary_iobuf, cluster::errc>
+    load_wasm_binary(model::offset o) {
         return client()->load_wasm_binary(o, test_timeout).get();
     }
     cluster::errc delete_wasm_binary(uuid_t key) {
@@ -918,17 +964,17 @@ auto MaxBatchSizeIs(size_t size) {
 TEST_P(TransformRpcTest, WasmBinaryCrud) {
     // clang-format off
     // NOLINTBEGIN(*-magic-numbers)
-    iobuf wasm_binary = bytes_to_iobuf(
+    auto wasm_binary = model::wasm_binary_iobuf(std::make_unique<iobuf>(bytes_to_iobuf(
       {0x00, 0x61, 0x73, 0x6d, 0x01, 0x00,
        0x00, 0x00, 0x00, 0x08, 0x04, 0x6e,
-       0x61, 0x6d, 0x65, 0x02, 0x01, 0x00});
+       0x61, 0x6d, 0x65, 0x02, 0x01, 0x00})));
     // NOLINTEND(*-magic-numbers)
     // clang-format on
     // The topic is auto created
     set_default_new_topic_leader(leader_node());
 
     set_errors_to_inject(2);
-    auto stored = store_wasm_binary(wasm_binary.copy());
+    auto stored = store_wasm_binary(model::share_wasm_binary(wasm_binary));
     ASSERT_TRUE(stored.has_value());
     EXPECT_THAT(
       non_leader_batches(model::wasm_binaries_internal_ntp), IsEmpty());

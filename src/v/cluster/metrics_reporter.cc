@@ -32,11 +32,11 @@
 #include "model/timeout_clock.h"
 #include "net/tls.h"
 #include "net/tls_certificate_probe.h"
-#include "net/unresolved_address.h"
 #include "reflection/adl.h"
 #include "rpc/types.h"
 #include "security/role_store.h"
 #include "ssx/sformat.h"
+#include "utils/unresolved_address.h"
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/coroutine.hh>
@@ -112,6 +112,7 @@ metrics_reporter::metrics_reporter(
   ss::sharded<config_frontend>& config_frontend,
   ss::sharded<features::feature_table>& feature_table,
   ss::sharded<security::role_store>& role_store,
+  ss::sharded<plugin_table>* pt,
   ss::sharded<ss::abort_source>& as)
   : _raft0(std::move(raft0))
   , _cluster_info(controller_stm.local().get_metrics_reporter_cluster_info())
@@ -122,6 +123,7 @@ metrics_reporter::metrics_reporter(
   , _config_frontend(config_frontend)
   , _feature_table(feature_table)
   , _role_store(role_store)
+  , _plugin_table(pt)
   , _as(as)
   , _logger(logger, "metrics-reporter") {}
 
@@ -185,43 +187,33 @@ metrics_reporter::build_metrics_snapshot() {
     if (!report) {
         co_return result<metrics_snapshot>(report.error());
     }
-    metrics_map.reserve(report.value().node_states.size());
+    metrics_map.reserve(report.value().node_reports.size());
 
-    for (auto& ns : report.value().node_states) {
-        auto [it, _] = metrics_map.emplace(ns.id, node_metrics{.id = ns.id});
+    for (auto& report : report.value().node_reports) {
+        auto [it, _] = metrics_map.emplace(
+          report->id, node_metrics{.id = report->id});
         auto& metrics = it->second;
-        metrics.is_alive = (bool)ns.is_alive;
 
-        auto nm = _members_table.local().get_node_metadata_ref(ns.id);
+        auto nm = _members_table.local().get_node_metadata_ref(report->id);
         if (!nm) {
             continue;
         }
-
         metrics.cpu_count = nm->get().broker.properties().cores;
-    }
-
-    for (auto& report : report.value().node_reports) {
-        auto it = metrics_map.find(report.id);
-        if (it == metrics_map.end()) {
-            auto [eit, _] = metrics_map.emplace(
-              report.id, node_metrics{.id = report.id});
-            it = eit;
-        }
-        auto& metrics = it->second;
-
-        metrics.version = report.local_state.redpanda_version;
-        metrics.logical_version = report.local_state.logical_version;
-        metrics.disks.reserve(report.local_state.shared_disk() ? 1 : 2);
-        auto transform_disk = [](storage::disk& d) -> node_disk_space {
+        metrics.is_alive = _health_monitor.local().is_alive(report->id)
+                           == cluster::alive::yes;
+        metrics.version = report->local_state.redpanda_version;
+        metrics.logical_version = report->local_state.logical_version;
+        metrics.disks.reserve(report->local_state.shared_disk() ? 1 : 2);
+        auto transform_disk = [](const storage::disk& d) -> node_disk_space {
             return node_disk_space{.free = d.free, .total = d.total};
         };
-        metrics.disks.push_back(transform_disk(report.local_state.data_disk));
-        if (!report.local_state.shared_disk()) {
+        metrics.disks.push_back(transform_disk(report->local_state.data_disk));
+        if (!report->local_state.shared_disk()) {
             metrics.disks.push_back(
-              transform_disk(*(report.local_state.cache_disk)));
+              transform_disk(*(report->local_state.cache_disk)));
         }
 
-        metrics.uptime_ms = report.local_state.uptime / 1ms;
+        metrics.uptime_ms = report->local_state.uptime / 1ms;
     }
     auto& topics = _topics.local().topics_map();
     snapshot.topic_count = 0;
@@ -256,6 +248,8 @@ metrics_reporter::build_metrics_snapshot() {
                         || config::oidc_is_enabled_http();
 
     snapshot.rbac_role_count = _role_store.local().size();
+
+    snapshot.data_transforms_count = _plugin_table->local().size();
 
     auto env_value = std::getenv("REDPANDA_ENVIRONMENT");
     if (env_value) {
@@ -520,6 +514,9 @@ void rjson_serialize(
 
     w.Key("rbac_role_count");
     w.Int(snapshot.rbac_role_count);
+
+    w.Key("data_transforms_count");
+    w.Uint(snapshot.data_transforms_count);
 
     w.Key("config");
     config::shard_local_cfg().to_json_for_metrics(w);

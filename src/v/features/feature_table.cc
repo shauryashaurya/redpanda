@@ -102,7 +102,7 @@ std::string_view to_string_view(feature f) {
     case feature::partition_shard_in_health_report:
         return "partition_shard_in_health_report";
     case feature::role_based_access_control:
-        return "role_base_access_control";
+        return "role_based_access_control";
     case feature::cluster_topic_manifest_format_v2:
         return "cluster_topic_manifest_format_v2";
 
@@ -151,12 +151,13 @@ std::string_view to_string_view(feature_state::state s) {
 //  23.2.1 -> 10
 //  23.3.1 -> 11
 //  24.1.1 -> 12
+//  24.2.1 -> 13
 //
 // Although some previous stable branches have included feature version
 // bumps, this is _not_ the intended usage, as stable branches are
 // meant to be safely downgradable within the branch, and new features
 // imply that new data formats may be written.
-static constexpr cluster_version latest_version = cluster_version{12};
+static constexpr cluster_version latest_version = cluster_version{13};
 
 // The earliest version we can upgrade from.  This is the version that
 // a freshly initialized node will start at: e.g. a 23.1 Redpanda joining

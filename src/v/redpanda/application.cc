@@ -70,6 +70,7 @@
 #include "cluster/tx_topic_manager.h"
 #include "cluster/types.h"
 #include "compression/async_stream_zstd.h"
+#include "compression/lz4_decompression_buffers.h"
 #include "compression/stream_zstd.h"
 #include "config/configuration.h"
 #include "config/endpoint_tls_config.h"
@@ -90,6 +91,7 @@
 #include "kafka/server/snc_quota_manager.h"
 #include "kafka/server/usage_manager.h"
 #include "migrations/migrators.h"
+#include "migrations/rbac_migrator.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "net/dns.h"
@@ -119,7 +121,7 @@
 #include "transform/api.h"
 #include "transform/rpc/client.h"
 #include "transform/rpc/service.h"
-#include "transform/transform_offsets_stm.h"
+#include "transform/stm/transform_offsets_stm.h"
 #include "utils/file_io.h"
 #include "utils/human.h"
 #include "utils/uuid.h"
@@ -533,6 +535,11 @@ void application::initialize(
 
         compression::initialize_async_stream_zstd(
           config::shard_local_cfg().zstd_decompress_workspace_bytes());
+
+        compression::init_lz4_decompression_buffers(
+          compression::lz4_decompression_buffers::bufsize,
+          compression::lz4_decompression_buffers::min_threshold,
+          config::shard_local_cfg().lz4_decompress_reusable_buffers_disabled());
     }).get0();
 
     if (config::shard_local_cfg().enable_pid_file()) {
@@ -854,6 +861,8 @@ void application::hydrate_config(const po::variables_map& cfg) {
 }
 
 void application::check_environment() {
+    static constexpr std::string_view fips_enabled_file
+      = "/proc/sys/crypto/fips_enabled";
     syschecks::systemd_message("checking environment (CPU, Mem)").get();
     syschecks::cpu();
     syschecks::memory(config::node().developer_mode());
@@ -876,6 +885,26 @@ void application::check_environment() {
               "expected filesystem mounted?",
               strict_data_dir_file));
         }
+    }
+
+    if (config::node().fips_mode()) {
+        if (!ss::file_exists(fips_enabled_file).get()) {
+            throw std::runtime_error(fmt::format(
+              "File '{}' does not exist.  Redpanda cannot start in FIPS mode",
+              fips_enabled_file));
+        }
+
+        auto fd = ss::file_desc::open(fips_enabled_file.data(), O_RDONLY);
+        char buf[1];
+        fd.read(buf, 1);
+        if (buf[0] != '1') {
+            throw std::runtime_error(fmt::format(
+              "File '{}' not reporting '1': '{}'.  Redpanda cannot start in "
+              "FIPS mode",
+              fips_enabled_file,
+              std::string(&buf[0], 1)));
+        }
+        syschecks::systemd_message("Starting Redpanda in FIPS mode").get();
     }
 }
 
@@ -1266,7 +1295,8 @@ void application::wire_up_runtime_services(
           &partition_manager,
           &_transform_rpc_client,
           &metadata_cache,
-          sched_groups.transforms_sg())
+          sched_groups.transforms_sg(),
+          memory_groups().data_transforms_max_memory())
           .get();
     }
 
@@ -1326,13 +1356,18 @@ void application::wire_up_redpanda_services(
                   .raft_recovery_concurrency_per_shard.bind(),
               .election_timeout_ms
               = config::shard_local_cfg().raft_election_timeout_ms.bind(),
-              .write_caching = config::shard_local_cfg().write_caching.bind(),
+              .write_caching
+              = config::shard_local_cfg().write_caching_default.bind(),
               .write_caching_flush_ms
               = config::shard_local_cfg()
                   .raft_replica_max_flush_delay_ms.bind(),
               .write_caching_flush_bytes
               = config::shard_local_cfg()
-                  .raft_replica_max_pending_flush_bytes.bind()};
+                  .raft_replica_max_pending_flush_bytes.bind(),
+              .enable_longest_log_detection
+              = config::shard_local_cfg()
+                  .raft_enable_longest_log_detection.bind(),
+            };
         },
         [] {
             return raft::recovery_memory_quota::configuration{
@@ -1898,16 +1933,19 @@ void application::wire_up_redpanda_services(
       }))
       .get();
     _kafka_conn_quotas
-      .start([]() {
-          return net::conn_quota_config{
-            .max_connections
-            = config::shard_local_cfg().kafka_connections_max.bind(),
-            .max_connections_per_ip
-            = config::shard_local_cfg().kafka_connections_max_per_ip.bind(),
-            .max_connections_overrides
-            = config::shard_local_cfg().kafka_connections_max_overrides.bind(),
-          };
-      })
+      .start(
+        []() {
+            return net::conn_quota_config{
+              .max_connections
+              = config::shard_local_cfg().kafka_connections_max.bind(),
+              .max_connections_per_ip
+              = config::shard_local_cfg().kafka_connections_max_per_ip.bind(),
+              .max_connections_overrides
+              = config::shard_local_cfg()
+                  .kafka_connections_max_overrides.bind(),
+            };
+        },
+        &kafka::klog)
       .get();
 
     ss::sharded<net::server_configuration> kafka_cfg;
@@ -2094,9 +2132,11 @@ void application::wire_up_and_start_crypto_services() {
     construct_service(
       ossl_context_service,
       std::ref(*thread_worker),
-      ss::sstring{},
-      ss::sstring{},
-      crypto::is_fips_mode::no)
+      ss::sstring{config::node_config().openssl_config_file().value_or("")},
+      ss::sstring{
+        config::node_config().openssl_module_directory().value_or("")},
+      config::node_config().fips_mode() ? crypto::is_fips_mode::yes
+                                        : crypto::is_fips_mode::no)
       .get();
     ossl_context_service.invoke_on_all(&crypto::ossl_context_service::start)
       .get();
@@ -2464,6 +2504,8 @@ void application::wire_up_and_start(::stop_signal& app_signal, bool test_mode) {
         _migrators.push_back(
           std::make_unique<features::migrators::cloud_storage_config>(
             *controller));
+        _migrators.push_back(
+          std::make_unique<features::migrators::rbac_migrator>(*controller));
     }
 
     if (cd.is_cluster_founder().get()) {
@@ -2621,7 +2663,8 @@ void application::start_runtime_services(
         app_signal.abort_source(),
         std::move(offsets_upload_requestor),
         producer_id_recovery_manager,
-        std::move(offsets_recovery_requestor))
+        std::move(offsets_recovery_requestor),
+        redpanda_start_time)
       .get0();
 
     if (archiver_manager.local_is_initialized()) {
@@ -2690,8 +2733,8 @@ void application::start_runtime_services(
             std::ref(controller->get_feature_table()),
             std::ref(controller->get_health_monitor()),
             std::ref(_connection_cache),
-            std::ref(controller->get_partition_manager())));
-
+            std::ref(controller->get_partition_manager()),
+            std::ref(node_status_backend)));
           runtime_services.push_back(
             std::make_unique<cluster::metadata_dissemination_handler>(
               sched_groups.cluster_sg(),

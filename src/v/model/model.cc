@@ -189,10 +189,11 @@ std::istream& operator>>(std::istream& i, compression& c) {
 std::ostream& operator<<(std::ostream& o, const model::broker_properties& b) {
     fmt::print(
       o,
-      "{{cores {}, mem_available {}, disk_available {}}}",
+      "{{cores {}, mem_available {}, disk_available {}, in_fips_mode {}}}",
       b.cores,
       b.available_memory_bytes,
       b.available_disk_gb,
+      b.in_fips_mode,
       b.mount_paths,
       b.etc_props);
     return o;
@@ -506,11 +507,13 @@ std::optional<write_caching_mode>
 write_caching_mode_from_string(std::string_view s) {
     return string_switch<std::optional<write_caching_mode>>(s)
       .match(
-        model::write_caching_mode_to_string(model::write_caching_mode::on),
-        model::write_caching_mode::on)
+        model::write_caching_mode_to_string(
+          model::write_caching_mode::default_true),
+        model::write_caching_mode::default_true)
       .match(
-        model::write_caching_mode_to_string(model::write_caching_mode::off),
-        model::write_caching_mode::off)
+        model::write_caching_mode_to_string(
+          model::write_caching_mode::default_false),
+        model::write_caching_mode::default_false)
       .match(
         model::write_caching_mode_to_string(
           model::write_caching_mode::disabled),

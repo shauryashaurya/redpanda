@@ -14,9 +14,9 @@
 #include "base/seastarx.h"
 #include "base/units.h"
 #include "model/fundamental.h"
-#include "net/unresolved_address.h"
 #include "serde/envelope.h"
 #include "utils/named_type.h"
+#include "utils/unresolved_address.h"
 #include "utils/xid.h"
 
 #include <seastar/core/sstring.hh>
@@ -34,38 +34,12 @@
 #include <vector>
 
 namespace model {
-using node_id = named_type<int32_t, struct node_id_model_type>;
-
-/**
- * Reserved to represent the node_id value yet to be assigned
- * when node is configured for automatic assignment of node_ids.
- * Never used in node configuration.
- */
-constexpr node_id unassigned_node_id(-1);
-
-/**
- * We use revision_id to identify entities evolution in time. f.e. NTP that was
- * first created and then removed, raft configuration
- */
-using revision_id = named_type<int64_t, struct revision_id_model_type>;
-
-/**
- * Revision id that the partition had when the topic was just created.
- * The revision_id of the partition might change when the partition is moved
- * between the nodes.
- */
-using initial_revision_id
-  = named_type<int64_t, struct initial_revision_id_model_type>;
-
-// tracking evolution of the shard table
-using shard_revision_id
-  = named_type<int64_t, struct shard_revision_id_model_type>;
 
 /// Rack id type
 using rack_id = named_type<ss::sstring, struct rack_id_model_type>;
 struct broker_properties
   : serde::
-      envelope<broker_properties, serde::version<1>, serde::compat_version<0>> {
+      envelope<broker_properties, serde::version<2>, serde::compat_version<0>> {
     uint32_t cores;
     uint32_t available_memory_gb;
     uint32_t available_disk_gb;
@@ -73,6 +47,7 @@ struct broker_properties
     // key=value properties in /etc/redpanda/machine_properties.yaml
     std::unordered_map<ss::sstring, ss::sstring> etc_props;
     uint64_t available_memory_bytes = 0;
+    bool in_fips_mode = false;
 
     bool operator==(const broker_properties& other) const = default;
 
@@ -86,7 +61,8 @@ struct broker_properties
           available_disk_gb,
           mount_paths,
           etc_props,
-          available_memory_bytes);
+          available_memory_bytes,
+          in_fips_mode);
     }
 };
 
@@ -555,21 +531,21 @@ using vcluster_id = named_type<xid, struct v_cluster_id_tag>;
  * Type that represents the cluster wide write caching mode.
  */
 enum class write_caching_mode : uint8_t {
-    // on by default for all topics
-    on = 0,
-    // off by default for all topics
-    off = 1,
-    // disabled by default clusterwide.
-    // cannot be overriden at topic level.
+    // true by default for all topics
+    default_true = 0,
+    // false by default for all topics
+    default_false = 1,
+    // disabled across all topics even for those
+    // with overrides. kill switch.
     disabled = 2
 };
 
 constexpr const char* write_caching_mode_to_string(write_caching_mode s) {
     switch (s) {
-    case write_caching_mode::on:
-        return "on";
-    case write_caching_mode::off:
-        return "off";
+    case write_caching_mode::default_true:
+        return "true";
+    case write_caching_mode::default_false:
+        return "false";
     case write_caching_mode::disabled:
         return "disabled";
     default:
@@ -673,6 +649,7 @@ struct hash<model::broker_properties> {
             boost::hash_combine(h, std::hash<ss::sstring>()(k));
             boost::hash_combine(h, std::hash<ss::sstring>()(v));
         }
+        boost::hash_combine(h, std::hash<bool>()(b.in_fips_mode));
         return h;
     }
 };

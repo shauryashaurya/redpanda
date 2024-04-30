@@ -19,6 +19,8 @@
 #include "utils/vint.h"
 
 #include <seastar/core/print.hh>
+#include <seastar/core/smp.hh>
+#include <seastar/util/variant_utils.hh>
 
 #include <algorithm>
 #include <optional>
@@ -71,6 +73,19 @@ void append_vint_to_iobuf(iobuf& b, int64_t v) {
 }
 
 } // namespace
+
+std::ostream&
+operator<<(std::ostream& os, const transform_offset_options& opts) {
+    ss::visit(
+      opts.position,
+      [&os](transform_offset_options::latest_offset) {
+          fmt::print(os, "{{ latest_offset }}");
+      },
+      [&os](model::timestamp ts) {
+          fmt::print(os, "{{ timequery: {} }}", ts.value());
+      });
+    return os;
+}
 
 std::ostream& operator<<(std::ostream& os, const transform_metadata& meta) {
     fmt::print(
@@ -293,4 +308,40 @@ transformed_data transformed_data::copy() const {
     return transformed_data(_data.copy());
 }
 
+wasm_binary_iobuf share_wasm_binary(const wasm_binary_iobuf& b) {
+    vassert(
+      b().get_owner_shard() == ss::this_shard_id(),
+      "cannot share a wasm binary from another shard");
+    const auto& underlying = b();
+    return wasm_binary_iobuf(
+      std::make_unique<iobuf>(underlying->share(0, underlying->size_bytes())));
+}
+
+void tag_invoke(
+  serde::tag_t<serde::read_tag>,
+  iobuf_parser& in,
+  wasm_binary_iobuf& t,
+  std::size_t const bytes_left_limit) {
+    auto size = serde::read_nested<serde::serde_size_t>(in, bytes_left_limit);
+    t = wasm_binary_iobuf(std::make_unique<iobuf>(in.share(size)));
+}
+
+void tag_invoke(
+  serde::tag_t<serde::write_tag>, iobuf& out, wasm_binary_iobuf t) {
+    if (!t()) {
+        serde::write<serde::serde_size_t>(out, 0);
+        return;
+    }
+    serde::write<serde::serde_size_t>(out, t()->size_bytes());
+    // If we're on the same shard we can enable move fragment optimizations
+    if (t().get_owner_shard() == ss::this_shard_id()) {
+        out.append(std::move(*t()));
+    } else {
+        // Otherwise we can't touch the memory and we need to do a full copy to
+        // this core.
+        for (const auto& fragment : *t()) {
+            out.append(fragment.get(), fragment.size());
+        }
+    }
+}
 } // namespace model

@@ -13,6 +13,7 @@ import random
 import string
 import json
 from typing import Optional
+import concurrent.futures
 
 from requests.exceptions import RequestException
 
@@ -55,15 +56,19 @@ class BaseDataTransformsTest(RedpandaTest):
     def _deploy_wasm(self,
                      name: str,
                      input_topic: TopicSpec,
-                     output_topic: TopicSpec,
-                     file="tinygo/identity.wasm"):
+                     output_topic: TopicSpec | list[TopicSpec],
+                     file="tinygo/identity.wasm",
+                     wait_running=True):
         """
         Deploy a wasm transform and wait for all processors to be running.
         """
+        if not isinstance(output_topic, list):
+            output_topic = [output_topic]
+
         def do_deploy():
             self._rpk.deploy_wasm(name,
                                   input_topic.name,
-                                  output_topic.name,
+                                  [o.name for o in output_topic],
                                   file=file)
             return True
 
@@ -74,6 +79,9 @@ class BaseDataTransformsTest(RedpandaTest):
             err_msg=f"unable to deploy wasm transform {name}",
             retry_on_exc=True,
         )
+
+        if not wait_running:
+            return
 
         def is_all_running():
             transforms = self._rpk.list_wasm()
@@ -207,7 +215,7 @@ class BaseDataTransformsTest(RedpandaTest):
             try:
                 self._rpk.deploy_wasm("invalid",
                                       self.topics[0].name,
-                                      self.topics[1].name,
+                                      [self.topics[1].name],
                                       file=file)
                 raise AssertionError(
                     "Unexpectedly was able to deploy transform")
@@ -232,8 +240,8 @@ class DataTransformsTest(BaseDataTransformsTest):
     topics = [TopicSpec(partition_count=9), TopicSpec(partition_count=9)]
 
     @cluster(num_nodes=4)
-    @matrix(transactional=[False, True])
-    def test_identity(self, transactional):
+    @matrix(transactional=[False, True], wait_running=[False, True])
+    def test_identity(self, transactional, wait_running):
         """
         Test that a transform that only copies records from the input to the output topic works as intended.
         """
@@ -241,7 +249,8 @@ class DataTransformsTest(BaseDataTransformsTest):
         output_topic = self.topics[1]
         self._deploy_wasm(name="identity-xform",
                           input_topic=input_topic,
-                          output_topic=output_topic)
+                          output_topic=output_topic,
+                          wait_running=wait_running)
         producer_status = self._produce_input_topic(
             topic=self.topics[0], transactional=transactional)
         consumer_status = self._consume_output_topic(topic=self.topics[1],
@@ -261,7 +270,8 @@ class DataTransformsTest(BaseDataTransformsTest):
         self._deploy_invalid(
             file="validation/wasi.wasm",
             expected_msg=
-            "Does the broker support this version of the Data Transforms SDK?")
+            "Check the broker support for the version of the Data Transforms SDK being used."
+        )
 
     @cluster(num_nodes=3)
     def test_tracked_offsets_cleaned_up(self):
@@ -334,6 +344,40 @@ class DataTransformsChainingTest(BaseDataTransformsTest):
                                                      timeout_sec=60)
         self.logger.info(f"{consumer_status}")
         assert consumer_status.invalid_records == 0, f"transform verification failed with invalid records: {consumer_status}"
+
+
+class DataTransformsMultipleOutputTopicsTest(BaseDataTransformsTest):
+    """
+    Tests related to WebAssembly powered data transforms that write to multiple output topics.
+    """
+    topics = [TopicSpec(partition_count=3) for i in range(9)]
+
+    @cluster(num_nodes=6)
+    def test_multiple_output_topics(self):
+        """
+        Test that we write to all output topics (using a tee transform) with each output topic being valid.
+        """
+        self._deploy_wasm("tee-xform",
+                          input_topic=self.topics[0],
+                          output_topic=self.topics[1:],
+                          file="tinygo/tee.wasm")
+        producer_status = self._produce_input_topic(topic=self.topics[0])
+
+        def validate_output(topic: TopicSpec,
+                            producer_status: TransformVerifierProduceStatus):
+            consumer_status = self._consume_output_topic(
+                topic=topic, status=producer_status, timeout_sec=60)
+            self.logger.info(f"{topic.name}={consumer_status}")
+            assert consumer_status.invalid_records == 0, f"transform verification failed with invalid records for topic {topic.name}: {consumer_status}"
+
+        # Limit concurrency to the number of available nodes that we have to schedule on.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            tasks = [
+                executor.submit(validate_output, topic, producer_status)
+                for topic in self.topics[1:]
+            ]
+            for task in concurrent.futures.as_completed(tasks):
+                task.result()  # Will throw if failed
 
 
 class Move(typing.NamedTuple):

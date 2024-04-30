@@ -16,28 +16,29 @@
 #include "cluster/plugin_frontend.h"
 #include "cluster/topic_table.h"
 #include "cluster/types.h"
+#include "commit_batcher.h"
 #include "config/configuration.h"
 #include "features/feature_table.h"
+#include "io.h"
 #include "kafka/server/partition_proxy.h"
-#include "kafka/server/replicated_partition.h"
+#include "logger.h"
 #include "model/fundamental.h"
 #include "model/namespace.h"
 #include "model/record_batch_reader.h"
 #include "model/timeout_clock.h"
+#include "model/timestamp.h"
 #include "model/transform.h"
 #include "resource_mgmt/io_priority.h"
 #include "ssx/future-util.h"
-#include "transform/commit_batcher.h"
-#include "transform/io.h"
-#include "transform/logger.h"
+#include "ssx/semaphore.h"
 #include "transform/logging/log_manager.h"
 #include "transform/logging/rpc_client.h"
 #include "transform/rpc/client.h"
 #include "transform/rpc/deps.h"
-#include "transform/transform_logger.h"
-#include "transform/transform_manager.h"
-#include "transform/transform_processor.h"
-#include "transform/txn_reader.h"
+#include "transform_logger.h"
+#include "transform_manager.h"
+#include "transform_processor.h"
+#include "txn_reader.h"
 #include "wasm/api.h"
 #include "wasm/cache.h"
 #include "wasm/errc.h"
@@ -56,6 +57,7 @@
 #include <absl/container/flat_hash_map.h>
 #include <boost/range/irange.hpp>
 
+#include <optional>
 #include <system_error>
 
 namespace transform {
@@ -143,6 +145,21 @@ public:
               kafka::make_error_code(result.error()).message());
         }
         return model::offset_cast(model::prev_offset(result.value()));
+    }
+
+    ss::future<kafka::offset>
+    offset_at_timestamp(model::timestamp ts, ss::abort_source* as) final {
+        auto result = co_await _partition.timequery(storage::timequery_config(
+          ts,
+          model::offset::max(),
+          /*iop=*/wasm_read_priority(),
+          /*type_filter=*/std::nullopt,
+          /*as=*/*as,
+          /*client_addr=*/std::nullopt));
+        if (!result.has_value()) {
+            co_return kafka::offset::min();
+        }
+        co_return model::offset_cast(result->offset);
     }
 
     ss::future<model::record_batch_reader>
@@ -362,7 +379,8 @@ public:
       model::ntp ntp,
       model::transform_metadata meta,
       processor::state_callback cb,
-      probe* p) final {
+      probe* p,
+      memory_limits* ml) final {
         auto engine = co_await _wasm_engine_factory(meta);
         if (!engine) {
             throw std::runtime_error("unable to create wasm engine");
@@ -393,7 +411,8 @@ public:
           std::move(src),
           std::move(sinks),
           std::move(offset_tracker),
-          p);
+          p,
+          ml);
     }
 
 private:
@@ -461,7 +480,8 @@ service::service(
   ss::sharded<cluster::partition_manager>* partition_manager,
   ss::sharded<rpc::client>* rpc_client,
   ss::sharded<cluster::metadata_cache>* metadata_cache,
-  ss::scheduling_group sg)
+  ss::scheduling_group sg,
+  size_t memory_limit)
   : _runtime(runtime)
   , _self(self)
   , _plugin_frontend(plugin_frontend)
@@ -471,15 +491,42 @@ service::service(
   , _partition_manager(partition_manager)
   , _rpc_client(rpc_client)
   , _metadata_cache(metadata_cache)
-  , _sg(sg) {}
+  , _sg(sg)
+  , _total_memory_limit(memory_limit) {}
 
 service::~service() = default;
 
 ss::future<> service::start() {
+    _log_manager = std::make_unique<logging::manager<ss::lowres_clock>>(
+      _self,
+      std::make_unique<logging::rpc_client>(
+        &_rpc_client->local(), &_metadata_cache->local()),
+      config::shard_local_cfg().data_transforms_logging_buffer_capacity_bytes(),
+      config::shard_local_cfg().data_transforms_logging_line_max_bytes.bind(),
+      config::shard_local_cfg()
+        .data_transforms_logging_flush_interval_ms.bind());
+
     _batcher = std::make_unique<commit_batcher<ss::lowres_clock>>(
       config::shard_local_cfg().data_transforms_commit_interval_ms.bind(),
       std::make_unique<rpc_offset_committer>(&_rpc_client->local()));
 
+    size_t read_buffer_percent
+      = config::shard_local_cfg()
+          .data_transforms_read_buffer_memory_percentage.value();
+    size_t write_buffer_percent
+      = config::shard_local_cfg()
+          .data_transforms_write_buffer_memory_percentage.value();
+    vassert(
+      read_buffer_percent + write_buffer_percent <= 90,
+      "Total buffer memory percentage must not be greater than 90%, read "
+      "buffer percent: {}%, write buffer percent: {}%",
+      read_buffer_percent,
+      write_buffer_percent);
+    constexpr size_t total_percentage = 100;
+    size_t one_percent = _total_memory_limit / total_percentage;
+    auto mem_limits = std::make_unique<memory_limits>(memory_limits::config{
+      .read = one_percent * read_buffer_percent,
+      .write = one_percent * write_buffer_percent});
     _manager = std::make_unique<manager<ss::lowres_clock>>(
       _self,
       std::make_unique<registry_adapter>(
@@ -492,21 +539,15 @@ ss::future<> service::start() {
         &_partition_manager->local(),
         &_rpc_client->local(),
         _batcher.get()),
-      _sg);
-    co_await _batcher->start();
-    co_await _manager->start();
-    register_notifications();
-
-    _log_manager = std::make_unique<logging::manager<ss::lowres_clock>>(
-      _self,
-      std::make_unique<logging::rpc_client>(
-        &_rpc_client->local(), &_metadata_cache->local()),
-      config::shard_local_cfg().data_transforms_logging_buffer_capacity_bytes(),
-      config::shard_local_cfg().data_transforms_logging_line_max_bytes.bind(),
-      config::shard_local_cfg()
-        .data_transforms_logging_flush_interval_ms.bind());
+      _sg,
+      std::move(mem_limits));
 
     co_await _log_manager->start();
+    co_await _batcher->start();
+    co_await _manager->start();
+
+    // This will start loading the transforms
+    register_notifications();
 }
 
 void service::register_notifications() {
@@ -619,15 +660,15 @@ service::delete_transform(model::transform_name name) {
     co_return cluster::make_error_code(cluster::errc::success);
 }
 
-ss::future<std::error_code>
-service::deploy_transform(model::transform_metadata meta, iobuf binary) {
+ss::future<std::error_code> service::deploy_transform(
+  model::transform_metadata meta, model::wasm_binary_iobuf binary) {
     if (!_feature_table->local().is_active(
           features::feature::wasm_transforms)) {
         co_return cluster::make_error_code(cluster::errc::feature_disabled);
     }
     auto _ = _gate.hold();
     try {
-        co_await _runtime->validate(binary.share(0, binary.size_bytes()));
+        co_await _runtime->validate(model::share_wasm_binary(binary));
     } catch (const wasm::wasm_exception& ex) {
         vlog(
           tlog.warn,
@@ -639,9 +680,8 @@ service::deploy_transform(model::transform_metadata meta, iobuf binary) {
     vlog(
       tlog.info,
       "deploying wasm binary (size={}) for transform {}",
-      binary.size_bytes(),
+      binary()->size_bytes(),
       meta.name);
-    // TODO(rockwood): Validate that the wasm adheres to our ABI
     auto result = co_await _rpc_client->local().store_wasm_binary(
       std::move(binary), wasm_binary_timeout);
     if (result.has_error()) {
@@ -652,6 +692,14 @@ service::deploy_transform(model::transform_metadata meta, iobuf binary) {
     auto [key, offset] = result.value();
     meta.uuid = key;
     meta.source_ptr = offset;
+    meta.offset_options = model::transform_offset_options{
+      // Set the transform to start processing new records starting now,
+      // this is the default expectations for developers, as once deploy
+      // completes, they should be able to produce without waiting for the
+      // vm to start. If we start from the end of the log, then records produced
+      // between now and the vm start would be skipped.
+      .position = model::new_timestamp(),
+    };
     vlog(
       tlog.debug,
       "stored wasm binary for transform {} at offset {}",

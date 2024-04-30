@@ -23,7 +23,6 @@ from rptest.utils.allow_logs_on_predicate import AllowLogsOnPredicate
 def cluster(log_allow_list=None,
             check_allowed_error_logs=True,
             check_for_storage_usage_inconsistencies=True,
-            is_cloud_cluster=False,
             **kwargs):
     """
     Drop-in replacement for Ducktape `cluster` that imposes additional
@@ -128,7 +127,8 @@ def cluster(log_allow_list=None,
 
                 raise
             else:
-                if not isinstance(self.redpanda, RedpandaServiceBase):
+                if not isinstance(self.redpanda,
+                                  RedpandaServiceBase | RedpandaServiceCloud):
                     # If None we passed without instantiating a RedpandaService, for example
                     # in a skipped test.
                     # Also skip if we are running against the cloud
@@ -162,7 +162,8 @@ def cluster(log_allow_list=None,
                     # RSB (technically, it might be that self.redpanda is RSB but some
                     # additional redpanda in the registry is, but that situation never arises
                     # in practice in our current tests)
-                    assert isinstance(redpanda, RedpandaServiceBase)
+                    assert isinstance(
+                        redpanda, RedpandaServiceBase | RedpandaServiceCloud)
 
                     if check_allowed_error_logs:
                         # Only do log inspections on tests that are otherwise
@@ -172,11 +173,24 @@ def cluster(log_allow_list=None,
                         # TODO: extend this to cover shutdown logging too, and
                         # clean up redpanda to not log so many errors on shutdown.
                         try:
-                            redpanda.raise_on_bad_logs(
-                                allow_list=log_allow_list)
+                            # We need test start time for RedpandaServiceCloud
+                            if isinstance(redpanda, RedpandaServiceCloud):
+                                redpanda.raise_on_bad_logs(
+                                    allow_list=log_allow_list,
+                                    test_start_time=t_initial)
+                            else:
+                                redpanda.raise_on_bad_logs(
+                                    allow_list=log_allow_list)
                         except:
-                            redpanda.cloud_storage_diagnostics()
+                            # Perform diagnostics only for Local run
+                            if isinstance(redpanda, RedpandaServiceBase):
+                                redpanda.cloud_storage_diagnostics()
                             raise
+
+                    # Do a check if this is the cloud
+                    # since the rest not applies to RedpandaServiceCloud class
+                    if isinstance(redpanda, RedpandaServiceCloud):
+                        return r
 
                     if check_for_storage_usage_inconsistencies:
                         try:
@@ -187,7 +201,7 @@ def cluster(log_allow_list=None,
 
                 self.redpanda.validate_controller_log()
 
-                if self.redpanda.si_settings is not None and not self.redpanda.si_settings.skip_end_of_test_scrubbing:
+                if self.redpanda._si_settings is not None and not self.redpanda.si_settings.skip_end_of_test_scrubbing:
                     try:
                         self.redpanda.maybe_do_internal_scrub()
                         self.redpanda.stop_and_scrub_object_storage()

@@ -26,7 +26,7 @@
 #include "model/namespace.h"
 #include "model/validation.h"
 #include "raft/errc.h"
-#include "raft/types.h"
+#include "raft/fundamental.h"
 #include "random/generators.h"
 #include "rpc/errc.h"
 #include "rpc/types.h"
@@ -122,8 +122,11 @@ ss::future<std::error_code> security_frontend::create_role(
   security::role_name name,
   security::role role,
   model::timeout_clock::time_point tout) {
-    if (!_features.local().is_active(
-          features::feature::role_based_access_control)) {
+    auto feature_enabled = _features.local().is_preparing(
+                             features::feature::role_based_access_control)
+                           || _features.local().is_active(
+                             features::feature::role_based_access_control);
+    if (!feature_enabled) {
         vlog(clusterlog.warn, "RBAC feature is not yet active");
         co_return cluster::errc::feature_disabled;
     }

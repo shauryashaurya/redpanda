@@ -15,7 +15,8 @@ import (
 	"os"
 	"sync"
 
-	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/container"
+
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/container/common"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/profile"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/config"
@@ -78,6 +79,7 @@ func purgeCluster(c common.Client) (purged bool, rerr error) {
 	}
 	grp, _ := errgroup.WithContext(context.Background())
 	for _, node := range nodes {
+		node := node
 		id := node.ID
 		var mu sync.Mutex
 		printf := func(msg string, args ...interface{}) {
@@ -87,11 +89,14 @@ func purgeCluster(c common.Client) (purged bool, rerr error) {
 		}
 		grp.Go(func() error {
 			ctx, _ := common.DefaultCtx()
-			name := common.Name(id)
+			name := common.RedpandaName(id)
+			if node.Console {
+				name = common.ConsoleContainerName
+			}
 			err := c.ContainerRemove(
 				ctx,
 				name,
-				types.ContainerRemoveOptions{
+				container.RemoveOptions{
 					RemoveVolumes: true,
 					Force:         true,
 				},
@@ -100,9 +105,9 @@ func purgeCluster(c common.Client) (purged bool, rerr error) {
 				if !c.IsErrNotFound(err) {
 					return err
 				}
-				printf("Unable to remove container %s (node %d)", name, id, err)
+				printf("Unable to remove container %s", name, err)
 			} else {
-				printf("Removed container %s (node %d)", name, id)
+				printf("Removed container %s", name)
 			}
 			return nil
 		})

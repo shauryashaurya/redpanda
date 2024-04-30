@@ -82,7 +82,8 @@ model::broker make_self_broker(const config::node_config& node_cfg) {
         .cores = ss::smp::count,
         .available_memory_gb = total_mem_gb,
         .available_disk_gb = disk_gb,
-        .available_memory_bytes = total_mem});
+        .available_memory_bytes = total_mem,
+        .in_fips_mode = node_cfg.fips_mode()});
 }
 
 bool are_replica_sets_equal(
@@ -164,6 +165,7 @@ cluster::errc map_update_interruption_error_code(std::error_code ec) {
         case rpc::errc::service_error:
         case rpc::errc::method_not_found:
         case rpc::errc::version_not_supported:
+        case rpc::errc::service_unavailable:
         case rpc::errc::unknown:
             return errc::replication_error;
         }
@@ -318,6 +320,7 @@ partition_raft_state get_partition_raft_state(consensus_ptr ptr) {
     raft_state.write_caching_enabled = ptr->write_caching_enabled();
     raft_state.flush_bytes = ptr->flush_bytes();
     raft_state.flush_ms = ptr->flush_ms();
+    raft_state.time_since_last_flush = ptr->time_since_last_flush();
     raft_state.replication_monitor_state = fmt::format(
       "{}", ptr->get_replication_monitor());
 

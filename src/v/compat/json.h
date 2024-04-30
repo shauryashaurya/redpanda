@@ -17,9 +17,9 @@
 #include "json/document.h"
 #include "json/json.h"
 #include "model/fundamental.h"
-#include "net/unresolved_address.h"
 #include "security/acl.h"
 #include "utils/base64.h"
+#include "utils/unresolved_address.h"
 
 #include <seastar/net/inet_address.hh>
 
@@ -349,6 +349,8 @@ inline void rjson_serialize(
     rjson_serialize(w, b.etc_props);
     w.Key("available_memory_bytes");
     rjson_serialize(w, b.available_memory_bytes);
+    w.Key("in_fips_mode");
+    rjson_serialize(w, b.in_fips_mode);
     w.EndObject();
 }
 
@@ -359,6 +361,7 @@ inline void read_value(json::Value const& rd, model::broker_properties& obj) {
     read_member(rd, "mount_paths", obj.mount_paths);
     read_member(rd, "etc_props", obj.etc_props);
     read_member(rd, "available_memory_bytes", obj.available_memory_bytes);
+    read_member(rd, "in_fips_mode", obj.in_fips_mode);
 }
 
 inline void

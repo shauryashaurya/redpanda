@@ -13,6 +13,7 @@
 
 #include "base/likely.h"
 #include "base/seastarx.h"
+#include "config/property.h"
 #include "features/feature_table.h"
 #include "hashing/crc32c.h"
 #include "metrics/metrics.h"
@@ -35,6 +36,7 @@
 #include "raft/replication_monitor.h"
 #include "raft/state_machine_manager.h"
 #include "raft/timeout_jitter.h"
+#include "raft/transfer_leadership.h"
 #include "raft/types.h"
 #include "ssx/semaphore.h"
 #include "storage/log.h"
@@ -99,6 +101,7 @@ public:
       ss::shared_ptr<storage::log>,
       scheduling_config,
       config::binding<std::chrono::milliseconds> disk_timeout,
+      config::binding<bool> enable_longest_log_detection,
       consensus_client_protocol,
       leader_cb_t,
       storage::api&,
@@ -623,6 +626,9 @@ private:
     /// \brief _does not_ hold the lock.
     using flushed = ss::bool_class<struct flushed_executed_tag>;
     ss::future<flushed> flush_log();
+    /// flush spawned with a gate.
+    void background_flush_log();
+    void maybe_schedule_flush();
 
     void maybe_step_down();
 
@@ -766,8 +772,7 @@ private:
     }
 
     flush_delay_t compute_max_flush_delay() const;
-    ss::future<> maybe_flush_log();
-    ss::future<> background_flusher();
+    ss::future<> do_flush();
 
     // args
     vnode _self;
@@ -776,6 +781,7 @@ private:
     ss::shared_ptr<storage::log> _log;
     scheduling_config _scheduling;
     config::binding<std::chrono::milliseconds> _disk_timeout;
+    config::binding<bool> _enable_longest_log_detection;
     consensus_client_protocol _client_protocol;
     leader_cb_t _leader_notification;
 
@@ -821,6 +827,8 @@ private:
     replicate_batcher _batcher;
     size_t _pending_flush_bytes{0};
     clock_type::time_point _last_flush_time;
+    /// Ensures that we do not schedule multiple redudant flushes.
+    bool _in_flight_flush = false;
 
     /// used to wait for background ops before shutting down
     ss::gate _bg;
@@ -899,7 +907,11 @@ private:
     // Its a variant to workaround a bug in cv::wait() method,
     // check comment in compute_max_flush_delay() for details
     flush_delay_t _max_flush_delay;
-    ss::condition_variable _background_flusher;
+
+    // Timer responsible for flush.ms. The timer is only armed when
+    // requests without an explicit flush arrive and the timer is
+    // immediately canceled if a flush is triggered via other means.
+    ss::timer<ss::lowres_clock> _deferred_flusher;
 
     replication_monitor _replication_monitor;
 

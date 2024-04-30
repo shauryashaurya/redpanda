@@ -10,7 +10,7 @@
 import os
 import pprint
 from contextlib import contextmanager
-from typing import Optional, Any
+from typing import Callable, Optional, Any
 
 from ducktape.utils.util import wait_until
 from requests.exceptions import HTTPError
@@ -41,19 +41,23 @@ class Scale:
         return self._scale
 
     @property
-    def local(self):
+    def local(self) -> bool:
+        """True iff we are running at local scale."""
         return self._scale == Scale.LOCAL
 
     @property
-    def ci(self):
+    def ci(self) -> bool:
+        """True iff we are running at CI scale."""
         return self._scale == Scale.CI
 
     @property
-    def release(self):
+    def release(self) -> bool:
+        """True iff we are running at release scale."""
         return self._scale == Scale.RELEASE
 
 
-def wait_until_result(condition, *args, **kwargs) -> Any:
+def wait_until_result(condition: Callable[[], Any], *args: Any,
+                      **kwargs: Any) -> Any:
     """
     a near drop-in replacement for ducktape's wait_util except that when
     the condition passes a result from the condition is passed back to the

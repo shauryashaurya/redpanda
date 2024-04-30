@@ -24,7 +24,7 @@
 #include "model/tests/random_batch.h"
 #include "model/tests/randoms.h"
 #include "model/timestamp.h"
-#include "raft/types.h"
+#include "raft/fundamental.h"
 #include "random/generators.h"
 #include "reflection/adl.h"
 #include "reflection/async_adl.h"
@@ -92,7 +92,8 @@ SEASTAR_THREAD_TEST_CASE(broker_metadata_rt_test) {
         .available_disk_gb = static_cast<uint32_t>(10000000000),
         .mount_paths = {"/", "/var/lib"},
         .etc_props = {{"max_segment_size", "1233451"}},
-        .available_memory_bytes = 1024 * 1_GiB});
+        .available_memory_bytes = 1024 * 1_GiB,
+        .in_fips_mode = true});
     auto d = serialize_roundtrip_rpc(std::move(b));
 
     BOOST_REQUIRE_EQUAL(d.id(), model::node_id(0));
@@ -111,6 +112,7 @@ SEASTAR_THREAD_TEST_CASE(broker_metadata_rt_test) {
       d.properties().etc_props.find("max_segment_size")->second, "1233451");
     BOOST_CHECK(d.rack() == std::optional<ss::sstring>("test"));
     BOOST_REQUIRE_EQUAL(d.properties().available_memory_bytes, 1024 * 1_GiB);
+    BOOST_REQUIRE(d.properties().in_fips_mode);
 }
 
 SEASTAR_THREAD_TEST_CASE(partition_assignment_rt_test) {
@@ -729,13 +731,9 @@ cluster::node::local_state random_local_state() {
 cluster::cluster_health_report random_cluster_health_report() {
     std::vector<cluster::node_state> node_states;
     for (auto i = 0, mi = random_generators::get_int(20); i < mi; ++i) {
-        node_states.push_back(cluster::node_state{
-          .id = tests::random_named_int<model::node_id>(),
-          .membership_state = model::membership_state::draining,
-          .is_alive = cluster::alive(tests::random_bool()),
-        });
+        node_states.push_back(cluster::random_node_state());
     }
-    std::vector<cluster::node_health_report> node_reports;
+    std::vector<cluster::node_health_report_ptr> node_reports;
     for (auto i = 0, mi = random_generators::get_int(20); i < mi; ++i) {
         chunked_vector<cluster::topic_status> topics;
         for (auto i = 0, mi = random_generators::get_int(20); i < mi; ++i) {
@@ -751,12 +749,13 @@ cluster::cluster_health_report random_cluster_health_report() {
         // Reduce to an ADL-encodable state
         report.local_state.cache_disk = std::nullopt;
 
-        node_reports.push_back(report);
+        node_reports.emplace_back(
+          ss::make_lw_shared<cluster::node_health_report>(std::move(report)));
     }
     cluster::cluster_health_report data{
       .raft0_leader = std::nullopt,
       .node_states = node_states,
-      .node_reports = node_reports,
+      .node_reports = std::move(node_reports),
     };
     if (tests::random_bool()) {
         data.raft0_leader = tests::random_named_int<model::node_id>();
@@ -1555,14 +1554,6 @@ SEASTAR_THREAD_TEST_CASE(serde_reflection_roundtrip) {
         roundtrip_test(data);
     }
     {
-        cluster::get_node_health_request data{
-          .filter = {
-            .ntp_filters = random_partitions_filter(),
-          },
-        };
-        roundtrip_test(data);
-    }
-    {
         storage::disk data{
           .path = random_generators::gen_alphanum_string(
             random_generators::get_int(20)),
@@ -1676,18 +1667,8 @@ SEASTAR_THREAD_TEST_CASE(serde_reflection_roundtrip) {
         };
         roundtrip_test(data);
     }
-    {
-        cluster::node_state data{
-          .id = tests::random_named_int<model::node_id>(),
-          .membership_state = model::membership_state::draining,
-          .is_alive = cluster::alive(tests::random_bool()),
-        };
-        roundtrip_test(data);
-    }
-    {
-        auto data = random_cluster_health_report();
-        roundtrip_test(data);
-    }
+    { roundtrip_test(cluster::random_node_state()); }
+    { roundtrip_test(random_cluster_health_report()); }
     {
         cluster::get_cluster_health_reply data{
           .error = cluster::errc::join_request_dispatch_error,
@@ -1695,7 +1676,7 @@ SEASTAR_THREAD_TEST_CASE(serde_reflection_roundtrip) {
         if (tests::random_bool()) {
             data.report = random_cluster_health_report();
         }
-        roundtrip_test(data);
+        roundtrip_test(std::move(data));
     }
     {
         cluster::topic_configuration_vector topics;

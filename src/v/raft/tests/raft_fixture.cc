@@ -240,8 +240,7 @@ channel& in_memory_test_protocol::get_channel(model::node_id id) {
     return *it->second;
 }
 
-void in_memory_test_protocol::on_dispatch(
-  ss::noncopyable_function<ss::future<>(msg_type)> f) {
+void in_memory_test_protocol::on_dispatch(dispatch_callback_t f) {
     _on_dispatch_handlers.push_back(std::move(f));
 }
 
@@ -301,7 +300,7 @@ in_memory_test_protocol::dispatch(model::node_id id, ReqT req) {
 
     const auto msg_type = map_msg_type<ReqT>();
     for (const auto& f : _on_dispatch_handlers) {
-        co_await f(msg_type);
+        co_await f(id, msg_type);
     }
 
     try {
@@ -360,7 +359,8 @@ raft_node_instance::raft_node_instance(
   model::revision_id revision,
   raft_node_map& node_map,
   ss::sharded<features::feature_table>& feature_table,
-  leader_update_clb_t leader_update_clb)
+  leader_update_clb_t leader_update_clb,
+  bool enable_longest_log_detection)
   : _id(id)
   , _revision(revision)
   , _logger(test_log, fmt::format("[node: {}]", _id))
@@ -377,7 +377,8 @@ raft_node_instance::raft_node_instance(
   })
   , _recovery_scheduler(
       config::mock_binding<size_t>(64), config::mock_binding(10ms))
-  , _leader_clb(std::move(leader_update_clb)) {
+  , _leader_clb(std::move(leader_update_clb))
+  , _enable_longest_log_detection(enable_longest_log_detection) {
     config::shard_local_cfg().disable_metrics.set_value(true);
 }
 
@@ -387,7 +388,8 @@ raft_node_instance::raft_node_instance(
   ss::sstring base_directory,
   raft_node_map& node_map,
   ss::sharded<features::feature_table>& feature_table,
-  leader_update_clb_t leader_update_clb)
+  leader_update_clb_t leader_update_clb,
+  bool enable_longest_log_detection)
   : _id(id)
   , _revision(revision)
   , _logger(test_log, fmt::format("[node: {}]", _id))
@@ -403,7 +405,8 @@ raft_node_instance::raft_node_instance(
   })
   , _recovery_scheduler(
       config::mock_binding<size_t>(64), config::mock_binding(10ms))
-  , _leader_clb(std::move(leader_update_clb)) {
+  , _leader_clb(std::move(leader_update_clb))
+  , _enable_longest_log_detection(enable_longest_log_detection) {
     config::shard_local_cfg().disable_metrics.set_value(true);
 }
 
@@ -447,6 +450,7 @@ raft_node_instance::initialise(std::vector<raft::vnode> initial_nodes) {
       scheduling_config(
         ss::default_scheduling_group(), ss::default_priority_class()),
       config::mock_binding<std::chrono::milliseconds>(1s),
+      config::mock_binding<bool>(_enable_longest_log_detection),
       consensus_client_protocol(_protocol),
       [this](leadership_status ls) { leadership_notification_callback(ls); },
       _storage.local(),
@@ -557,8 +561,7 @@ raft_node_instance::random_batch_base_offset(model::offset max) {
     co_return batches.front().base_offset();
 }
 
-void raft_node_instance::on_dispatch(
-  ss::noncopyable_function<ss::future<>(msg_type)> f) {
+void raft_node_instance::on_dispatch(dispatch_callback_t f) {
     _protocol->on_dispatch(std::move(f));
 }
 
@@ -568,6 +571,9 @@ seastar::future<> raft_fixture::TearDownAsync() {
 
     co_await seastar::coroutine::parallel_for_each(
       _nodes, [](auto& pair) { return pair.second->stop(); });
+
+    co_await seastar::coroutine::parallel_for_each(
+      _nodes, [](auto& pair) { return pair.second->remove_data(); });
 
     co_await _features.stop();
 }
@@ -587,9 +593,12 @@ seastar::future<> raft_fixture::SetUpAsync() {
 raft_node_instance&
 raft_fixture::add_node(model::node_id id, model::revision_id rev) {
     auto instance = std::make_unique<raft_node_instance>(
-      id, rev, *this, _features, [id, this](leadership_status lst) {
-          _leaders_view[id] = lst;
-      });
+      id,
+      rev,
+      *this,
+      _features,
+      [id, this](leadership_status lst) { _leaders_view[id] = lst; },
+      _enable_longest_log_detection);
 
     auto [it, success] = _nodes.emplace(id, std::move(instance));
     return *it->second;
@@ -603,7 +612,8 @@ raft_node_instance& raft_fixture::add_node(
       std::move(base_dir),
       *this,
       _features,
-      [id, this](leadership_status lst) { _leaders_view[id] = lst; });
+      [id, this](leadership_status lst) { _leaders_view[id] = lst; },
+      _enable_longest_log_detection);
 
     auto [it, success] = _nodes.emplace(id, std::move(instance));
     return *it->second;
@@ -620,7 +630,7 @@ raft_fixture::stop_node(model::node_id id, remove_data_dir remove) {
 }
 
 raft_node_instance& raft_fixture::node(model::node_id id) {
-    return *_nodes.find(id)->second;
+    return *_nodes.at(id);
 }
 
 ss::future<model::node_id>
@@ -713,10 +723,11 @@ ss::future<> raft_fixture::reset_background_flushing() const {
 }
 
 ss::future<> raft_fixture::set_write_caching(bool value) const {
-    auto mode = value ? model::write_caching_mode::on
-                      : model::write_caching_mode::off;
-    co_await ss::smp::invoke_on_all(
-      [mode]() { config::shard_local_cfg().write_caching.set_value(mode); });
+    auto mode = value ? model::write_caching_mode::default_true
+                      : model::write_caching_mode::default_false;
+    co_await ss::smp::invoke_on_all([mode]() {
+        config::shard_local_cfg().write_caching_default.set_value(mode);
+    });
     notify_replicas_on_config_change();
 }
 

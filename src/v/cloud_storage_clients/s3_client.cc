@@ -73,6 +73,7 @@ request_creator::request_creator(
   const s3_configuration& conf,
   ss::lw_shared_ptr<const cloud_roles::apply_credentials> apply_credentials)
   : _ap(conf.uri)
+  , _ap_style(conf.url_style)
   , _apply_credentials{std::move(apply_credentials)} {}
 
 result<http::client::request_header> request_creator::make_get_object_request(
@@ -80,13 +81,18 @@ result<http::client::request_header> request_creator::make_get_object_request(
   object_key const& key,
   std::optional<http_byte_range> byte_range) {
     http::client::request_header header{};
+    // Virtual Style:
     // GET /{object-id} HTTP/1.1
-    // Host: {bucket-name}.s3.amazonaws.com
+    // Host: {bucket-name}.s3.{region}.amazonaws.com
+    // Path Style:
+    // GET /{bucket-name}/{object-id} HTTP/1.1
+    // Host: s3.{region}.amazonaws.com
+    //
     // x-amz-date:{req-datetime}
     // Authorization:{signature}
     // x-amz-content-sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
-    auto host = fmt::format("{}.{}", name(), _ap());
-    auto target = fmt::format("/{}", key().string());
+    auto host = make_host(name);
+    auto target = make_target(name, key);
     header.method(boost::beast::http::verb::get);
     header.target(target);
     header.insert(
@@ -111,13 +117,18 @@ result<http::client::request_header> request_creator::make_get_object_request(
 result<http::client::request_header> request_creator::make_head_object_request(
   bucket_name const& name, object_key const& key) {
     http::client::request_header header{};
+    // Virtual Style:
     // HEAD /{object-id} HTTP/1.1
-    // Host: {bucket-name}.s3.amazonaws.com
+    // Host: {bucket-name}.s3.{region}.amazonaws.com
+    // Path Style:
+    // HEAD /{bucket-name}/{object-id} HTTP/1.1
+    // Host: s3.{region}.amazonaws.com
+    //
     // x-amz-date:{req-datetime}
     // Authorization:{signature}
     // x-amz-content-sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
-    auto host = fmt::format("{}.{}", name(), _ap());
-    auto target = fmt::format("/{}", key().string());
+    auto host = make_host(name);
+    auto target = make_target(name, key);
     header.method(boost::beast::http::verb::head);
     header.target(target);
     header.insert(
@@ -134,8 +145,13 @@ result<http::client::request_header> request_creator::make_head_object_request(
 result<http::client::request_header>
 request_creator::make_unsigned_put_object_request(
   bucket_name const& name, object_key const& key, size_t payload_size_bytes) {
+    // Virtual Style:
     // PUT /my-image.jpg HTTP/1.1
-    // Host: myBucket.s3.<Region>.amazonaws.com
+    // Host: {bucket-name}.s3.{region}.amazonaws.com
+    // Path Style:
+    // PUT /{bucket-name}/{object-id} HTTP/1.1
+    // Host: s3.{region}.amazonaws.com
+    //
     // Date: Wed, 12 Oct 2009 17:50:00 GMT
     // Authorization: authorization string
     // Content-Type: text/plain
@@ -144,8 +160,8 @@ request_creator::make_unsigned_put_object_request(
     // Expect: 100-continue
     // [11434 bytes of object data]
     http::client::request_header header{};
-    auto host = fmt::format("{}.{}", name(), _ap());
-    auto target = fmt::format("/{}", key().string());
+    auto host = make_host(name);
+    auto target = make_target(name, key);
     header.method(boost::beast::http::verb::put);
     header.target(target);
     header.insert(
@@ -172,19 +188,25 @@ request_creator::make_list_objects_v2_request(
   std::optional<size_t> max_keys,
   std::optional<ss::sstring> continuation_token,
   std::optional<char> delimiter) {
+    // Virtual Style:
     // GET /?list-type=2&prefix=photos/2006/&delimiter=/ HTTP/1.1
-    // Host: example-bucket.s3.<Region>.amazonaws.com
+    // Host: {bucket-name}.s3.{region}.amazonaws.com
+    // Path Style:
+    // GET /{bucket-name}/?list-type=2&prefix=photos/2006/&delimiter=/ HTTP/1.1
+    // Host: s3.{region}.amazonaws.com
+    //
     // x-amz-date: 20160501T000433Z
     // Authorization: authorization string
     http::client::request_header header{};
-    auto host = fmt::format("{}.{}", name(), _ap());
-    auto target = fmt::format("/?list-type=2");
+    auto host = make_host(name);
+    auto key = fmt::format("?list-type=2");
     if (prefix.has_value()) {
-        target = fmt::format("{}&prefix={}", target, (*prefix)().string());
+        key = fmt::format("{}&prefix={}", key, (*prefix)().string());
     }
     if (delimiter.has_value()) {
-        target = fmt::format("{}&delimiter={}", target, *delimiter);
+        key = fmt::format("{}&delimiter={}", key, *delimiter);
     }
+    auto target = make_target(name, object_key{key});
     header.method(boost::beast::http::verb::get);
     header.target(target);
     header.insert(
@@ -224,15 +246,20 @@ result<http::client::request_header>
 request_creator::make_delete_object_request(
   bucket_name const& name, object_key const& key) {
     http::client::request_header header{};
+    // Virtual Style:
     // DELETE /{object-id} HTTP/1.1
     // Host: {bucket-name}.s3.amazonaws.com
+    // Path Style:
+    // DELETE /{bucket-name}/{object-id} HTTP/1.1
+    // Host: s3.{region}.amazonaws.com
+    //
     // x-amz-date:{req-datetime}
     // Authorization:{signature}
     // x-amz-content-sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
     //
     // NOTE: x-amz-mfa, x-amz-bypass-governance-retention are not used for now
-    auto host = fmt::format("{}.{}", name(), _ap());
-    auto target = fmt::format("/{}", key().string());
+    auto host = make_host(name);
+    auto target = make_target(name, key);
     header.method(boost::beast::http::verb::delete_);
     header.target(target);
     header.insert(
@@ -262,8 +289,13 @@ request_creator::make_delete_objects_request(
     // https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObjects.html
     // will generate this request:
     //
+    // Virtual Style:
     // POST /?delete HTTP/1.1
-    // Host: <Bucket>.s3.amazonaws.com
+    // Host: {bucket-name}.s3.{region}.amazonaws.com
+    // Path Style:
+    // POST /{bucket-name}/?delete HTTP/1.1
+    // Host: s3.{region}.amazonaws.com
+    //
     // Content-MD5: <Computer from body>
     // Authorization: <applied by _requestor>
     // Content-Length: <...>
@@ -317,11 +349,12 @@ request_creator::make_delete_objects_request(
         return bytes_to_base64(to_bytes_view(bin_digest));
     }();
 
-    auto header = http::client::request_header{};
+    http::client::request_header header{};
     header.method(boost::beast::http::verb::post);
-    header.target("/?delete");
-    header.insert(
-      boost::beast::http::field::host, fmt::format("{}.{}", name(), _ap()));
+    auto host = make_host(name);
+    auto target = make_target(name, object_key{"?delete"});
+    header.target(target);
+    header.insert(boost::beast::http::field::host, host);
     // from experiments, minio is sloppy in checking this field. It will check
     // that it's valid base64, but seems not to actually check the value
     header.insert(
@@ -341,6 +374,29 @@ request_creator::make_delete_objects_request(
       std::move(header),
       ss::input_stream<char>{ss::data_source{
         std::make_unique<delete_objects_body>(std::move(body))}}};
+}
+
+std::string request_creator::make_host(const bucket_name& name) const {
+    switch (_ap_style) {
+    case s3_url_style::virtual_host:
+        // Host: bucket-name.s3.region-code.amazonaws.com
+        return fmt::format("{}.{}", name(), _ap());
+    case s3_url_style::path:
+        // Host: s3.region-code.amazonaws.com
+        return fmt::format("{}", _ap());
+    }
+}
+
+std::string request_creator::make_target(
+  const bucket_name& name, const object_key& key) const {
+    switch (_ap_style) {
+    case s3_url_style::virtual_host:
+        // Target: /homepage.html
+        return fmt::format("/{}", key().string());
+    case s3_url_style::path:
+        // Target: /example.com/homepage.html
+        return fmt::format("/{}/{}", name(), key().string());
+    }
 }
 
 // client //
@@ -415,7 +471,11 @@ ss::future<ResultT> parse_head_error_response(
           code, msg, ss::sstring(rid.data(), rid.size()), key().native());
         return ss::make_exception_future<ResultT>(err);
     } catch (...) {
-        vlog(s3_log.error, "!!error parse error {}", std::current_exception());
+        vlog(
+          s3_log.error,
+          "!!error parse error {}, header: {}",
+          std::current_exception(),
+          hdr);
         throw;
     }
 }
@@ -452,7 +512,12 @@ ss::future<result<T, error_outcome>> s3_client::send_request(
             // the manifest's prefix. Backoff algorithm should be applied.
             // In principle only slow_down should occur, but in practice
             // AWS S3 does return internal_error as well sometimes.
-            vlog(s3_log.warn, "{} response received {}", err.code(), bucket);
+            vlog(
+              s3_log.warn,
+              "{} response received {} in {}",
+              err.code(),
+              key,
+              bucket);
             outcome = error_outcome::retry;
         } else {
             // Unexpected REST API error, we can't recover from this
@@ -460,9 +525,10 @@ ss::future<result<T, error_outcome>> s3_client::send_request(
             // exist)
             vlog(
               s3_log.error,
-              "Accessing {}, unexpected REST API error \"{}\" detected, "
+              "Accessing {} in {}, unexpected REST API error \"{}\" detected, "
               "code: "
               "{}, request_id: {}, resource: {}",
+              key,
               bucket,
               err.message(),
               err.code_string(),
@@ -535,8 +601,8 @@ ss::future<http::client::response_stream_ref> s3_client::do_get_object(
     }
     vlog(s3_log.trace, "send https request:\n{}", header.value());
     return _client.request(std::move(header.value()), timeout)
-      .then([expect_no_such_key,
-             is_byte_range_requested](http::client::response_stream_ref&& ref) {
+      .then([expect_no_such_key, is_byte_range_requested, key](
+              http::client::response_stream_ref&& ref) {
           // here we didn't receive any bytes from the socket and
           // ref->is_header_done() is 'false', we need to prefetch
           // the header first
@@ -545,7 +611,8 @@ ss::future<http::client::response_stream_ref> s3_client::do_get_object(
           auto f = ref->prefetch_headers();
           return f.then([ref = std::move(ref),
                          expect_no_such_key,
-                         is_byte_range_requested]() mutable {
+                         is_byte_range_requested,
+                         key]() mutable {
               vassert(ref->is_header_done(), "Header is not received");
               const auto result = ref->get_headers().result();
               bool request_failed = result != boost::beast::http::status::ok;
@@ -561,13 +628,16 @@ ss::future<http::client::response_stream_ref> s3_client::do_get_object(
                     && result == boost::beast::http::status::not_found) {
                       vlog(
                         s3_log.debug,
-                        "S3 GET request with expected error: {} {:l}",
+                        "S3 GET request with expected error for key {}: {} "
+                        "{:l}",
+                        key,
                         ref->get_headers().result(),
                         ref->get_headers());
                   } else {
                       vlog(
                         s3_log.warn,
-                        "S3 GET request failed: {} {:l}",
+                        "S3 GET request failed for key {}: {} {:l}",
+                        key,
                         ref->get_headers().result(),
                         ref->get_headers());
                   }
@@ -612,14 +682,16 @@ ss::future<s3_client::head_object_result> s3_client::do_head_object(
                   if (status == boost::beast::http::status::not_found) {
                       vlog(
                         s3_log.debug,
-                        "Object not available, error: {:l}",
+                        "Object {} not available, error: {:l}",
+                        key,
                         ref->get_headers());
                       return parse_head_error_response<head_object_result>(
                         ref->get_headers(), key);
                   } else if (status != boost::beast::http::status::ok) {
                       vlog(
                         s3_log.warn,
-                        "S3 HEAD request failed: {} {:l}",
+                        "S3 HEAD request failed for key {}: {} {:l}",
+                        key,
                         status,
                         ref->get_headers());
                       return parse_head_error_response<head_object_result>(
@@ -675,21 +747,22 @@ ss::future<> s3_client::do_put_object(
     vlog(s3_log.trace, "send https request:\n{}", header.value());
     return ss::do_with(
       std::move(body),
-      [this, timeout, header = std::move(header)](
+      [this, timeout, header = std::move(header), id](
         ss::input_stream<char>& body) mutable {
           auto make_request = [this, &header, &body, &timeout]() {
               return _client.request(std::move(header.value()), body, timeout);
           };
 
           return ss::futurize_invoke(make_request)
-            .then([](const http::client::response_stream_ref& ref) {
+            .then([id](const http::client::response_stream_ref& ref) {
                 return util::drain_response_stream(ref).then(
-                  [ref](iobuf&& res) {
+                  [ref, id](iobuf&& res) {
                       auto status = ref->get_headers().result();
                       if (status != boost::beast::http::status::ok) {
                           vlog(
                             s3_log.warn,
-                            "S3 PUT request failed: {} {:l}",
+                            "S3 PUT request failed for key {}: {} {:l}",
+                            id,
                             status,
                             ref->get_headers());
                           return parse_rest_error_response<>(
@@ -706,8 +779,12 @@ ss::future<> s3_client::do_put_object(
                 _probe->register_failure(err.code(), op_type_tag::upload);
                 return ss::make_exception_future<>(err);
             })
-            .handle_exception([](std::exception_ptr eptr) {
-                vlog(s3_log.warn, "S3 PUT request failed with error: {}", eptr);
+            .handle_exception([id](std::exception_ptr eptr) {
+                vlog(
+                  s3_log.warn,
+                  "S3 PUT request failed with error for key {}: {}",
+                  id,
+                  eptr);
                 return ss::make_exception_future<>(eptr);
             })
             .finally([&body]() { return body.close(); });
@@ -852,8 +929,8 @@ ss::future<> s3_client::do_delete_object(
     }
     vlog(s3_log.trace, "send https request:\n{}", header.value());
     return _client.request(std::move(header.value()), timeout)
-      .then([](const http::client::response_stream_ref& ref) {
-          return util::drain_response_stream(ref).then([ref](iobuf&& res) {
+      .then([key](const http::client::response_stream_ref& ref) {
+          return util::drain_response_stream(ref).then([ref, key](iobuf&& res) {
               auto status = ref->get_headers().result();
               if (
                 status != boost::beast::http::status::ok
@@ -861,7 +938,8 @@ ss::future<> s3_client::do_delete_object(
                      != boost::beast::http::status::no_content) { // expect 204
                   vlog(
                     s3_log.warn,
-                    "S3 DeleteObject request failed: {} {:l}",
+                    "S3 DeleteObject request failed for key {}: {} {:l}",
+                    key,
                     status,
                     ref->get_headers());
                   return parse_rest_error_response<>(status, std::move(res));
@@ -975,8 +1053,8 @@ auto s3_client::delete_objects(
   std::vector<object_key> keys,
   ss::lowres_clock::duration timeout)
   -> ss::future<result<delete_objects_result, error_outcome>> {
-    object_key dummy{""};
-    return send_request(
+    const object_key dummy{""};
+    co_return co_await send_request(
       do_delete_objects(bucket, keys, timeout), bucket, dummy);
 }
 } // namespace cloud_storage_clients

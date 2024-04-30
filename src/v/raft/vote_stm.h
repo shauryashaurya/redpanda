@@ -12,6 +12,7 @@
 #pragma once
 
 #include "base/outcome.h"
+#include "raft/fwd.h"
 #include "raft/group_configuration.h"
 #include "raft/logger.h"
 #include "raft/types.h"
@@ -95,8 +96,18 @@ private:
             // it is an error
             return state::error;
         }
+
+        bool has_more_up_to_date_log() const {
+            return value && value->has_value() && !value->value().log_ok;
+        }
         std::unique_ptr<result<vote_reply>> value;
     };
+
+    bool has_request_in_progress() const;
+
+    bool can_wait_for_all() const;
+
+    ss::future<> wait_for_next_reply();
 
     friend std::ostream& operator<<(std::ostream&, const vmeta&);
 
@@ -121,6 +132,7 @@ private:
     ss::gate _vote_bg;
     absl::flat_hash_map<vnode, vmeta> _replies;
     ctx_log _ctxlog;
+    clock_type::time_point _requests_dispatched_ts;
 };
 
 } // namespace raft

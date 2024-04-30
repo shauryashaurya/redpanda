@@ -251,6 +251,30 @@ configuration::configuration()
       "after any character escaping.",
       {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
       1_KiB)
+  , data_transforms_read_buffer_memory_percentage(
+      *this,
+      "data_transforms_read_buffer_memory_percentage",
+      "The percentage of available memory in the transform subsystem to use "
+      "for read buffers",
+      {
+        .needs_restart = needs_restart::yes,
+        .example = "25",
+        .visibility = visibility::tunable,
+      },
+      45,
+      {.min = 1, .max = 99})
+  , data_transforms_write_buffer_memory_percentage(
+      *this,
+      "data_transforms_write_buffer_memory_percentage",
+      "The percentage of available memory in the transform subsystem to use "
+      "for write buffers",
+      {
+        .needs_restart = needs_restart::yes,
+        .example = "25",
+        .visibility = visibility::tunable,
+      },
+      45,
+      {.min = 1, .max = 99})
   , topic_memory_per_partition(
       *this,
       "topic_memory_per_partition",
@@ -406,6 +430,15 @@ configuration::configuration()
           }
           return std::nullopt;
       })
+  , raft_enable_longest_log_detection(
+      *this,
+      "raft_enable_longest_log_detection",
+      "Enables additional step in leader election where candidate is allowed "
+      "to wait for all the replies from node it requested votes from. This may "
+      "introduce a small delay when recovering from failure but will prevent "
+      "truncation if any of the replicas has more data than the majority.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      true)
   , enable_usage(
       *this,
       "enable_usage",
@@ -968,20 +1001,20 @@ configuration::configuration()
       "one follower",
       {.visibility = visibility::tunable},
       16)
-  , write_caching(
+  , write_caching_default(
       *this,
-      "write_caching",
+      "write_caching_default",
       "Cache batches until the segment appender chunk is full instead of "
       "flushing for every acks=all write. This is the global default "
       "for all topics and can be overriden at a topic scope with property "
       "write.caching. 'disabled' mode takes precedence over topic overrides "
       "and disables the feature altogether for the entire cluster.",
       {.needs_restart = needs_restart::no,
-       .example = "on",
+       .example = "true",
        .visibility = visibility::user},
-      model::write_caching_mode::off,
-      {model::write_caching_mode::on,
-       model::write_caching_mode::off,
+      model::write_caching_mode::default_false,
+      {model::write_caching_mode::default_true,
+       model::write_caching_mode::default_false,
        model::write_caching_mode::disabled})
   , reclaim_min_size(
       *this,
@@ -1221,6 +1254,13 @@ configuration::configuration()
        .visibility = visibility::tunable},
       2,
       {.min = 1})
+  , debug_load_slice_warning_depth(
+      *this,
+      "debug_load_slice_warning_depth",
+      "The recursion depth after which debug logging will be enabled "
+      "automatically for the log reader.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      std::nullopt)
   , tx_registry_log_capacity(*this, "tx_registry_log_capacity")
   , id_allocator_log_capacity(
       *this,
@@ -1630,6 +1670,18 @@ configuration::configuration()
       {.visibility = visibility::user},
       std::nullopt,
       &validate_non_empty_string_opt)
+  , cloud_storage_url_style(
+      *this,
+      "cloud_storage_url_style",
+      "The addressing style to use for S3 requests.",
+      {.needs_restart = needs_restart::yes,
+       .example = "virtual_host",
+       .visibility = visibility::user},
+      cloud_storage_clients::s3_url_style::virtual_host,
+      {
+        cloud_storage_clients::s3_url_style::virtual_host,
+        cloud_storage_clients::s3_url_style::path,
+      })
   , cloud_storage_credentials_source(
       *this,
       "cloud_storage_credentials_source",
@@ -2128,6 +2180,17 @@ configuration::configuration()
       "cloud_storage_azure_adls_endpoint.",
       {.needs_restart = needs_restart::yes, .visibility = visibility::user},
       std::nullopt)
+  , cloud_storage_azure_hierarchical_namespace_enabled(
+      *this,
+      "cloud_storage_azure_hierarchical_namespace_enabled",
+      "Whether or not Azure Hierarchical Namespaces are enabled on the "
+      "cloud_storage_azure_storage_account. If this property is not set, "
+      "cloud_storage_azure_shared_key must be set, and each node will try to "
+      "determine at startup if HNS is enabled. Setting this property to True "
+      "will disable the check and assume HNS is active. Setting to False will "
+      "disable the check and assume that HNS is not active.",
+      {.needs_restart = needs_restart::yes, .visibility = visibility::tunable},
+      std::nullopt)
   , cloud_storage_upload_ctrl_update_interval_ms(
       *this,
       "cloud_storage_upload_ctrl_update_interval_ms",
@@ -2332,6 +2395,18 @@ configuration::configuration()
       // Enough for a >1TiB cache of 16MiB objects.  Decrease this in case
       // of issues with trim performance.
       100000)
+  , cloud_storage_cache_trim_carryover_bytes(
+      *this,
+      "cloud_storage_cache_trim_carryover_bytes",
+      "The cache performs a recursive directory inspection during the cache "
+      "trim. The information obtained during the inspection can be carried "
+      "over to the next trim operation. This parameter sets a limit on the "
+      "memory occupied by objects that can be carried over from one trim to "
+      "next, and allows cache to quickly unblock readers before starting the "
+      "directory inspection.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      // This roughly translates to around 1000 carryover file names
+      256_KiB)
   , cloud_storage_cache_check_interval_ms(
       *this,
       "cloud_storage_cache_check_interval",
@@ -2506,6 +2581,12 @@ configuration::configuration()
       "Size of the zstd decompression workspace",
       {.visibility = visibility::tunable},
       8_MiB)
+  , lz4_decompress_reusable_buffers_disabled(
+      *this,
+      "lz4_decompress_reusable_buffers_disabled",
+      "Disable reusable preallocated buffers for LZ4 decompression",
+      {.needs_restart = needs_restart::yes, .visibility = visibility::tunable},
+      false)
   , full_raft_configuration_recovery_pattern(
       *this, "full_raft_configuration_recovery_pattern")
   , enable_auto_rebalance_on_node_add(
@@ -2690,6 +2771,13 @@ configuration::configuration()
       "the data directory. Redpanda will refuse to start if it is not found.",
       {.needs_restart = needs_restart::no, .visibility = visibility::user},
       false)
+  , alive_timeout_ms(
+      *this,
+      "alive_timeout_ms",
+      "Time from the last node status heartbeat after which a node will be "
+      "considered offline and not alive",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      5s)
   , memory_abort_on_alloc_failure(
       *this,
       "memory_abort_on_alloc_failure",
@@ -2881,7 +2969,7 @@ configuration::configuration()
       "milliseconds. Value of 0 disables the balancer and makes all the "
       "throughput quotas immutable.",
       {.needs_restart = needs_restart::no, .visibility = visibility::user},
-      750ms,
+      0ms,
       {.min = 0ms})
   , kafka_quota_balancer_min_shard_throughput_ratio(
       *this,

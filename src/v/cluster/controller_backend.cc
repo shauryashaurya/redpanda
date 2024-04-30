@@ -31,8 +31,8 @@
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "prometheus/prometheus_sanitize.h"
+#include "raft/fundamental.h"
 #include "raft/group_configuration.h"
-#include "raft/types.h"
 #include "ssx/event.h"
 #include "ssx/future-util.h"
 #include "storage/offset_translator.h"
@@ -882,9 +882,10 @@ ss::future<> controller_backend::try_reconcile_ntp(
         }
 
         if (last_error != errc::success) {
-            vassert(rs.cur_operation, "[{}] expected current operation", ntp);
-            rs.cur_operation->last_error = last_error;
-            rs.cur_operation->retries += 1;
+            if (rs.cur_operation) {
+                rs.cur_operation->last_error = last_error;
+                rs.cur_operation->retries += 1;
+            }
             vlog(
               clusterlog.trace,
               "[{}] reconciliation attempt finished, state: {}",
@@ -1613,6 +1614,14 @@ controller_backend::force_abort_replica_set_update(
         }
         co_return errc::waiting_for_recovery;
     } else {
+        auto leader_id = partition->get_leader_id();
+        if (leader_id && leader_id != _self) {
+            // The leader is alive and we are a follower. Wait for the leader to
+            // replicate the aborting configuration, but don't append it
+            // ourselves to minimize the chance of log inconsistency.
+            co_return errc::not_leader;
+        }
+
         vlog(
           clusterlog.debug,
           "[{}] force-aborting reconfiguration",

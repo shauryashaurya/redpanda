@@ -85,23 +85,23 @@ class SimpleEndToEndTest(EndToEndTest):
 
     @skip_debug_mode
     @cluster(num_nodes=6)
-    @parametrize(write_caching=True)
+    @parametrize(write_caching=True, disable_batch_cache=False)
+    @parametrize(write_caching=True, disable_batch_cache=True)
     @parametrize(write_caching=False)
-    def test_relaxed_acks(self, write_caching):
-        ev = threading.Event()
+    def test_relaxed_acks(self, write_caching, disable_batch_cache=False):
+        stop_fi_ev = threading.Event()
 
         def inject_failures():
             fi = FailureInjector(self.redpanda)
-            while not ev.is_set():
-
+            while not stop_fi_ev.is_set():
                 node = random.choice(self.redpanda.nodes)
                 fi.inject_failure(
                     FailureSpec(type=FailureSpec.FAILURE_KILL,
                                 length=0,
                                 node=node))
-                time.sleep(5)
+                time.sleep(10)
 
-        (acks, wc_conf) = (-1, "on") if write_caching else (1, "off")
+        (acks, wc_conf) = (-1, "true") if write_caching else (1, "false")
         # use small segment size to enable log eviction
         self.start_redpanda(num_nodes=3,
                             si_settings=SISettings(
@@ -114,15 +114,17 @@ class SimpleEndToEndTest(EndToEndTest):
                                 5242880,
                                 "default_topic_replications":
                                 3,
-                                "write_caching":
+                                "write_caching_default":
                                 wc_conf,
                                 "raft_replica_max_pending_flush_bytes":
                                 1024 * 1024 * 1024 * 1024,
                                 "raft_replica_max_flush_delay_ms":
-                                3000000
+                                3000000,
+                                "disable_batch_cache":
+                                disable_batch_cache,
                             })
 
-        self.redpanda.logger.debug(
+        self.logger.debug(
             f"Using configuration: acks: {acks}, write_caching: {wc_conf}")
         spec = TopicSpec(name="verify-leader-ack",
                          partition_count=16,
@@ -135,11 +137,11 @@ class SimpleEndToEndTest(EndToEndTest):
 
         self.start_consumer(1)
         self.await_startup()
-        thread = threading.Thread(target=inject_failures, daemon=True)
-        thread.start()
 
+        fi_thread = threading.Thread(target=inject_failures, daemon=True)
+        fi_thread.start()
         self.run_validation(min_records=100000,
                             producer_timeout_sec=300,
                             consumer_timeout_sec=300)
-        ev.set()
-        thread.join()
+        stop_fi_ev.set()
+        fi_thread.join()

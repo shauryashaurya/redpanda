@@ -11,19 +11,21 @@
 
 #pragma once
 
+#include "json/iobuf_writer.h"
 #include "pandaproxy/json/rjson_util.h"
 #include "pandaproxy/schema_registry/types.h"
 
 namespace pandaproxy::schema_registry {
 
 struct post_subject_versions_version_response {
-    canonical_schema schema;
+    subject_schema schema;
     schema_id id;
     schema_version version;
 };
 
-inline void rjson_serialize(
-  ::json::Writer<::json::StringBuffer>& w,
+template<typename Buffer>
+void rjson_serialize(
+  ::json::iobuf_writer<Buffer>& w,
   const post_subject_versions_version_response& res) {
     w.StartObject();
     w.Key("subject");

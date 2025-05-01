@@ -16,10 +16,15 @@
 #include "cloud_storage/materialized_resources.h"
 #include "cloud_storage/offset_translation_layer.h"
 #include "cloud_storage/partition_manifest.h"
+#include "cloud_storage/partition_manifest_downloader.h"
+#include "cloud_storage/remote_path_provider.h"
 #include "cloud_storage/remote_segment.h"
 #include "cloud_storage/tx_range_manifest.h"
 #include "cloud_storage/types.h"
+#include "cloud_storage_clients/types.h"
 #include "model/fundamental.h"
+#include "model/timestamp.h"
+#include "net/connection.h"
 #include "ssx/future-util.h"
 #include "ssx/watchdog.h"
 #include "storage/log_reader.h"
@@ -187,7 +192,8 @@ remote_partition::borrow_result_t remote_partition::borrow_next_segment_reader(
     if (iter != _segments.end()) {
         if (
           iter->second->segment->get_segment_path()
-          != manifest.generate_segment_path(*mit)) {
+          != manifest.generate_segment_path(
+            *mit, _manifest_view->path_provider())) {
             // The segment was replaced and doesn't match metadata anymore. We
             // want to avoid picking it up because otherwise we won't be able to
             // make any progress.
@@ -196,7 +202,8 @@ remote_partition::borrow_result_t remote_partition::borrow_next_segment_reader(
         }
     }
     if (iter == _segments.end()) {
-        auto path = manifest.generate_segment_path(*mit);
+        auto path = manifest.generate_segment_path(
+          *mit, _manifest_view->path_provider());
         iter = get_or_materialize_segment(path, *mit, std::move(segment_unit));
     }
     auto mit_committed_offset = mit->committed_offset;
@@ -242,12 +249,25 @@ public:
         if (config.abort_source) {
             vlog(_ctxlog.debug, "abort_source is set");
             _partition_reader_as = config.abort_source;
-            auto sub = config.abort_source->get().subscribe([this]() noexcept {
-                vlog(_ctxlog.debug, "abort requested via config.abort_source");
-                if (_seg_reader) {
-                    _partition->evict_segment_reader(std::move(_seg_reader));
-                }
-            });
+            auto sub = config.abort_source->get().subscribe(
+              [this](const std::optional<std::exception_ptr>& eptr) noexcept {
+                  auto reason = eptr.has_value()
+                                  ? net::is_disconnect_exception(*eptr)
+                                  : "shutdown";
+                  if (reason) {
+                      vlog(
+                        _ctxlog.debug,
+                        "abort requested via config.abort_source: {}",
+                        reason);
+                  } else {
+                      vlog(
+                        _ctxlog.debug,
+                        "abort requested via config.abort_source");
+                  }
+                  if (_seg_reader) {
+                      _partition->evict_segment_reader(std::move(_seg_reader));
+                  }
+              });
             if (sub) {
                 _as_sub = std::move(*sub);
             } else {
@@ -316,8 +336,36 @@ public:
     void throw_on_external_abort() {
         _partition->_as.check();
 
-        if (_partition_reader_as) {
-            _partition_reader_as.value().get().check();
+        if (
+          _partition_reader_as
+          && _partition_reader_as.value().get().abort_requested()) {
+            // Avoid logging boring exceptions
+            try {
+                _partition_reader_as.value().get().check();
+            } catch (...) {
+                auto eptr = std::current_exception();
+                if (ssx::is_shutdown_exception(eptr)) {
+                    // Shutdown exception is not expected here. We're only
+                    // using this abort source to propagate exceptions.
+                    // The exception will be handled correctly but we need
+                    // to have an audit trail.
+                    vlog(_ctxlog.error, "Unexpected shutdown error: {}", eptr);
+                } else {
+                    auto reason = net::is_disconnect_exception(eptr);
+                    if (reason.has_value()) {
+                        // This indicates that the exception is
+                        // uninteresting and can be ignored for good.
+                        // Convert it to abort_requested_exception.
+                        vlog(
+                          _ctxlog.debug,
+                          "Kafka client disconnected: {}",
+                          reason.value());
+                        eptr = std::make_exception_ptr(
+                          ss::abort_requested_exception());
+                    }
+                }
+                std::rethrow_exception(eptr);
+            }
         }
     }
 
@@ -510,7 +558,10 @@ private:
 
         async_view_search_query_t query;
         if (config.first_timestamp.has_value()) {
-            query = config.first_timestamp.value();
+            query = async_view_timestamp_query(
+              model::offset_cast(config.start_offset),
+              config.first_timestamp.value(),
+              model::offset_cast(config.max_offset));
         } else {
             // NOTE: config.start_offset actually contains kafka offset
             // stored using model::offset type.
@@ -523,66 +574,72 @@ private:
                 co_return;
             }
 
-            if (
-              cur.error() == error_outcome::out_of_range
-              && ss::visit(
-                query,
-                [&](model::offset) { return false; },
-                [&](kafka::offset query_offset) {
-                    // Special case queries below the start offset of the log.
-                    // The start offset may have advanced while the request was
-                    // in progress. This is expected, so log at debug level.
-                    const auto log_start_offset
-                      = _partition->_manifest_view->stm_manifest()
-                          .full_log_start_kafka_offset();
+            // Out of range queries are unexpected. The caller must take care
+            // to send only valid queries to remote_partition. I.e. the fetch
+            // handler does such validation. Similar validation is done inside
+            // remote partition.
+            //
+            // Out of range at this point is due to a race condition or due to
+            // a bug. In both cases the only valid action is to throw an
+            // exception and let the caller deal with it. If the caller doesn't
+            // handle it it leads to a closed kafka connection which the
+            // end clients retry.
+            if (cur.error() == error_outcome::out_of_range) {
+                ss::visit(
+                  query,
+                  [&](model::offset) {
+                      vassert(
+                        false,
+                        "Unreachable code. Remote partition doesn't know how "
+                        "to "
+                        "handle model::offset queries.");
+                  },
+                  [&](kafka::offset query_offset) {
+                      // Bug or retention racing with the query.
+                      const auto log_start_offset
+                        = _partition->_manifest_view->stm_manifest()
+                            .full_log_start_kafka_offset();
 
-                    if (log_start_offset && query_offset < *log_start_offset) {
-                        vlog(
-                          _ctxlog.debug,
-                          "Manifest query below the log's start Kafka offset: "
-                          "{} < {}",
-                          query_offset(),
-                          log_start_offset.value()());
-                        return true;
-                    }
-                    return false;
-                },
-                [&](model::timestamp query_ts) {
-                    // Special case, it can happen when a timequery falls below
-                    // the clean offset. Caused when the query races with
-                    // retention/gc. log a warning, since the kafka client can
-                    // handle a failed query
-                    auto const& spillovers = _partition->_manifest_view
-                                               ->stm_manifest()
-                                               .get_spillover_map();
-                    if (
-                      spillovers.empty()
-                      || spillovers.get_max_timestamp_column()
-                             .last_value()
-                             .value_or(model::timestamp::max()())
-                           >= query_ts()) {
-                        vlog(
-                          _ctxlog.debug,
-                          "Manifest query raced with retention and the result "
-                          "is below the clean/start offset for {}",
-                          query_ts);
-                        return true;
-                    }
+                      if (
+                        log_start_offset && query_offset < *log_start_offset) {
+                          vlog(
+                            _ctxlog.warn,
+                            "Manifest query below the log's start Kafka "
+                            "offset: "
+                            "{} < {}",
+                            query_offset(),
+                            log_start_offset.value()());
+                      }
+                  },
+                  [&](const async_view_timestamp_query& query_ts) {
+                      // Special case, it can happen when a timequery falls
+                      // below the clean offset. Caused when the query races
+                      // with retention/gc.
+                      const auto& spillovers = _partition->_manifest_view
+                                                 ->stm_manifest()
+                                                 .get_spillover_map();
 
-                    // query was not meant for archive region. fallthrough and
-                    // log an error
-                    return false;
-                })) {
-                // error was handled
-                co_return;
+                      bool timestamp_inside_spillover
+                        = query_ts.ts()
+                          <= spillovers.get_max_timestamp_column()
+                               .last_value()
+                               .value_or(model::timestamp::min()());
+
+                      if (timestamp_inside_spillover) {
+                          vlog(
+                            _ctxlog.debug,
+                            "Manifest query raced with retention and the "
+                            "result "
+                            "is below the clean/start offset for {}",
+                            query_ts);
+                      }
+                  });
             }
 
-            vlog(
-              _ctxlog.error,
+            throw std::runtime_error(fmt::format(
               "Failed to query spillover manifests: {}, query: {}",
               cur.error(),
-              query);
-            co_return;
+              query));
         }
         _view_cursor = std::move(cur.value());
         co_await _view_cursor->with_manifest(
@@ -812,8 +869,13 @@ private:
     /// Transition reader to the completed state. Stop tracking state in
     /// the 'remote_partition'
     ss::future<> set_end_of_stream() {
-        co_await _seg_reader->stop();
-        _seg_reader = {};
+        if (!_seg_reader) {
+            co_return;
+        }
+        // It's critical that we swap out the reader before calling stop().
+        // Otherwise, another fiber may swap it out while we're stopping!
+        auto reader = std::move(_seg_reader);
+        co_await reader->stop();
     }
 
     retry_chain_node _rtc;
@@ -904,7 +966,7 @@ ss::future<> remote_partition::run_eviction_loop() {
         // got stuck. The deadline is set to 5 minutes to avoid false positives.
         // The callback is self sufficient and can outlive the remote_partition
         // instance.
-        watchdog wd(300s, [ntp = _ntp] {
+        ssx::watchdog wd(300s, [ntp = _ntp] {
             vlog(cst_log.error, "Eviction loop for partition {} stuck", ntp);
         });
         auto eviction_in_flight = std::exchange(_eviction_pending, {});
@@ -1010,7 +1072,8 @@ remote_partition::aborted_transactions(offset_range offsets) {
             // up front at the start of the function.
             auto segment_unit = co_await materialized().get_segment_units(
               std::nullopt);
-            auto path = stm_manifest.generate_segment_path(*it);
+            auto path = stm_manifest.generate_segment_path(
+              *it, _manifest_view->path_provider());
             auto m = get_or_materialize_segment(
               path, *it, std::move(segment_unit));
             remote_segs.emplace_back(m->second->segment);
@@ -1042,7 +1105,7 @@ remote_partition::aborted_transactions(offset_range offsets) {
         auto cursor = std::move(cur_res.value());
         co_await for_each_manifest(
           std::move(cursor),
-          [&offsets, &meta_to_materialize](
+          [&offsets, &meta_to_materialize, this](
             ssx::task_local_ptr<const partition_manifest> manifest) {
               for (auto it = manifest->segment_containing(offsets.begin);
                    it != manifest->end();
@@ -1050,7 +1113,8 @@ remote_partition::aborted_transactions(offset_range offsets) {
                   if (it->base_offset > offsets.end_rp) {
                       return ss::stop_iteration::yes;
                   }
-                  auto path = manifest->generate_segment_path(*it);
+                  auto path = manifest->generate_segment_path(
+                    *it, _manifest_view->path_provider());
                   meta_to_materialize.emplace_back(*it, path);
               }
               return ss::stop_iteration::no;
@@ -1086,7 +1150,7 @@ remote_partition::aborted_transactions(offset_range offsets) {
 
 ss::future<> remote_partition::stop() {
     vlog(_ctxlog.debug, "remote partition stop {} segments", _segments.size());
-    watchdog wd(300s, [ntp = get_ntp()] {
+    ssx::watchdog wd(300s, [ntp = get_ntp()] {
         vlog(cst_log.error, "remote_partition {} stop operation stuck", ntp);
     });
 
@@ -1195,11 +1259,13 @@ remote_partition::timequery(storage::timequery_config cfg) {
         co_return std::nullopt;
     }
 
-    auto start_offset = stm_manifest.full_log_start_kafka_offset().value();
+    auto start_offset = std::max(
+      cfg.min_offset,
+      kafka::offset_cast(stm_manifest.full_log_start_kafka_offset().value()));
 
     // Synthesize a log_reader_config from our timequery_config
     storage::log_reader_config config(
-      kafka::offset_cast(start_offset),
+      start_offset,
       cfg.max_offset,
       0,
       2048, // We just need one record batch
@@ -1214,15 +1280,17 @@ remote_partition::timequery(storage::timequery_config cfg) {
     auto translating_reader = co_await make_reader(config);
 
     // Read one batch from the reader to learn the offset
-    model::record_batch_reader::storage_t data
-      = co_await model::consume_reader_to_memory(
-        std::move(translating_reader.reader), model::no_timeout);
+    auto batches = co_await model::consume_reader_to_memory(
+      std::move(translating_reader.reader), model::no_timeout);
 
-    auto& batches = std::get<model::record_batch_reader::data_t>(data);
     vlog(_ctxlog.debug, "timequery: {} batches", batches.size());
 
     if (batches.size()) {
-        co_return storage::batch_timequery(*(batches.begin()), cfg.time);
+        co_return co_await storage::batch_timequery(
+          std::move(*(batches.begin())),
+          cfg.min_offset,
+          cfg.time,
+          cfg.max_offset);
     } else {
         co_return std::nullopt;
     }
@@ -1247,34 +1315,64 @@ struct finalize_data {
     model::ntp ntp;
     model::initial_revision_id revision;
     cloud_storage_clients::bucket_name bucket;
-    cloud_storage_clients::object_key key;
     iobuf serialized_manifest;
     model::offset insync_offset;
+    bool remote_manifest_expected;
 };
 
-ss::future<> finalize_background(remote& api, finalize_data data) {
-    // This function runs as a detached background fiber, so has no shutdown
-    // logic of its own: our remote operations will be shut down when the
-    // `remote` object is shut down.
+/// This function runs as a detached background fiber, so has no shutdown
+/// logic of its own: our remote operations will be shut down when the
+/// `remote` object is shut down.
+///
+/// Precondition: the caller must ensure that api object is valid for the
+/// duration of this function. I.e. hold a gate.
+ss::future<> finalize_in_background(
+  remote& api, finalize_data data, remote_path_provider path_provider) {
     ss::abort_source& as = api.as();
 
     retry_chain_node local_rtc(as, finalize_timeout, finalize_backoff);
 
+    // Start with an empty manifest.
     partition_manifest remote_manifest(data.ntp, data.revision);
 
-    auto [manifest_get_result, result_fmt]
-      = co_await api.try_download_partition_manifest(
-        data.bucket, remote_manifest, local_rtc);
-
-    if (manifest_get_result != download_result::success) {
+    // Try downloading the remote manifest unconditionally. Although locally we
+    // might believe it does not exist (e.g. because we are a replica and
+    // haven't received yet the command informing us that remote manifest is
+    // clean), it might exist and we should try to use it if so.
+    partition_manifest_downloader dl(
+      data.bucket, path_provider, data.ntp, data.revision, api);
+    auto manifest_get_result = co_await dl.download_manifest(
+      local_rtc, &remote_manifest);
+    if (manifest_get_result.has_error()) {
         vlog(
           cst_log.error,
           "[{}] Failed to fetch manifest during finalize(). Error: {}",
           data.ntp,
-          manifest_get_result);
+          manifest_get_result.error());
         co_return;
     }
 
+    if (
+      manifest_get_result.value()
+      == find_partition_manifest_outcome::no_matching_manifest) {
+        if (data.remote_manifest_expected) {
+            // Log an error if manifest doesn't exist but we expected it to.
+            // This is a bug.
+            vlog(
+              cst_log.error,
+              "[{}] Failed to fetch manifest during finalize(). Not found",
+              data.ntp);
+            co_return;
+        } else {
+            vlog(
+              cst_log.debug,
+              "[{}] Failed to fetch manifest during finalize(). Not found. "
+              "Will upload a new one.",
+              data.ntp);
+        }
+    }
+
+    // Note: We might get here with empty remote_manifest (default constructed).
     if (remote_manifest.get_insync_offset() > data.insync_offset) {
         // Our local manifest is behind the remote: return a copy of the
         // remote manifest for use in deletion
@@ -1297,9 +1395,11 @@ ss::future<> finalize_background(remote& api, finalize_data data) {
           remote_manifest.get_insync_offset(),
           data.insync_offset);
 
+        const auto key = cloud_storage_clients::object_key{
+          path_provider.partition_manifest_path(data.ntp, data.revision)};
         auto manifest_put_result = co_await api.upload_object(
           {.transfer_details
-           = {.bucket = data.bucket, .key = data.key, .parent_rtc = local_rtc},
+           = {.bucket = data.bucket, .key = key, .parent_rtc = local_rtc},
            .type = upload_type::manifest,
            .payload = std::move(data.serialized_manifest)});
 
@@ -1324,7 +1424,7 @@ ss::future<> finalize_background(remote& api, finalize_data data) {
     }
 }
 
-void remote_partition::finalize() {
+void remote_partition::finalize(bool remote_manifest_expected) {
     vlog(_ctxlog.info, "Finalizing remote storage state...");
 
     // We do this in the background, because
@@ -1343,15 +1443,17 @@ void remote_partition::finalize() {
       .ntp = get_ntp(),
       .revision = stm_manifest.get_revision_id(),
       .bucket = _bucket,
-      .key
-      = cloud_storage_clients::object_key{stm_manifest.get_manifest_path()()},
       .serialized_manifest = std::move(serialized_manifest),
-      .insync_offset = stm_manifest.get_insync_offset()};
+      .insync_offset = stm_manifest.get_insync_offset(),
+      .remote_manifest_expected = remote_manifest_expected,
+    };
 
     ssx::spawn_with_gate(
       _api.gate(),
-      [&api = _api, data = std::move(data)]() mutable -> ss::future<> {
-          return finalize_background(api, std::move(data));
+      [&api = _api,
+       data = std::move(data),
+       pp = _manifest_view->path_provider().copy()]() mutable -> ss::future<> {
+          return finalize_in_background(api, std::move(data), pp.copy());
       });
 }
 
@@ -1370,6 +1472,7 @@ void remote_partition::finalize() {
 ss::future<remote_partition::erase_result> remote_partition::erase(
   cloud_storage::remote& api,
   cloud_storage_clients::bucket_name bucket,
+  const remote_path_provider& path_provider,
   partition_manifest manifest,
   remote_manifest_path manifest_path,
   retry_chain_node& parent_rtc) {
@@ -1381,7 +1484,8 @@ ss::future<remote_partition::erase_result> remote_partition::erase(
 
     auto replaced_segments = manifest.lw_replaced_segments();
     for (const auto& lw_meta : replaced_segments) {
-        const auto path = manifest.generate_segment_path(lw_meta);
+        const auto path = manifest.generate_segment_path(
+          lw_meta, path_provider);
         ++segments_to_remove_count;
 
         objects_to_remove.emplace_back(path);
@@ -1392,7 +1496,7 @@ ss::future<remote_partition::erase_result> remote_partition::erase(
     }
 
     for (const auto& meta : manifest) {
-        const auto path = manifest.generate_segment_path(meta);
+        const auto path = manifest.generate_segment_path(meta, path_provider);
         ++segments_to_remove_count;
 
         objects_to_remove.emplace_back(path);

@@ -18,7 +18,7 @@ ss::future<ss::connected_socket> connect_with_timeout(
     auto f = socket->connect(address).finally([socket] {});
     return ss::with_timeout(timeout, std::move(f))
       .handle_exception([socket, address, log](const std::exception_ptr& e) {
-          log->trace("error connecting to {} - {}", address, e);
+          vlog(log->trace, "error connecting to {} - {}", address, e);
           socket->shutdown();
           return ss::make_exception_future<ss::connected_socket>(e);
       });
@@ -54,9 +54,9 @@ ss::future<> base_transport::do_connect(clock_type::time_point timeout) {
             fd = co_await ss::tls::wrap_client(
               _creds,
               std::move(fd),
-              _tls_sni_hostname ? *_tls_sni_hostname : ss::sstring{},
               ss::tls::tls_options{
-                .wait_for_eof_on_shutdown = _wait_for_tls_server_eof});
+                .wait_for_eof_on_shutdown = _wait_for_tls_server_eof,
+                .server_name = _tls_sni_hostname.value_or("")});
         }
         _fd = std::make_unique<ss::connected_socket>(std::move(fd));
         if (auto* p = _probe.value_or(nullptr); p != nullptr) {
@@ -73,7 +73,7 @@ ss::future<> base_transport::do_connect(clock_type::time_point timeout) {
         if (auto* p = _probe.value_or(nullptr); p != nullptr) {
             p->connection_error();
         }
-        _log->trace("Connection error: {}", e);
+        vlog(_log->trace, "Connection error: {}", e);
         std::rethrow_exception(e);
     }
 

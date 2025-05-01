@@ -8,7 +8,7 @@
  * https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
  */
 
-#include "cloud_storage/tests/s3_imposter.h"
+#include "cloud_io/tests/s3_imposter.h"
 #include "cluster/cloud_metadata/offsets_lookup.h"
 #include "cluster/types.h"
 #include "random/generators.h"
@@ -35,8 +35,8 @@ class offsets_lookup_fixture
 public:
     offsets_lookup_fixture()
       : redpanda_thread_fixture(
-        redpanda_thread_fixture::init_cloud_storage_tag{},
-        httpd_port_number()) {
+          redpanda_thread_fixture::init_cloud_storage_tag{},
+          httpd_port_number()) {
         set_expectations_and_listen({});
         wait_for_controller_leadership().get();
         RPTEST_REQUIRE_EVENTUALLY(5s, [this] {

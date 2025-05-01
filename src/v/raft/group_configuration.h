@@ -11,8 +11,9 @@
 
 #pragma once
 #include "model/metadata.h"
+#include "raft/fundamental.h"
 #include "reflection/adl.h"
-#include "serde/envelope.h"
+#include "serde/rw/vector.h"
 
 #include <boost/range/join.hpp>
 
@@ -25,35 +26,8 @@ struct broker_revision {
     model::revision_id rev;
 };
 
-static constexpr model::revision_id no_revision{};
-class vnode
-  : public serde::envelope<vnode, serde::version<0>, serde::compat_version<0>> {
-public:
-    constexpr vnode() = default;
+inline constexpr model::revision_id no_revision{};
 
-    constexpr vnode(model::node_id nid, model::revision_id rev)
-      : _node_id(nid)
-      , _revision(rev) {}
-
-    bool operator==(const vnode& other) const = default;
-    bool operator!=(const vnode& other) const = default;
-
-    friend std::ostream& operator<<(std::ostream& o, const vnode& r);
-
-    template<typename H>
-    friend H AbslHashValue(H h, const vnode& node) {
-        return H::combine(std::move(h), node._node_id, node._revision);
-    }
-
-    constexpr model::node_id id() const { return _node_id; }
-    constexpr model::revision_id revision() const { return _revision; }
-
-    auto serde_fields() { return std::tie(_node_id, _revision); }
-
-private:
-    model::node_id _node_id;
-    model::revision_id _revision;
-};
 /**
  * Enum describing configuration state.
  *
@@ -134,7 +108,7 @@ struct configuration_update
 class group_configuration
   : public serde::envelope<
       group_configuration,
-      serde::version<6>,
+      serde::version<7>,
       serde::compat_version<6>> {
 public:
     using version_t
@@ -150,7 +124,10 @@ public:
     // serde serialized configuration
     static constexpr version_t v_6{6};
 
-    static constexpr version_t current_version = v_6;
+    // version with symmetric cancellations (configuration_change_strategy_v6)
+    static constexpr version_t v_7{7};
+
+    static constexpr version_t current_version = v_7;
 
     /**
      * creates a configuration where all provided brokers are current
@@ -412,6 +389,7 @@ public:
     bool is_with_brokers() const { return _version < v_5; }
 
     void serde_write(iobuf& out);
+    void serde_write_v6(iobuf& out);
 
     static group_configuration
     serde_direct_read(iobuf_parser&, const serde::header&);
@@ -423,11 +401,14 @@ private:
 
     friend class configuration_change_strategy_v5;
 
+    friend class configuration_change_strategy_v6;
+
     std::vector<vnode> unique_voter_ids() const;
     std::vector<vnode> unique_learner_ids() const;
     std::unique_ptr<configuration_change_strategy> make_change_strategy();
-
-    version_t _version = current_version;
+    // initialize version to the v_6 in order to correctly handle
+    // deserialization when version field is missing
+    version_t _version = v_6;
     std::vector<model::broker> _brokers;
     group_nodes _current;
     std::optional<configuration_update> _configuration_update;
@@ -435,8 +416,10 @@ private:
     model::revision_id _revision;
 };
 
-namespace details {
+void tag_invoke(
+  serde::tag_t<serde::write_tag>, iobuf& out, group_configuration t);
 
+namespace details {
 template<typename ValueProvider, typename Range>
 auto quorum_match(ValueProvider&& f, Range&& range) {
     using ret_t = std::invoke_result_t<ValueProvider, vnode>;

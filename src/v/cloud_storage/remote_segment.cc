@@ -10,6 +10,7 @@
 
 #include "cloud_storage/remote_segment.h"
 
+#include "base/vlog.h"
 #include "bytes/iobuf.h"
 #include "bytes/iostream.h"
 #include "cloud_storage/cache_service.h"
@@ -37,6 +38,7 @@
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/circular_buffer.hh>
 #include <seastar/core/fstream.hh>
+#include <seastar/core/future.hh>
 #include <seastar/core/io_priority_class.hh>
 #include <seastar/core/loop.hh>
 #include <seastar/core/lowres_clock.hh>
@@ -74,42 +76,6 @@ private:
 } // namespace
 
 namespace cloud_storage {
-
-class split_segment_into_chunk_range_consumer {
-public:
-    split_segment_into_chunk_range_consumer(
-      cloud_storage::remote_segment& remote_segment,
-      cloud_storage::segment_chunk_range range)
-      : _segment{remote_segment}
-      , _range{std::move(range)} {}
-
-    ss::future<uint64_t>
-    operator()(uint64_t size, ss::input_stream<char> stream) {
-        for (const auto [start, end] : _range) {
-            const auto bytes_to_read = end.value_or(_segment._size - 1) - start
-                                       + 1;
-            auto reservation = co_await _segment._cache.reserve_space(
-              bytes_to_read, 1);
-            vlog(
-              cst_log.trace,
-              "making stream from byte offset {} for {} bytes",
-              start,
-              bytes_to_read);
-            auto dsi = std::make_unique<bounded_stream>(stream, bytes_to_read);
-            auto stream_upto = ss::input_stream<char>{
-              ss::data_source{std::move(dsi)}};
-            _segment._probe.chunk_size(bytes_to_read);
-            co_await _segment.put_chunk_in_cache(
-              reservation, std::move(stream_upto), start);
-        }
-        co_await stream.close();
-        co_return size;
-    }
-
-private:
-    cloud_storage::remote_segment& _segment;
-    cloud_storage::segment_chunk_range _range;
-};
 
 std::filesystem::path
 generate_index_path(const cloud_storage::remote_segment_path& p) {
@@ -244,13 +210,14 @@ ss::future<> remote_segment::stop() {
         co_return;
     }
 
-    watchdog wd(300s, [path = _path] {
+    ssx::watchdog wd(300s, [path = _path] {
         vlog(cst_log.error, "remote_segment {} stop operation stuck", path);
     });
 
-    vlog(_ctxlog.debug, "remote segment stop");
+    vlog(_ctxlog.debug, "remote segment stop: gate closing");
     _bg_cvar.broken();
     co_await _gate.close();
+    vlog(_ctxlog.debug, "remote segment stop: gate closed");
     if (_data_file) {
         co_await _data_file.close().handle_exception(
           [this](std::exception_ptr err) {
@@ -260,7 +227,9 @@ ss::future<> remote_segment::stop() {
     }
 
     if (_chunks_api) {
+        vlog(_ctxlog.debug, "waiting for chunk api to stop");
         co_await _chunks_api->stop();
+        vlog(_ctxlog.debug, "chunk api stopped");
     }
     _stopped = true;
 }
@@ -765,10 +734,24 @@ void remote_segment::set_waiter_errors(const std::exception_ptr& err) {
         p.set_exception(err);
         _wait_list.pop_front();
     }
+
+    fragmented_vector<chunk_request> chunk_waiters;
+    chunk_waiters.swap(_chunk_waiters);
+    for (auto& w : chunk_waiters) {
+        w.promise.set_exception(err);
+    }
 };
 
 bool remote_segment::is_legacy_mode_engaged() const {
     return _fallback_mode || _sname_format <= segment_name_format::v2;
+}
+
+void remote_segment::switch_to_legacy_mode() {
+    _fallback_mode = fallback_mode::yes;
+    for (auto& waiter : _chunk_waiters) {
+        waiter.promise.set_exception(
+          std::runtime_error{"chunk download aborted"});
+    }
 }
 
 bool remote_segment::is_state_materialized() const {
@@ -805,8 +788,10 @@ ss::future<> remote_segment::run_hydrate_bg() {
 
     while (!_gate.is_closed()) {
         try {
-            co_await _bg_cvar.wait(
-              [this] { return !_wait_list.empty() || _gate.is_closed(); });
+            co_await _bg_cvar.wait([this] {
+                return !_wait_list.empty() || !_chunk_waiters.empty()
+                       || _gate.is_closed();
+            });
 
             if (is_legacy_mode_engaged()) {
                 vlog(
@@ -865,6 +850,21 @@ ss::future<> remote_segment::run_hydrate_bg() {
                 }
                 _wait_list.pop_front();
             }
+
+            // Only download chunks if we are not in legacy mode and the index
+            // is available.
+            if (
+              !is_legacy_mode_engaged() && is_state_materialized()
+              && !_chunk_waiters.empty()) {
+                vlog(
+                  _ctxlog.debug,
+                  "Processing {} chunk download request(s)",
+                  _chunk_waiters.size());
+                auto failed_requests = co_await service_chunk_requests();
+                for (auto& r : failed_requests) {
+                    _chunk_waiters.emplace_back(std::move(r));
+                }
+            }
         } catch (...) {
             const auto err = std::current_exception();
             set_waiter_errors(err);
@@ -878,11 +878,98 @@ ss::future<> remote_segment::run_hydrate_bg() {
         }
     }
 
+    // If any new download requests got queued up while we were downloading
+    // chunks before the gate closed, cancel them so that the gate close does
+    // not get stuck during segment stop.
+    if (!_chunk_waiters.empty() && _gate.is_closed()) {
+        vlog(
+          _ctxlog.debug,
+          "Cancelling {} pending chunk downloads during segment stop",
+          _chunk_waiters.size());
+        for (auto& w : _chunk_waiters) {
+            w.promise.set_exception(ss::gate_closed_exception{});
+        }
+    }
+
     _hydration_loop_running = false;
 }
 
-namespace {
+ss::future<fragmented_vector<remote_segment::chunk_request>>
+remote_segment::service_chunk_requests() {
+    auto g = _gate.hold();
+    fragmented_vector<ss::future<ss::file>> chunk_op_results;
+    chunk_op_results.reserve(_chunk_waiters.size());
 
+    fragmented_vector<chunk_request> requests;
+    requests.swap(_chunk_waiters);
+
+    std::ranges::transform(
+      requests,
+      std::back_inserter(chunk_op_results),
+      [this](const auto& request) {
+          vlog(_ctxlog.debug, "Downloading chunk {}", request.start);
+          return hydrate_and_materialize_chunk(request.start);
+      });
+
+    auto results = co_await ss::when_all(
+      chunk_op_results.begin(), chunk_op_results.end());
+
+    fragmented_vector<chunk_request> failed;
+    for (size_t i = 0; i < results.size(); ++i) {
+        auto request = std::move(requests[i]);
+        auto current_result = std::move(results[i]);
+
+        ss::file materialized_handle;
+        std::exception_ptr err;
+
+        if (current_result.failed()) {
+            err = current_result.get_exception();
+        } else {
+            materialized_handle = current_result.get();
+        }
+
+        // Materialization may fail due to cache eviction. In this case the
+        // materialized handle is default initialized. Re-queue waiter which
+        // will be processed again on the next iteration of run_hydrate_bg loop.
+        // Continue with other requests in queue.
+        if (!err && !materialized_handle) {
+            vlog(
+              _ctxlog.debug,
+              "Failed to materialize chunk start {}, retrying",
+              request.start);
+            failed.emplace_back(std::move(request));
+            continue;
+        }
+
+        if (err) {
+            request.promise.set_exception(err);
+        } else {
+            request.promise.set_value(materialized_handle);
+        }
+    }
+    co_return failed;
+}
+
+ss::future<ss::file> remote_segment::hydrate_and_materialize_chunk(
+  chunk_start_offset_t start_offset) {
+    auto g = _gate.hold();
+    vlog(_ctxlog.debug, "Hydrating chunk {}", start_offset);
+    co_await hydrate_chunk(start_offset);
+    vlog(_ctxlog.debug, "Materializing chunk {}", start_offset);
+    co_return co_await materialize_chunk(start_offset);
+}
+
+ss::future<ss::file>
+remote_segment::download_chunk(chunk_start_offset_t chunk_start) {
+    auto g = _gate.hold();
+    ss::promise<ss::file> p;
+    auto fut = p.get_future();
+    _chunk_waiters.push_back({chunk_start, std::move(p)});
+    _bg_cvar.signal();
+    co_return co_await std::move(fut);
+}
+
+namespace {
 void log_hydration_abort_cause(
   const retry_chain_logger& logger,
   const ss::lowres_clock::time_point& deadline,
@@ -890,8 +977,8 @@ void log_hydration_abort_cause(
     if (ss::lowres_clock::now() > deadline) {
         vlog(logger.warn, "timed out while waiting for hydration");
     } else if (as.has_value() && as->get().abort_requested()) {
-        // TODO it might be useful to be able to log the client info here from
-        // log reader config.
+        // TODO it might be useful to be able to log the client info here
+        // from log reader config.
         vlog(logger.debug, "consumer disconnected during hydration");
     }
 }
@@ -929,7 +1016,7 @@ ss::future<> remote_segment::do_hydrate(
                   "failed to download index with error [{}], switching to "
                   "fallback mode and retrying hydration.",
                   ex);
-                _fallback_mode = fallback_mode::yes;
+                switch_to_legacy_mode();
                 return do_hydrate(as, deadline).then([] {
                     // This is an empty file to match the type returned by
                     // `fut`. The result is discarded immediately so it is
@@ -976,19 +1063,8 @@ ss::future<> remote_segment::hydrate(storage::opt_abort_source_t as) {
       .finally([holder = std::move(g)] {});
 }
 
-ss::future<> remote_segment::hydrate_chunk(segment_chunk_range range) {
-    const auto start = range.first_offset();
-    const auto path_to_start = get_path_to_chunk(start);
-
-    // It is possible that the chunk has already been downloaded during a
-    // prefetch operation. In this case we skip hydration and try to materialize
-    // the chunk. This also skips the prefetch of the successive chunks. So
-    // given a series of chunks A, B, C, D, E and a prefetch of 2, when A is
-    // fetched B,C are also fetched. Then hydration of B,C are no-ops and no
-    // prefetch is done during those no-ops. When D is fetched, hydration
-    // makes an HTTP GET call and E is also prefetched. So a total of two calls
-    // are made for the five chunks (ignoring any cache evictions during the
-    // process).
+ss::future<> remote_segment::hydrate_chunk(chunk_start_offset_t start_offset) {
+    const auto path_to_start = get_path_to_chunk(start_offset);
     if (const auto status = co_await _cache.is_cached(path_to_start);
         status == cache_element_status::available) {
         vlog(
@@ -1002,23 +1078,33 @@ ss::future<> remote_segment::hydrate_chunk(segment_chunk_range range) {
     retry_chain_node rtc{
       cache_hydration_timeout, cache_hydration_backoff, &_rtc};
 
-    const auto chunk_count = range.chunk_count();
+    auto byte_range = _chunks_api->get_byte_range_for_chunk(
+      start_offset, _size - 1);
 
-    const auto end = range.last_offset().value_or(_size - 1);
-    auto consumer = split_segment_into_chunk_range_consumer{
-      *this, std::move(range)};
+    const auto space_required = byte_range.second - byte_range.first + 1;
+    auto reserved = co_await _cache.reserve_space(space_required, 1);
 
     auto measurement = _ts_probe.chunk_hydration_latency();
     track_hydration t{_ts_probe};
 
     auto res = co_await _api.download_segment(
-      _bucket, _path, std::move(consumer), rtc, std::make_pair(start, end));
+      _bucket,
+      _path,
+      [this, start_offset, &reserved](
+        auto size, auto stream) -> ss::future<unsigned long> {
+          return put_chunk_in_cache(reserved, std::move(stream), start_offset)
+            .then([size] { return size; });
+      },
+      rtc,
+      std::move(byte_range));
+
     if (res != download_result::success) {
         measurement->cancel();
         throw download_exception{res, _path};
     }
 
-    _ts_probe.on_chunks_hydration(chunk_count);
+    _probe.chunk_size(space_required);
+    _ts_probe.on_chunks_hydration(1);
 }
 
 ss::future<ss::file>
@@ -1463,7 +1549,7 @@ ss::future<> remote_segment_batch_reader::stop() {
         co_return;
     }
 
-    watchdog wd(300s, [path = _seg->get_segment_path()] {
+    ssx::watchdog wd(300s, [path = _seg->get_segment_path()] {
         vlog(
           cst_log.error,
           "remote_segment_batch_reader {} stop operation stuck",
@@ -1579,7 +1665,18 @@ ss::future<> hydration_loop_state::hydrate(size_t wait_list_size) {
             fs.push_back(state.hydrate_action());
             break;
         case cache_element_status::in_progress:
-            vassert(false, "{} is already in progress", state.path);
+            // Ths means that we have two remote_segment instances running
+            // in parallel. This is possible in case of extreme contention
+            // when the materialized segment gets evicted and then
+            // materialized again. The underlying cache service is a global
+            // state that all instances of the 'remote_segment' share.
+            vlog(_ctxlog.warn, "{} is already in progress", state.path);
+            fs.push_back(
+              ss::make_exception_future<>(std::runtime_error(fmt_with_ctx(
+                fmt::format,
+                "Concurrency violation. {} is already in progress.",
+                state.path))));
+            break;
         }
     }
 

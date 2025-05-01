@@ -14,13 +14,14 @@
 #include "bytes/iostream.h"
 #include "cloud_storage/base_manifest.h"
 #include "cloud_storage/partition_manifest.h"
+#include "cloud_storage/remote_path_provider.h"
+#include "cloud_storage/segment_path_utils.h"
 #include "cloud_storage/spillover_manifest.h"
 #include "cloud_storage/types.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "model/timestamp.h"
 #include "random/generators.h"
-#include "serde/serde.h"
 #include "utils/tracking_allocator.h"
 
 #include <seastar/testing/test_case.hh>
@@ -31,6 +32,10 @@
 #include <boost/test/unit_test.hpp>
 
 using namespace cloud_storage;
+
+namespace {
+const remote_path_provider path_provider(std::nullopt, std::nullopt);
+} // anonymous namespace
 
 static constexpr std::string_view empty_manifest_json = R"json({
     "version": 1,
@@ -307,7 +312,7 @@ manifest_for(std::vector<std::pair<model::offset, kafka::offset>> o) {
         cloud_storage::manifest_format::json,
         make_manifest_stream(empty_manifest_json))
       .get();
-    for (int i = 0; i < o.size() - 1; i++) {
+    for (size_t i = 0; i < o.size() - 1; i++) {
         segment_meta seg{
           .is_compacted = false,
           .size_bytes = 1024,
@@ -471,7 +476,7 @@ SEASTAR_THREAD_TEST_CASE(test_manifest_type) {
 }
 
 SEASTAR_THREAD_TEST_CASE(test_segment_path) {
-    auto path = generate_remote_segment_path(
+    auto path = prefixed_segment_path(
       manifest_ntp,
       model::initial_revision_id(0),
       segment_name("22-11-v1.log"),
@@ -479,45 +484,6 @@ SEASTAR_THREAD_TEST_CASE(test_segment_path) {
     // use pre-calculated murmur hash value from full ntp path + file name
     BOOST_REQUIRE_EQUAL(
       path, "2bea9275/test-ns/test-topic/42_0/22-11-v1.log.123");
-}
-
-SEASTAR_THREAD_TEST_CASE(test_manifest_name_parsing) {
-    std::filesystem::path path
-      = "b0000000/meta/kafka/redpanda-test/4_2/manifest.json";
-    auto res = cloud_storage::get_partition_manifest_path_components(path);
-    BOOST_REQUIRE_EQUAL(res->_origin, path);
-    BOOST_REQUIRE_EQUAL(res->_ns(), "kafka");
-    BOOST_REQUIRE_EQUAL(res->_topic(), "redpanda-test");
-    BOOST_REQUIRE_EQUAL(res->_part(), 4);
-    BOOST_REQUIRE_EQUAL(res->_rev(), 2);
-}
-
-SEASTAR_THREAD_TEST_CASE(test_manifest_name_parsing_failure_1) {
-    std::filesystem::path path
-      = "b0000000/meta/kafka/redpanda-test/a_b/manifest.json";
-    auto res = cloud_storage::get_partition_manifest_path_components(path);
-    BOOST_REQUIRE(res.has_value() == false);
-}
-
-SEASTAR_THREAD_TEST_CASE(test_manifest_name_parsing_failure_2) {
-    std::filesystem::path path
-      = "b0000000/kafka/redpanda-test/4_2/manifest.json";
-    auto res = cloud_storage::get_partition_manifest_path_components(path);
-    BOOST_REQUIRE(res.has_value() == false);
-}
-
-SEASTAR_THREAD_TEST_CASE(test_manifest_name_parsing_failure_3) {
-    std::filesystem::path path
-      = "b0000000/meta/kafka/redpanda-test//manifest.json";
-    auto res = cloud_storage::get_partition_manifest_path_components(path);
-    BOOST_REQUIRE(res.has_value() == false);
-}
-
-SEASTAR_THREAD_TEST_CASE(test_manifest_name_parsing_failure_4) {
-    std::filesystem::path path
-      = "b0000000/meta/kafka/redpanda-test/4_2/foo.bar";
-    auto res = cloud_storage::get_partition_manifest_path_components(path);
-    BOOST_REQUIRE(res.has_value() == false);
 }
 
 SEASTAR_THREAD_TEST_CASE(test_segment_name_parsing) {
@@ -542,7 +508,7 @@ SEASTAR_THREAD_TEST_CASE(test_segment_name_parsing_failure_2) {
 
 SEASTAR_THREAD_TEST_CASE(test_manifest_path) {
     partition_manifest m(manifest_ntp, model::initial_revision_id(0));
-    auto path = m.get_manifest_path();
+    auto path = m.get_manifest_path(path_provider);
     BOOST_REQUIRE_EQUAL(
       path, "20000000/meta/test-ns/test-topic/42_0/manifest.bin");
 }
@@ -551,7 +517,7 @@ SEASTAR_THREAD_TEST_CASE(test_empty_manifest_update) {
     partition_manifest m;
     m.update(manifest_format::json, make_manifest_stream(empty_manifest_json))
       .get();
-    auto path = m.get_manifest_path();
+    auto path = m.get_manifest_path(path_provider);
     BOOST_REQUIRE_EQUAL(
       path, "20000000/meta/test-ns/test-topic/42_0/manifest.bin");
 }
@@ -578,7 +544,7 @@ SEASTAR_THREAD_TEST_CASE(test_complete_manifest_update) {
     m.update(
        manifest_format::json, make_manifest_stream(complete_manifest_json))
       .get();
-    auto path = m.get_manifest_path();
+    auto path = m.get_manifest_path(path_provider);
     BOOST_REQUIRE_EQUAL(
       path, "60000000/meta/test-ns/test-topic/42_1/manifest.bin");
     BOOST_REQUIRE_EQUAL(m.size(), 5);
@@ -672,7 +638,7 @@ SEASTAR_THREAD_TEST_CASE(test_max_segment_meta_update) {
        manifest_format::json,
        make_manifest_stream(max_segment_meta_manifest_json))
       .get();
-    auto path = m.get_manifest_path();
+    auto path = m.get_manifest_path(path_provider);
     BOOST_REQUIRE_EQUAL(
       path, "60000000/meta/test-ns/test-topic/42_1/manifest.bin");
     BOOST_REQUIRE_EQUAL(m.size(), 1);
@@ -741,7 +707,7 @@ SEASTAR_THREAD_TEST_CASE(test_metas_get_smaller) {
        manifest_format::json,
        make_manifest_stream(segment_meta_gets_smaller_manifest_json))
       .get();
-    auto path = m.get_manifest_path();
+    auto path = m.get_manifest_path(path_provider);
     BOOST_REQUIRE_EQUAL(
       path, "60000000/meta/test-ns/test-topic/42_1/manifest.bin");
     BOOST_REQUIRE_EQUAL(m.size(), 2);
@@ -791,8 +757,8 @@ SEASTAR_THREAD_TEST_CASE(test_no_closing_bracket_meta) {
       [](std::runtime_error ex) {
           return std::string(ex.what()).find(
                    "Failed to parse partition manifest "
-                   "\"b0000000/meta///-2147483648_-9223372036854775808/"
-                   "manifest.json\": Missing a comma or '}' after an object "
+                   "b0000000/meta///-2147483648_-9223372036854775808/"
+                   "manifest.json: Missing a comma or '}' after an object "
                    "member. at offset 325")
                  != std::string::npos;
       });
@@ -803,7 +769,7 @@ SEASTAR_THREAD_TEST_CASE(test_fields_after_segments) {
     m.update(
        manifest_format::json, make_manifest_stream(fields_after_segments_json))
       .get();
-    auto path = m.get_manifest_path();
+    auto path = m.get_manifest_path(path_provider);
     BOOST_REQUIRE_EQUAL(
       path, "60000000/meta/test-ns/test-topic/42_1/manifest.bin");
     BOOST_REQUIRE_EQUAL(m.size(), 1);
@@ -1046,7 +1012,7 @@ namespace cloud_storage {
 struct partition_manifest_accessor {
     static void add_replaced_segment(
       partition_manifest* m,
-      const segment_name& key,
+      const segment_name&,
       const partition_manifest::segment_meta& meta) {
         m->_replaced.push_back(
           partition_manifest::lw_segment_meta::convert(meta));
@@ -1571,6 +1537,8 @@ struct metadata_stm_segment
     cloud_storage::segment_name name;
     cloud_storage::partition_manifest::segment_meta meta;
 
+    auto serde_fields() { return std::tie(name, meta); }
+
     bool operator==(const metadata_stm_segment&) const = default;
 };
 
@@ -1587,6 +1555,17 @@ struct segment_meta_v0 {
     model::timestamp base_timestamp;
     model::timestamp max_timestamp;
     model::offset delta_offset;
+
+    auto serde_fields() {
+        return std::tie(
+          is_compacted,
+          size_bytes,
+          base_offset,
+          committed_offset,
+          base_timestamp,
+          max_timestamp,
+          delta_offset);
+    }
 
     auto operator<=>(const segment_meta_v0&) const = default;
 };
@@ -1606,6 +1585,19 @@ struct segment_meta_v1 {
     model::initial_revision_id ntp_revision;
     model::term_id archiver_term;
 
+    auto serde_fields() {
+        return std::tie(
+          is_compacted,
+          size_bytes,
+          base_offset,
+          committed_offset,
+          base_timestamp,
+          max_timestamp,
+          delta_offset,
+          ntp_revision,
+          archiver_term);
+    }
+
     auto operator<=>(const segment_meta_v1&) const = default;
 };
 
@@ -1617,6 +1609,8 @@ struct metadata_stm_segment
       serde::compat_version<0>> {
     cloud_storage::segment_name name;
     segment_meta_t meta;
+
+    auto serde_fields() { return std::tie(name, meta); }
 
     bool operator==(const metadata_stm_segment&) const = default;
 };
@@ -1770,7 +1764,7 @@ void reference_check_timequery(
  * does its own linear scan of segments, as a reference implementation
  * of timequery.
  */
-void scan_ts_segments_general(partition_manifest const& m) {
+void scan_ts_segments_general(const partition_manifest& m) {
     // Before range: should get first segment
     reference_check_timequery(
       m, model::timestamp{m.begin()->base_timestamp() - 100});
@@ -1791,7 +1785,7 @@ void scan_ts_segments_general(partition_manifest const& m) {
  * offset
  */
 void expect_ts_segment(
-  std::optional<partition_manifest::segment_meta> const& s, int base_offset) {
+  const std::optional<partition_manifest::segment_meta>& s, int base_offset) {
     BOOST_REQUIRE(s);
     BOOST_REQUIRE_EQUAL(s->base_offset, model::offset{base_offset});
 }
@@ -1800,7 +1794,7 @@ void expect_ts_segment(
  * For non-overlapping time ranges on segments, verify that each timestamp
  * maps to the expected segment.
  */
-void scan_ts_segments(partition_manifest const& m) {
+void scan_ts_segments(const partition_manifest& m) {
     // Before range: should get first segment
     expect_ts_segment(
       m.timequery(model::timestamp{m.begin()->base_timestamp() - 100}),
@@ -2052,7 +2046,7 @@ SEASTAR_THREAD_TEST_CASE(test_reset_manifest) {
     m.update(
        manifest_format::json, make_manifest_stream(complete_manifest_json))
       .get();
-    auto path = m.get_manifest_path();
+    auto path = m.get_manifest_path(path_provider);
     BOOST_REQUIRE_EQUAL(
       path, "60000000/meta/test-ns/test-topic/42_1/manifest.bin");
     BOOST_REQUIRE_EQUAL(m.size(), 5);
@@ -2153,11 +2147,8 @@ SEASTAR_THREAD_TEST_CASE(test_generate_segment_name_format) {
         auto s = m.find(model::offset(10));
         auto expected = remote_segment_path(
           "9b367cb7/test-ns/test-topic/42_1/10-1-v1.log.1");
-        auto actual1 = partition_manifest::generate_remote_segment_path(
-          m.get_ntp(), *s);
-        auto actual2 = m.generate_segment_path(*s);
-        BOOST_REQUIRE_EQUAL(expected, actual1);
-        BOOST_REQUIRE_EQUAL(expected, actual2);
+        auto actual = m.generate_segment_path(*s, path_provider);
+        BOOST_REQUIRE_EQUAL(expected, actual);
     }
 
     {
@@ -2165,11 +2156,8 @@ SEASTAR_THREAD_TEST_CASE(test_generate_segment_name_format) {
         auto s = m.find(model::offset(20));
         auto expected = remote_segment_path(
           "96c6b7a9/test-ns/test-topic/42_1/20-29-2048-1-v1.log.2");
-        auto actual1 = partition_manifest::generate_remote_segment_path(
-          m.get_ntp(), *s);
-        auto actual2 = m.generate_segment_path(*s);
-        BOOST_REQUIRE_EQUAL(expected, actual1);
-        BOOST_REQUIRE_EQUAL(expected, actual2);
+        auto actual = m.generate_segment_path(*s, path_provider);
+        BOOST_REQUIRE_EQUAL(expected, actual);
     }
 
     {
@@ -2177,11 +2165,8 @@ SEASTAR_THREAD_TEST_CASE(test_generate_segment_name_format) {
         auto s = m.find(model::offset(30));
         auto expected = remote_segment_path(
           "df1262f5/test-ns/test-topic/42_1/30-1-v1.log");
-        auto actual1 = partition_manifest::generate_remote_segment_path(
-          m.get_ntp(), *s);
-        auto actual2 = m.generate_segment_path(*s);
-        BOOST_REQUIRE_EQUAL(expected, actual1);
-        BOOST_REQUIRE_EQUAL(expected, actual2);
+        auto actual = m.generate_segment_path(*s, path_provider);
+        BOOST_REQUIRE_EQUAL(expected, actual);
     }
 
     {
@@ -2189,11 +2174,8 @@ SEASTAR_THREAD_TEST_CASE(test_generate_segment_name_format) {
         auto s = m.find(model::offset(40));
         auto expected = remote_segment_path(
           "e44e8104/test-ns/test-topic/42_1/40-42-4096-2-v1.log");
-        auto actual1 = partition_manifest::generate_remote_segment_path(
-          m.get_ntp(), *s);
-        auto actual2 = m.generate_segment_path(*s);
-        BOOST_REQUIRE_EQUAL(expected, actual1);
-        BOOST_REQUIRE_EQUAL(expected, actual2);
+        auto actual = m.generate_segment_path(*s, path_provider);
+        BOOST_REQUIRE_EQUAL(expected, actual);
     }
 }
 
@@ -2397,6 +2379,166 @@ SEASTAR_THREAD_TEST_CASE(test_archive_offsets_serialization) {
     BOOST_REQUIRE_EQUAL(
       restored.get_archive_start_offset(), model::offset(100));
     BOOST_REQUIRE_EQUAL(restored.get_archive_clean_offset(), model::offset(50));
+}
+
+namespace {
+segment_meta make_segment(
+  std::pair<int64_t, int64_t> kafka_bounds, size_t size, int64_t delta = 10) {
+    auto model_start = kafka_bounds.first + delta;
+    auto model_last = kafka_bounds.second + delta;
+    return {
+      .is_compacted = false,
+      .size_bytes = size,
+      .base_offset = model::offset(model_start),
+      .committed_offset = model::offset(model_last),
+      .base_timestamp = model::timestamp{1689985196373},
+      .max_timestamp = model::timestamp{1689985643129},
+      .delta_offset = model::offset_delta(delta),
+      .ntp_revision = model::initial_revision_id(1234),
+      .archiver_term = model::term_id(16),
+      .segment_term = model::term_id(1),
+      .delta_offset_end = model::offset_delta(delta),
+      .sname_format = segment_name_format::v3,
+      .metadata_size_hint = 0};
+}
+} // namespace
+
+SEASTAR_THREAD_TEST_CASE(test_estimate_size) {
+    partition_manifest m;
+    m.add(make_segment({10, 99}, 1234));
+    m.add(make_segment({100, 199}, 1000));
+    BOOST_CHECK_EQUAL(kafka::offset{200}, m.get_next_kafka_offset());
+
+    // Check values before the start.
+    BOOST_CHECK_EQUAL(
+      0, m.estimate_size_between(kafka::offset{0}, kafka::offset{0}));
+    BOOST_CHECK_EQUAL(
+      0, m.estimate_size_between(kafka::offset{0}, kafka::offset{9}));
+
+    // Overlapping with just the first segment.
+    BOOST_CHECK_EQUAL(
+      1234, m.estimate_size_between(kafka::offset{0}, kafka::offset{10}));
+    BOOST_CHECK_EQUAL(
+      1234, m.estimate_size_between(kafka::offset{10}, kafka::offset{99}));
+    BOOST_CHECK_EQUAL(
+      1234, m.estimate_size_between(kafka::offset{99}, kafka::offset{99}));
+
+    // Overlapping with both segments.
+    BOOST_CHECK_EQUAL(
+      2234, m.estimate_size_between(kafka::offset{99}, kafka::offset{100}));
+    BOOST_CHECK_EQUAL(
+      2234, m.estimate_size_between(kafka::offset{0}, kafka::offset{100}));
+    BOOST_CHECK_EQUAL(
+      2234, m.estimate_size_between(kafka::offset{0}, kafka::offset{200}));
+
+    // Overlapping with just the second segment.
+    BOOST_CHECK_EQUAL(
+      1000, m.estimate_size_between(kafka::offset{100}, kafka::offset{100}));
+    BOOST_CHECK_EQUAL(
+      1000, m.estimate_size_between(kafka::offset{100}, kafka::offset{199}));
+    BOOST_CHECK_EQUAL(
+      1000, m.estimate_size_between(kafka::offset{199}, kafka::offset{199}));
+    BOOST_CHECK_EQUAL(
+      1000, m.estimate_size_between(kafka::offset{100}, kafka::offset{200}));
+
+    // Check values past the end.
+    BOOST_CHECK_EQUAL(
+      0, m.estimate_size_between(kafka::offset{200}, kafka::offset{200}));
+}
+
+SEASTAR_THREAD_TEST_CASE(test_estimate_size_spillover) {
+    partition_manifest m;
+    m.add(make_segment({10, 99}, 1234));
+    m.add(make_segment({100, 199}, 1000));
+    m.add(make_segment({200, 299}, 2000));
+    m.add(make_segment({300, 399}, 500));
+    m.set_archive_start_offset(model::offset{20}, model::offset_delta{10});
+    m.spillover(make_segment({10, 199}, 2234));
+    m.spillover(make_segment({200, 299}, 2000));
+
+    BOOST_CHECK_EQUAL(kafka::offset{10}, m.full_log_start_kafka_offset());
+    BOOST_CHECK_EQUAL(kafka::offset{400}, m.get_next_kafka_offset());
+    BOOST_CHECK_EQUAL(500, m.stm_region_size_bytes());
+    BOOST_CHECK_EQUAL(4234, m.archive_size_bytes());
+
+    // At this point, the archival layout looks like this:
+    //   size bytes    [2234B  ][2000B   ][500B ]
+    //   kafka offsets [10, 199][200, 299][300, 399]
+    //   region        [archive          ][stm     ]
+
+    BOOST_CHECK_EQUAL(
+      0, m.estimate_size_between(kafka::offset{0}, kafka::offset{0}));
+    BOOST_CHECK_EQUAL(
+      0, m.estimate_size_between(kafka::offset{0}, kafka::offset{9}));
+
+    // Overlapping with just the first segment.
+    BOOST_CHECK_EQUAL(
+      2234, m.estimate_size_between(kafka::offset{0}, kafka::offset{10}));
+    BOOST_CHECK_EQUAL(
+      2234, m.estimate_size_between(kafka::offset{10}, kafka::offset{99}));
+    BOOST_CHECK_EQUAL(
+      2234, m.estimate_size_between(kafka::offset{99}, kafka::offset{99}));
+
+    // Overlapping with both segments.
+    BOOST_CHECK_EQUAL(
+      2234, m.estimate_size_between(kafka::offset{99}, kafka::offset{100}));
+    BOOST_CHECK_EQUAL(
+      2234, m.estimate_size_between(kafka::offset{0}, kafka::offset{100}));
+
+    // Overlapping with just the second segment.
+    BOOST_CHECK_EQUAL(
+      2234, m.estimate_size_between(kafka::offset{100}, kafka::offset{100}));
+    BOOST_CHECK_EQUAL(
+      2234, m.estimate_size_between(kafka::offset{100}, kafka::offset{199}));
+    BOOST_CHECK_EQUAL(
+      2234, m.estimate_size_between(kafka::offset{199}, kafka::offset{199}));
+
+    // Overlap with the second spillover manifest too.
+    BOOST_CHECK_EQUAL(
+      4234, m.estimate_size_between(kafka::offset{0}, kafka::offset{200}));
+    BOOST_CHECK_EQUAL(
+      4234, m.estimate_size_between(kafka::offset{100}, kafka::offset{200}));
+
+    // Overlap with just the second spillover manifest.
+    BOOST_CHECK_EQUAL(
+      2000, m.estimate_size_between(kafka::offset{299}, kafka::offset{299}));
+
+    // Overlap the spillover manifest and STM manifest.
+    BOOST_CHECK_EQUAL(
+      2500, m.estimate_size_between(kafka::offset{299}, kafka::offset{300}));
+
+    // Now just the STM manifest.
+    BOOST_CHECK_EQUAL(
+      500, m.estimate_size_between(kafka::offset{300}, kafka::offset{300}));
+
+    // And now the whole cloud log.
+    BOOST_CHECK_EQUAL(
+      4734, m.estimate_size_between(kafka::offset{0}, kafka::offset{300}));
+}
+
+SEASTAR_THREAD_TEST_CASE(test_estimate_size_empty) {
+    partition_manifest m;
+    BOOST_CHECK(!m.get_next_kafka_offset().has_value());
+    BOOST_CHECK_EQUAL(
+      0, m.estimate_size_between(kafka::offset{0}, kafka::offset{0}));
+
+    m.add(make_segment({10, 99}, 1234));
+    BOOST_CHECK_EQUAL(kafka::offset{100}, m.get_next_kafka_offset());
+
+    // Sanity check that we get non-zero for a valid range...
+    BOOST_CHECK_EQUAL(
+      1234, m.estimate_size_between(kafka::offset{90}, kafka::offset{90}));
+    // ...but zero when the range is empty.
+    BOOST_CHECK_EQUAL(
+      0, m.estimate_size_between(kafka::offset{90}, kafka::offset{89}));
+
+    // Now truncate such that the whole manifest is empty.
+    m.truncate(model::next_offset(m.last_segment()->committed_offset));
+    BOOST_CHECK(!m.get_next_kafka_offset().has_value());
+    BOOST_CHECK_EQUAL(
+      0, m.estimate_size_between(kafka::offset{0}, kafka::offset{0}));
+    BOOST_CHECK_EQUAL(
+      0, m.estimate_size_between(kafka::offset{100}, kafka::offset{100}));
 }
 
 SEASTAR_THREAD_TEST_CASE(test_partition_manifest_outofbound_trigger) {

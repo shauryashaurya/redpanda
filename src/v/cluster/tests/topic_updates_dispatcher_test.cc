@@ -14,8 +14,6 @@
 
 #include <seastar/testing/thread_test_case.hh>
 
-#include <bits/stdint-uintn.h>
-
 #include <cstdint>
 using namespace std::chrono_literals;
 
@@ -140,23 +138,25 @@ FIXTURE_TEST(
 FIXTURE_TEST(
   test_dispatching_conflicts, topic_table_updates_dispatcher_fixture) {
     create_topics();
-    // discard create delta
-    table.local().wait_for_changes(as).get0();
+
+    std::vector<cluster::topic_table_ntp_delta> deltas;
+    table.local().register_ntp_delta_notification(
+      [&](const auto& d) { deltas.insert(deltas.end(), d.begin(), d.end()); });
 
     auto res_1 = table.local()
                    .apply(
                      cluster::delete_topic_cmd(
                        make_tp_ns("not_exists"), make_tp_ns("not_exists")),
                      model::offset(0))
-                   .get0();
+                   .get();
     BOOST_REQUIRE_EQUAL(res_1, cluster::errc::topic_not_exists);
 
     auto res_2 = table.local()
                    .apply(
                      make_create_topic_cmd("test_tp_1", 2, 3), model::offset(0))
-                   .get0();
+                   .get();
     BOOST_REQUIRE_EQUAL(res_2, cluster::errc::topic_already_exists);
-    BOOST_REQUIRE_EQUAL(table.local().has_pending_changes(), false);
+    BOOST_REQUIRE_EQUAL(deltas.size(), 0);
 
     BOOST_REQUIRE_EQUAL(
       current_cluster_capacity(allocator.local().state().allocation_nodes()),
@@ -170,7 +170,8 @@ FIXTURE_TEST(
     auto check_allocated_counts = [&](std::vector<size_t> expected) {
         std::vector<size_t> counts;
         for (const auto& [id, node] : allocation_nodes) {
-            BOOST_REQUIRE(id() == counts.size() + 1); // 1-based node ids
+            BOOST_REQUIRE(
+              id() == static_cast<int>(counts.size()) + 1); // 1-based node ids
             counts.push_back(node->allocated_partitions());
         }
         logger.debug("allocated counts: {}, expected: {}", counts, expected);
@@ -180,7 +181,8 @@ FIXTURE_TEST(
     auto check_final_counts = [&](std::vector<size_t> expected) {
         std::vector<size_t> counts;
         for (const auto& [id, node] : allocation_nodes) {
-            BOOST_REQUIRE(id() == counts.size() + 1); // 1-based node ids
+            BOOST_REQUIRE(
+              id() == static_cast<int>(counts.size()) + 1); // 1-based node ids
             counts.push_back(node->final_partitions());
         }
         logger.debug("final counts: {}, expected: {}", counts, expected);

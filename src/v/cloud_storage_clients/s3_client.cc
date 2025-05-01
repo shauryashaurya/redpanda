@@ -12,12 +12,17 @@
 
 #include "base/vlog.h"
 #include "bytes/bytes.h"
+#include "bytes/iostream.h"
 #include "cloud_storage_clients/logger.h"
 #include "cloud_storage_clients/s3_error.h"
 #include "cloud_storage_clients/util.h"
 #include "cloud_storage_clients/xml_sax_parser.h"
+#include "config/configuration.h"
+#include "config/node_config.h"
+#include "config/types.h"
 #include "hashing/secure.h"
 #include "http/client.h"
+#include "http/utils.h"
 #include "net/types.h"
 #include "ssx/sformat.h"
 #include "utils/base64.h"
@@ -27,6 +32,7 @@
 #include <seastar/core/gate.hh>
 #include <seastar/core/iostream.hh>
 #include <seastar/core/loop.hh>
+#include <seastar/core/lowres_clock.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/temporary_buffer.hh>
 #include <seastar/net/inet_address.hh>
@@ -37,7 +43,6 @@
 #include <boost/beast/http/status.hpp>
 #include <boost/property_tree/ptree.hpp>
 #include <boost/property_tree/xml_parser.hpp>
-#include <gnutls/crypto.h>
 
 #include <bit>
 #include <exception>
@@ -77,8 +82,8 @@ request_creator::request_creator(
   , _apply_credentials{std::move(apply_credentials)} {}
 
 result<http::client::request_header> request_creator::make_get_object_request(
-  bucket_name const& name,
-  object_key const& key,
+  const bucket_name& name,
+  const object_key& key,
   std::optional<http_byte_range> byte_range) {
     http::client::request_header header{};
     // Virtual Style:
@@ -111,11 +116,12 @@ result<http::client::request_header> request_creator::make_get_object_request(
     if (ec) {
         return ec;
     }
+    util::url_encode_target(header);
     return header;
 }
 
 result<http::client::request_header> request_creator::make_head_object_request(
-  bucket_name const& name, object_key const& key) {
+  const bucket_name& name, const object_key& key) {
     http::client::request_header header{};
     // Virtual Style:
     // HEAD /{object-id} HTTP/1.1
@@ -139,12 +145,13 @@ result<http::client::request_header> request_creator::make_head_object_request(
     if (ec) {
         return ec;
     }
+    util::url_encode_target(header);
     return header;
 }
 
 result<http::client::request_header>
 request_creator::make_unsigned_put_object_request(
-  bucket_name const& name, object_key const& key, size_t payload_size_bytes) {
+  const bucket_name& name, const object_key& key, size_t payload_size_bytes) {
     // Virtual Style:
     // PUT /my-image.jpg HTTP/1.1
     // Host: {bucket-name}.s3.{region}.amazonaws.com
@@ -177,6 +184,7 @@ request_creator::make_unsigned_put_object_request(
     if (ec) {
         return ec;
     }
+    util::url_encode_target(header);
     return header;
 }
 
@@ -203,6 +211,15 @@ request_creator::make_list_objects_v2_request(
     if (prefix.has_value()) {
         key = fmt::format("{}&prefix={}", key, (*prefix)().string());
     }
+    if (start_after.has_value()) {
+        key = fmt::format("{}&start-after={}", key, *start_after);
+    }
+    if (max_keys.has_value()) {
+        key = fmt::format("{}&max-keys={}", key, *max_keys);
+    }
+    if (continuation_token.has_value()) {
+        key = fmt::format("{}&continuation-token={}", key, *continuation_token);
+    }
     if (delimiter.has_value()) {
         key = fmt::format("{}&delimiter={}", key, *delimiter);
     }
@@ -214,37 +231,18 @@ request_creator::make_list_objects_v2_request(
     header.insert(boost::beast::http::field::host, host);
     header.insert(boost::beast::http::field::content_length, "0");
 
-    if (prefix) {
-        header.insert(aws_header_names::prefix, (*prefix)().string());
-    }
-    if (start_after) {
-        header.insert(aws_header_names::start_after, (*start_after)().string());
-    }
-    if (max_keys) {
-        header.insert(aws_header_names::max_keys, std::to_string(*max_keys));
-    }
-    if (continuation_token) {
-        header.insert(
-          aws_header_names::continuation_token,
-          {continuation_token->data(), continuation_token->size()});
-    }
-
-    if (delimiter) {
-        header.insert(
-          aws_header_names::delimiter, std::string(1, delimiter.value()));
-    }
-
     auto ec = _apply_credentials->add_auth(header);
     vlog(s3_log.trace, "ListObjectsV2:\n {}", header);
     if (ec) {
         return ec;
     }
+    util::url_encode_target(header);
     return header;
 }
 
 result<http::client::request_header>
 request_creator::make_delete_object_request(
-  bucket_name const& name, object_key const& key) {
+  const bucket_name& name, const object_key& key) {
     http::client::request_header header{};
     // Virtual Style:
     // DELETE /{object-id} HTTP/1.1
@@ -270,6 +268,7 @@ request_creator::make_delete_object_request(
     if (ec) {
         return ec;
     }
+    util::url_encode_target(header);
     return header;
 }
 
@@ -325,7 +324,7 @@ request_creator::make_delete_objects_request(
         delete_tree.put("Delete.Quiet", true);
         // add an array of Object.Key=key to the Delete root
         for (auto key_tree = boost::property_tree::ptree{};
-             auto const& k : keys) {
+             const auto& k : keys) {
             key_tree.put("Key", k().c_str());
             delete_tree.add_child("Delete.Object", key_tree);
         }
@@ -369,7 +368,7 @@ request_creator::make_delete_objects_request(
     if (ec) {
         return ec;
     }
-
+    util::url_encode_target(header);
     return {
       std::move(header),
       ss::input_stream<char>{ss::data_source{
@@ -413,36 +412,47 @@ status_to_error_code(boost::beast::http::status s) {
     return cloud_storage_clients::s3_error_code::_unknown;
 }
 
-template<class ResultT = void>
-ss::future<ResultT>
-parse_rest_error_response(boost::beast::http::status result, iobuf&& buf) {
-    if (buf.empty()) {
-        // AWS errors occasionally come with an empty body
-        // (See https://github.com/redpanda-data/redpanda/issues/6061)
-        // Without a proper code, we treat it as a hint to gracefully retry
-        // (synthesize the slow_down code).
-        rest_error_response err(
-          fmt::format("{}", status_to_error_code(result)),
-          fmt::format("Empty error response, status code {}", result),
-          "",
-          "");
-        return ss::make_exception_future<ResultT>(err);
-    } else {
-        try {
-            auto resp = util::iobuf_to_ptree(std::move(buf), s3_log);
-            constexpr const char* empty = "";
-            auto code = resp.get<ss::sstring>("Error.Code", empty);
-            auto msg = resp.get<ss::sstring>("Error.Message", empty);
-            auto rid = resp.get<ss::sstring>("Error.RequestId", empty);
-            auto res = resp.get<ss::sstring>("Error.Resource", empty);
-            rest_error_response err(code, msg, rid, res);
-            return ss::make_exception_future<ResultT>(err);
-        } catch (...) {
-            vlog(
-              s3_log.error, "!!error parse error {}", std::current_exception());
-            throw;
+rest_error_response parse_xml_rest_error_response(iobuf&& buf) {
+    try {
+        auto resp = util::iobuf_to_ptree(std::move(buf), s3_log);
+        constexpr const char* empty = "";
+        auto code = resp.get<ss::sstring>("Error.Code", empty);
+        auto msg = resp.get<ss::sstring>("Error.Message", empty);
+        auto rid = resp.get<ss::sstring>("Error.RequestId", empty);
+        auto res = resp.get<ss::sstring>("Error.Resource", empty);
+        rest_error_response err(code, msg, rid, res);
+        return err;
+    } catch (...) {
+        vlog(s3_log.error, "!!error parse error {}", std::current_exception());
+        throw;
+    }
+}
+
+template<typename ResultT = void>
+ss::future<ResultT> parse_rest_error_response(
+  response_content_type type, boost::beast::http::status result, iobuf&& buf) {
+    // AWS errors occasionally come with an empty body
+    // (See https://github.com/redpanda-data/redpanda/issues/6061)
+    // Without a proper code, we treat it as a hint to gracefully retry
+    // (synthesize the slow_down code).
+    if (!buf.empty()) {
+        if (type == response_content_type::xml) {
+            // Error responses from S3 _should_ have the Content-Type header set
+            // with `application/xml`- however, certain responses (such as `503
+            // Service Unavailable`) may not be of this form.
+            // https://docs.aws.amazon.com/AmazonS3/latest/API/ErrorResponses.html
+            return ss::make_exception_future<ResultT>(
+              parse_xml_rest_error_response(std::move(buf)));
         }
     }
+
+    auto result_prefix = buf.empty() ? "Empty error response, " : "";
+    rest_error_response err(
+      fmt::format("{}", status_to_error_code(result)),
+      fmt::format("{}status code {}", result_prefix, result),
+      "",
+      "");
+    return ss::make_exception_future<ResultT>(err);
 }
 
 /// Head response doesn't give us an XML encoded error object in
@@ -490,7 +500,9 @@ ss::future<result<T, error_outcome>> s3_client::send_request(
     try {
         co_return co_await std::move(request_future);
     } catch (const rest_error_response& err) {
-        if (err.code() == s3_error_code::no_such_key) {
+        if (
+          err.code() == s3_error_code::no_such_key
+          || err.code() == s3_error_code::no_such_configuration) {
             // Unexpected 404s are logged by 'request_future' at warn
             // level, so only log at debug level here.
             vlog(s3_log.debug, "NoSuchKey response received {}", key);
@@ -561,21 +573,87 @@ s3_client::s3_client(
 
 ss::future<result<client_self_configuration_output, error_outcome>>
 s3_client::self_configure() {
+    auto result = s3_self_configuration_result{
+      .url_style = s3_url_style::virtual_host};
+    // Oracle cloud storage only supports path-style requests
+    // (https://www.oracle.com/ca-en/cloud/storage/object-storage/faq/#category-amazon),
+    // but self-configuration will misconfigure to virtual-host style due to a
+    // ListObjects request that happens to succeed. Override for this
+    // specific case.
+    auto inferred_backend = infer_backend_from_uri(_requestor._ap);
+    if (inferred_backend == model::cloud_storage_backend::oracle_s3_compat) {
+        result.url_style = s3_url_style::path;
+        co_return result;
+    }
+
+    // Test virtual host style addressing, fall back to path if necessary.
+    // If any configuration options prevent testing, addressing style will
+    // default to virtual_host.
+    // If both addressing methods fail, return an error.
+    const auto& bucket_config = config::shard_local_cfg().cloud_storage_bucket;
+
+    if (!bucket_config.value().has_value()) {
+        vlog(
+          s3_log.warn,
+          "Could not self-configure S3 Client, {} is not set. Defaulting to {}",
+          bucket_config.name(),
+          result.url_style);
+        co_return result;
+    }
+
+    const auto bucket = cloud_storage_clients::bucket_name{
+      bucket_config.value().value()};
+
+    // Test virtual_host style.
+    vassert(
+      _requestor._ap_style == s3_url_style::virtual_host,
+      "_ap_style should be virtual host by default before self configuration "
+      "begins");
+    if (co_await self_configure_test(bucket)) {
+        // Virtual-host style request succeeded.
+        co_return result;
+    }
+
+    // fips mode can only work in virtual_host mode, so if the above test failed
+    // the TS service is likely misconfigured
+    vassert(
+      !config::fips_mode_enabled(config::node().fips_mode.value()),
+      "fips_mode requires the bucket to configured in virtual_host mode, but "
+      "the connectivity test failed");
+
+    // Test path style.
+    _requestor._ap_style = s3_url_style::path;
+    result.url_style = _requestor._ap_style;
+    if (co_await self_configure_test(bucket)) {
+        // Path style request succeeded.
+        co_return result;
+    }
+
+    // Both addressing styles failed.
     vlog(
       s3_log.error,
-      "Call to self_configure was made, but the S3 client doesn't require self "
-      "configuration");
-    co_return s3_self_configuration_result{};
+      "Couldn't reach S3 storage with either path style or virtual_host style "
+      "requests.",
+      bucket_config.name());
+    co_return error_outcome::fail;
+}
+
+ss::future<bool> s3_client::self_configure_test(const bucket_name& bucket) {
+    // Check that the current addressing-style works by issuing a ListObjects
+    // request.
+    auto list_objects_result = co_await list_objects(
+      bucket, std::nullopt, std::nullopt, 1);
+    co_return list_objects_result;
 }
 
 ss::future<> s3_client::stop() { return _client.stop(); }
 
-void s3_client::shutdown() { _client.shutdown(); }
+void s3_client::shutdown() { _client.shutdown_now(); }
 
 ss::future<result<http::client::response_stream_ref, error_outcome>>
 s3_client::get_object(
-  bucket_name const& name,
-  object_key const& key,
+  const bucket_name& name,
+  const object_key& key,
   ss::lowres_clock::duration timeout,
   bool expect_no_such_key,
   std::optional<http_byte_range> byte_range) {
@@ -587,8 +665,8 @@ s3_client::get_object(
 }
 
 ss::future<http::client::response_stream_ref> s3_client::do_get_object(
-  bucket_name const& name,
-  object_key const& key,
+  const bucket_name& name,
+  const object_key& key,
   ss::lowres_clock::duration timeout,
   bool expect_no_such_key,
   std::optional<http_byte_range> byte_range) {
@@ -641,11 +719,13 @@ ss::future<http::client::response_stream_ref> s3_client::do_get_object(
                         ref->get_headers().result(),
                         ref->get_headers());
                   }
+                  const auto content_type = util::get_response_content_type(
+                    ref->get_headers());
                   return util::drain_response_stream(std::move(ref))
-                    .then([result](iobuf&& res) {
+                    .then([content_type, result](iobuf&& res) {
                         return parse_rest_error_response<
                           http::client::response_stream_ref>(
-                          result, std::move(res));
+                          content_type, result, std::move(res));
                     });
               }
               return ss::make_ready_future<http::client::response_stream_ref>(
@@ -656,15 +736,15 @@ ss::future<http::client::response_stream_ref> s3_client::do_get_object(
 
 ss::future<result<s3_client::head_object_result, error_outcome>>
 s3_client::head_object(
-  bucket_name const& name,
-  object_key const& key,
+  const bucket_name& name,
+  const object_key& key,
   ss::lowres_clock::duration timeout) {
     return send_request(do_head_object(name, key, timeout), name, key);
 }
 
 ss::future<s3_client::head_object_result> s3_client::do_head_object(
-  bucket_name const& name,
-  object_key const& key,
+  const bucket_name& name,
+  const object_key& key,
   ss::lowres_clock::duration timeout) {
     auto header = _requestor.make_head_object_request(name, key);
     if (!header) {
@@ -717,13 +797,15 @@ ss::future<s3_client::head_object_result> s3_client::do_head_object(
 }
 
 ss::future<result<s3_client::no_response, error_outcome>> s3_client::put_object(
-  bucket_name const& name,
-  object_key const& key,
+  const bucket_name& name,
+  const object_key& key,
   size_t payload_size,
   ss::input_stream<char> body,
-  ss::lowres_clock::duration timeout) {
+  ss::lowres_clock::duration timeout,
+  bool accept_no_content) {
     return send_request(
-      do_put_object(name, key, payload_size, std::move(body), timeout)
+      do_put_object(
+        name, key, payload_size, std::move(body), timeout, accept_no_content)
         .then(
           []() { return ss::make_ready_future<no_response>(no_response{}); }),
       name,
@@ -731,11 +813,12 @@ ss::future<result<s3_client::no_response, error_outcome>> s3_client::put_object(
 }
 
 ss::future<> s3_client::do_put_object(
-  bucket_name const& name,
-  object_key const& id,
+  const bucket_name& name,
+  const object_key& id,
   size_t payload_size,
   ss::input_stream<char> body,
-  ss::lowres_clock::duration timeout) {
+  ss::lowres_clock::duration timeout,
+  bool accept_no_content) {
     auto header = _requestor.make_unsigned_put_object_request(
       name, id, payload_size);
     if (!header) {
@@ -747,26 +830,33 @@ ss::future<> s3_client::do_put_object(
     vlog(s3_log.trace, "send https request:\n{}", header.value());
     return ss::do_with(
       std::move(body),
-      [this, timeout, header = std::move(header), id](
+      [this, timeout, header = std::move(header), id, accept_no_content](
         ss::input_stream<char>& body) mutable {
           auto make_request = [this, &header, &body, &timeout]() {
               return _client.request(std::move(header.value()), body, timeout);
           };
 
           return ss::futurize_invoke(make_request)
-            .then([id](const http::client::response_stream_ref& ref) {
+            .then([id, accept_no_content](
+                    const http::client::response_stream_ref& ref) {
                 return util::drain_response_stream(ref).then(
-                  [ref, id](iobuf&& res) {
+                  [ref, id, accept_no_content](iobuf&& res) {
                       auto status = ref->get_headers().result();
-                      if (status != boost::beast::http::status::ok) {
+                      using enum boost::beast::http::status;
+                      if (const auto is_no_content_and_accepted
+                          = status == no_content && accept_no_content;
+                          status != ok && !is_no_content_and_accepted) {
                           vlog(
                             s3_log.warn,
                             "S3 PUT request failed for key {}: {} {:l}",
                             id,
                             status,
                             ref->get_headers());
+                          const auto content_type
+                            = util::get_response_content_type(
+                              ref->get_headers());
                           return parse_rest_error_response<>(
-                            status, std::move(res));
+                            content_type, status, std::move(res));
                       }
                       return ss::now();
                   });
@@ -829,7 +919,7 @@ ss::future<s3_client::list_bucket_result> s3_client::do_list_objects_v2(
       name,
       std::move(prefix),
       std::move(start_after),
-      max_keys,
+      std::move(max_keys),
       std::move(continuation_token),
       delimiter);
     if (!header) {
@@ -850,12 +940,14 @@ ss::future<s3_client::list_bucket_result> s3_client::do_list_objects_v2(
                       header.result(),
                       header);
 
+                    const auto content_type = util::get_response_content_type(
+                      header);
                     // In the error path we drain the response stream fully, the
                     // error response should not be very large.
                     return util::drain_chunked_response_stream(resp).then(
-                      [result = header.result()](iobuf buf) {
+                      [result = header.result(), content_type](iobuf buf) {
                           return parse_rest_error_response<list_bucket_result>(
-                            result, std::move(buf));
+                            content_type, result, std::move(buf));
                       });
                 }
 
@@ -942,7 +1034,10 @@ ss::future<> s3_client::do_delete_object(
                     key,
                     status,
                     ref->get_headers());
-                  return parse_rest_error_response<>(status, std::move(res));
+                  const auto content_type = util::get_response_content_type(
+                    ref->get_headers());
+                  return parse_rest_error_response<>(
+                    content_type, status, std::move(res));
               }
               return ss::now();
           });
@@ -966,7 +1061,7 @@ iobuf_to_delete_objects_result(iobuf&& buf) {
             rest_error_response err(code, msg, rid, res);
             return err;
         }
-        for (auto const& [tag, value] : root.get_child("DeleteResult")) {
+        for (const auto& [tag, value] : root.get_child("DeleteResult")) {
             if (tag != "Error") {
                 continue;
             }
@@ -1008,7 +1103,7 @@ iobuf_to_delete_objects_result(iobuf&& buf) {
 }
 
 auto s3_client::do_delete_objects(
-  bucket_name const& bucket,
+  const bucket_name& bucket,
   std::span<const object_key> keys,
   ss::lowres_clock::duration timeout)
   -> ss::future<client::delete_objects_result> {
@@ -1027,13 +1122,15 @@ auto s3_client::do_delete_objects(
                  return _client.request(std::move(header), to_delete, timeout)
                    .finally([&] { return to_delete.close(); });
              })
-      .then([](http::client::response_stream_ref const& response) {
+      .then([](const http::client::response_stream_ref& response) {
           return util::drain_response_stream(response).then(
             [response](iobuf&& res) {
                 auto status = response->get_headers().result();
                 if (status != boost::beast::http::status::ok) {
+                    const auto content_type = util::get_response_content_type(
+                      response->get_headers());
                     return parse_rest_error_response<delete_objects_result>(
-                      status, std::move(res));
+                      content_type, status, std::move(res));
                 }
                 auto parse_result = iobuf_to_delete_objects_result(
                   std::move(res));

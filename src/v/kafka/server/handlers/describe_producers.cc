@@ -17,6 +17,8 @@
 #include "kafka/protocol/errors.h"
 #include "kafka/protocol/produce.h"
 #include "kafka/protocol/schemata/describe_producers_response.h"
+#include "kafka/server/group_manager.h"
+#include "kafka/server/group_router.h"
 #include "kafka/server/handlers/details/security.h"
 #include "kafka/server/request_context.h"
 #include "kafka/server/response.h"
@@ -34,15 +36,15 @@ namespace kafka {
 
 namespace {
 
-using ret_res = checked<cluster::rm_stm::transaction_set, kafka::error_code>;
+using ret_res = checked<cluster::tx::partition_transactions, kafka::error_code>;
 
 partition_response
 make_error_response(model::partition_id id, kafka::error_code ec) {
     return partition_response{.partition_index = id, .error_code = ec};
 }
 
-partition_response
-do_get_producers_for_partition(cluster::partition_manager& pm, model::ktp ntp) {
+partition_response do_get_producers_for_data_partition(
+  cluster::partition_manager& pm, model::ktp ntp) {
     auto partition = pm.get(ntp);
     if (!partition || !partition->is_leader()) {
         return make_error_response(
@@ -61,19 +63,25 @@ do_get_producers_for_partition(cluster::partition_manager& pm, model::ktp ntp) {
           ntp.get_partition(), kafka::error_code::unknown_server_error);
     }
     const auto& producers = rm_stm_ptr->get_producers();
+    auto log_start = partition->raft_start_offset();
     partition_response resp;
     resp.error_code = error_code::none;
     resp.partition_index = ntp.get_partition();
     resp.active_producers.reserve(producers.size());
     for (const auto& [pid, state] : producers) {
+        auto tx_start = state->get_current_tx_start_offset();
+        auto kafka_tx_start = -1;
+        if (tx_start && tx_start.value() >= log_start) {
+            kafka_tx_start = partition->log()->from_log_offset(
+              tx_start.value());
+        }
         resp.active_producers.push_back(producer_state{
-          .producer_id = pid.get_id(),
-          .producer_epoch = pid.get_epoch(),
+          .producer_id = pid,
+          .producer_epoch = state->id().get_epoch(),
           .last_sequence = state->last_sequence_number().value_or(-1),
           .last_timestamp = state->last_update_timestamp().value(),
           .coordinator_epoch = -1,
-          .current_txn_start_offset
-          = state->current_txn_start_offset().value_or(kafka::offset(-1)),
+          .current_txn_start_offset = kafka_tx_start,
         });
     }
     return resp;
@@ -91,9 +99,16 @@ get_producers_for_partition(request_context& ctx, model::ktp ntp) {
           ntp.get_partition(), kafka::error_code::not_leader_for_partition);
     }
 
+    if (ntp.get_topic() == model::kafka_consumer_offsets_topic) {
+        co_return co_await ctx.groups().get_group_manager().invoke_on(
+          *shard, [ktp = std::move(ntp)](kafka::group_manager& gm) mutable {
+              return gm.describe_partition_producers(ktp.to_ntp());
+          });
+    }
+
     co_return co_await ctx.partition_manager().invoke_on(
       *shard, [ntp = std::move(ntp)](cluster::partition_manager& pm) mutable {
-          return do_get_producers_for_partition(pm, std::move(ntp));
+          return do_get_producers_for_data_partition(pm, std::move(ntp));
       });
 }
 

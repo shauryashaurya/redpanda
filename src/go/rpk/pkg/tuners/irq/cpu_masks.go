@@ -7,6 +7,8 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0
 
+//go:build linux
+
 package irq
 
 import (
@@ -34,7 +36,7 @@ type CPUMasks interface {
 	GetNumberOfCores(mask string) (uint, error)
 	GetNumberOfPUs(mask string) (uint, error)
 	GetAllCpusMask() (string, error)
-	GetLogicalCoreIdsFromPhysCore(core uint) ([]uint, error)
+	GetLogicalCoreIDsFromPhysCore(core uint) ([]uint, error)
 	IsSupported() bool
 }
 
@@ -212,7 +214,7 @@ func (masks *cpuMasks) GetNumberOfPUs(mask string) (uint, error) {
 	return masks.hwloc.GetNumberOfPUs(mask)
 }
 
-func (masks *cpuMasks) GetLogicalCoreIdsFromPhysCore(
+func (masks *cpuMasks) GetLogicalCoreIDsFromPhysCore(
 	core uint,
 ) ([]uint, error) {
 	return masks.hwloc.GetPhysIntersection("PU", fmt.Sprintf("core:%d", core))

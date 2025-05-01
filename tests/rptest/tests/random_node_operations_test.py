@@ -7,26 +7,30 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0
 
+import math
 import random
 import re
 import threading
 from rptest.clients.rpk import RpkTool
 from rptest.services.admin import Admin
+from rptest.services.apache_iceberg_catalog import IcebergRESTCatalog
 from rptest.tests.prealloc_nodes import PreallocNodesTest
 
-from ducktape.mark import matrix
+from ducktape.mark import matrix, ignore
 from ducktape.utils.util import wait_until
 from rptest.services.admin_ops_fuzzer import AdminOperationsFuzzer
 from rptest.services.cluster import cluster
 from rptest.clients.types import TopicSpec
 from rptest.clients.default import DefaultClient
 from rptest.services.kgo_verifier_services import KgoVerifierConsumerGroupConsumer, KgoVerifierProducer
-from rptest.services.redpanda import CHAOS_LOG_ALLOW_LIST, PREV_VERSION_LOG_ALLOW_LIST, SISettings
+from rptest.services.redpanda import CHAOS_LOG_ALLOW_LIST, PREV_VERSION_LOG_ALLOW_LIST, CloudStorageType, LoggingConfig, PandaproxyConfig, SISettings, SchemaRegistryConfig, get_cloud_storage_type
 from rptest.services.redpanda_installer import RedpandaInstaller
-from rptest.utils.mode_checks import cleanup_on_early_exit, skip_debug_mode
-from rptest.utils.node_operations import FailureInjectorBackgroundThread, NodeOpsExecutor, generate_random_workload
+from rptest.utils.mode_checks import cleanup_on_early_exit, skip_debug_mode, skip_fips_mode
+from rptest.utils.node_operations import FailureInjectorBackgroundThread, NodeOpsExecutor, generate_random_workload, verify_offset_translator_state_consistent
+from rptest.services.redpanda import MetricsEndpoint
 
 from rptest.clients.offline_log_viewer import OfflineLogViewer
+from rptest.tests.datalake.utils import supported_storage_types
 
 TS_LOG_ALLOW_LIST = [
     re.compile(
@@ -35,7 +39,9 @@ TS_LOG_ALLOW_LIST = [
     # v23.2.x specific log
     re.compile(".*archival_metadata_stm.*Can't apply override"),
     # topic deletion may happen before data were uploaded
-    re.compile(".*cloud_storage.*Failed to fetch manifest during finalize().*")
+    re.compile(".*cloud_storage.*Failed to fetch manifest during finalize().*"
+               ),
+    re.compile(".*archival -.* System error during SSL read:.*")
 ]
 
 
@@ -53,11 +59,36 @@ class RandomNodeOperationsTest(PreallocNodesTest):
                 # set disk timeout to value greater than max suspend time
                 # not to emit spurious errors
                 "raft_io_timeout_ms": 20000,
+                "compacted_log_segment_size": 1024 * 1024,
+                "log_segment_size": 2 * 1024 * 1024,
             },
             # 2 nodes for kgo producer/consumer workloads
             node_prealloc_count=3,
+            schema_registry_config=SchemaRegistryConfig(),
+            pandaproxy_config=PandaproxyConfig(),
+            log_config=LoggingConfig(
+                'info', {
+                    'storage-resources': 'warn',
+                    'storage-gc': 'warn',
+                    'raft': 'debug',
+                    'cluster': 'debug',
+                    'datalake': 'trace',
+                    'cloud_storage': 'debug',
+                }),
             *args,
             **kwargs)
+        self.nodes_with_prev_version = []
+        self.installer = self.redpanda._installer
+        self.previous_version = self.installer.highest_from_prior_feature_version(
+            RedpandaInstaller.HEAD)
+        self._si_settings = SISettings(self.test_context,
+                                       cloud_storage_enable_remote_read=True,
+                                       cloud_storage_enable_remote_write=True,
+                                       fast_uploads=True)
+        self.catalog_service = IcebergRESTCatalog(
+            test_context,
+            cloud_storage_bucket=self._si_settings.cloud_storage_bucket,
+            filesystem_wrapper_mode=False)
 
     def min_producer_records(self):
         return 20 * self.producer_throughput
@@ -88,10 +119,9 @@ class RandomNodeOperationsTest(PreallocNodesTest):
             self.redpanda.set_skip_if_no_redpanda_log(True)
 
     def setUp(self):
-        # defer starting redpanda to test body
-        pass
+        self.catalog_service.start()
 
-    def _setup_test_scale(self, num_to_upgrade):
+    def _setup_test_scale(self):
         # test setup
         self.producer_timeout = 180
         self.consumer_timeout = 180
@@ -105,10 +135,6 @@ class RandomNodeOperationsTest(PreallocNodesTest):
             self.rate_limit = 100 * 1024 * 1024  # 100 MBps
             self.total_data = 5 * 1024 * 1024 * 1024
         else:
-            # container test setup
-            if num_to_upgrade > 0:
-                self.should_skip = True
-
             self.max_partitions = 32
             self.producer_throughput = 1000 if self.debug_mode else 10000
             self.node_operations = 10
@@ -129,33 +155,62 @@ class RandomNodeOperationsTest(PreallocNodesTest):
             f"running test with: [message_size {self.msg_size},  total_bytes: {self.total_data}, message_count: {self.msg_count}, rate_limit: {self.rate_limit}, cluster_operations: {self.node_operations}]"
         )
 
-    def _start_redpanda(self, number_nodes_to_upgrade, with_tiered_storage):
+    def _start_redpanda(self, mixed_versions, with_tiered_storage,
+                        with_iceberg, with_chunked_compaction):
 
-        if with_tiered_storage:
-            si_settings = SISettings(self.test_context,
-                                     cloud_storage_enable_remote_read=True,
-                                     cloud_storage_enable_remote_write=True,
-                                     fast_uploads=True)
+        if with_tiered_storage or with_iceberg:
             # since this test is deleting topics we must tolerate missing manifests
-            si_settings.set_expected_damage(
+            self._si_settings.set_expected_damage(
                 {"ntr_no_topic_manifest", "ntpr_no_manifest"})
-            self.redpanda.set_si_settings(si_settings)
+            self.redpanda.set_si_settings(self._si_settings)
+
+        if with_iceberg:
+            self.redpanda.add_extra_rp_conf({
+                "iceberg_enabled":
+                "true",
+                "iceberg_catalog_type":
+                "rest",
+                "iceberg_rest_catalog_endpoint":
+                self.catalog_service.iceberg_rest_url,
+                "iceberg_rest_catalog_client_id":
+                "panda-user",
+                "iceberg_rest_catalog_client_secret":
+                "panda-secret",
+            })
+
+        if with_chunked_compaction:
+            # This may not be recognized on certain nodes in mixed-version run.
+            environment = {
+                "__REDPANDA_TEST_DISABLE_BOUNDED_PROPERTY_CHECKS": "ON"
+            }
+            self.redpanda.set_environment(environment)
+            # Use 3 KiB of memory for compaction map, which should force chunked compaction.
+            self.redpanda.add_extra_rp_conf(
+                {"storage_compaction_key_map_memory": 3 * 1024})
 
         self.redpanda.set_seed_servers(self.redpanda.nodes)
-        if number_nodes_to_upgrade > 0:
-            installer = self.redpanda._installer
-            installer.install(
-                self.redpanda.nodes,
-                installer.highest_from_prior_feature_version(
-                    RedpandaInstaller.HEAD))
-            self.redpanda.start()
-            installer.install(self.redpanda.nodes[:number_nodes_to_upgrade],
-                              RedpandaInstaller.HEAD)
-            self.redpanda.restart_nodes(
-                self.redpanda.nodes[:number_nodes_to_upgrade])
+        if mixed_versions:
+            node_count = len(self.redpanda.nodes)
+            with_prev_version = math.ceil(node_count / 2.0)
+            self.logger.info(
+                f"Using cluster with mixed versions with {node_count - with_prev_version} nodes using current HEAD version {RedpandaInstaller.HEAD} and {with_prev_version} using previous version: {self.previous_version}"
+            )
+
+            self.nodes_with_prev_version = self.redpanda.nodes[:
+                                                               with_prev_version]
+            self.installer.install(self.nodes_with_prev_version,
+                                   self.previous_version)
+
+            self.redpanda.set_seed_servers(self.nodes_with_prev_version)
+            self.redpanda.start(auto_assign_node_id=True,
+                                omit_seeds_on_idx_one=False)
         else:
             self.redpanda.start(auto_assign_node_id=True,
                                 omit_seeds_on_idx_one=False)
+
+        self.redpanda.await_feature('membership_change_controller_cmds',
+                                    'active',
+                                    timeout_sec=30)
 
     def _alter_local_topic_retention_bytes(self, topic, retention_bytes):
         rpk = RpkTool(self.redpanda)
@@ -231,6 +286,7 @@ class RandomNodeOperationsTest(PreallocNodesTest):
                 nodes=self.nodes,
                 debug_logs=with_logs,
                 trace_logs=with_logs,
+                compacted=self.compaction_enabled,
                 tolerate_data_loss=self.tolerate_data_loss)
 
             self.consumer.start(clean=False)
@@ -249,7 +305,7 @@ class RandomNodeOperationsTest(PreallocNodesTest):
             )
             self.producer.wait()
 
-            assert self.producer.produce_status.bad_offsets == 0
+            assert self.producer.produce_status.bad_offsets == 0 or self.tolerate_data_loss
             # Await the consumer that is reading only the subset of data that
             # was written before it started.
             self.consumer.wait()
@@ -265,15 +321,29 @@ class RandomNodeOperationsTest(PreallocNodesTest):
 
             assert self.consumer.consumer_status.validator.invalid_reads == 0, f"Invalid reads in topic: {self.topic}, invalid reads count: {self.consumer.consumer_status.validator.invalid_reads}"
 
+    def maybe_enable_iceberg_for_topic(self, topic_spec: TopicSpec,
+                                       iceberg_enabled: bool):
+        if iceberg_enabled:
+            client = DefaultClient(self.redpanda)
+            client.alter_topic_config(topic_spec.name,
+                                      TopicSpec.PROPERTY_ICEBERG_MODE,
+                                      "key_value")
+
+    # before v24.2, dns query to s3 endpoint do not include the bucketname, which is required for AWS S3 fips endpoints
+    @skip_fips_mode
     @skip_debug_mode
-    @cluster(num_nodes=8,
+    @cluster(num_nodes=9,
              log_allow_list=CHAOS_LOG_ALLOW_LIST +
              PREV_VERSION_LOG_ALLOW_LIST + TS_LOG_ALLOW_LIST)
     @matrix(enable_failures=[True, False],
-            num_to_upgrade=[0, 3],
-            with_tiered_storage=[True, False])
-    def test_node_operations(self, enable_failures, num_to_upgrade,
-                             with_tiered_storage):
+            mixed_versions=[True, False],
+            with_tiered_storage=[True, False],
+            with_iceberg=[True, False],
+            with_chunked_compaction=[True, False],
+            cloud_storage_type=get_cloud_storage_type())
+    def test_node_operations(self, enable_failures, mixed_versions,
+                             with_tiered_storage, with_iceberg,
+                             with_chunked_compaction, cloud_storage_type):
         # In order to reduce the number of parameters and at the same time cover
         # as many use cases as possible this test uses 3 topics which 3 separate
         # producer/consumer pairs:
@@ -281,12 +351,22 @@ class RandomNodeOperationsTest(PreallocNodesTest):
         # tp-workload-deletion   - topic with delete cleanup policy
         # tp-workload-compaction - topic with compaction
         # tp-workload-fast       - topic with fast partition movements enabled
+        if with_iceberg:
+            if mixed_versions:
+                self.should_skip = True
+                self.logger.info(
+                    "Skipping test with iceberg and mixed versions as it is not supported"
+                )
+            cloud_storage_types = supported_storage_types()
+            if cloud_storage_type not in cloud_storage_types:
+                self.should_skip = True
+                self.logger.info(
+                    "Skipping test with iceberg and unsupported cloud storage type"
+                )
 
         def enable_fast_partition_movement():
             if not with_tiered_storage:
                 return False
-            if num_to_upgrade == 0:
-                return True
 
             initial_version = self.redpanda._installer.highest_from_prior_feature_version(
                 RedpandaInstaller.HEAD)
@@ -298,7 +378,7 @@ class RandomNodeOperationsTest(PreallocNodesTest):
             return supported_by_prev
 
         def enable_write_caching_testing():
-            if num_to_upgrade == 0:
+            if not mixed_versions:
                 return True
             # Write caching feature is available 24.x and later.
             pre_upgrade_version = self.redpanda._installer.highest_from_prior_feature_version(
@@ -309,18 +389,24 @@ class RandomNodeOperationsTest(PreallocNodesTest):
         default_segment_size = 1024 * 1024
 
         # setup test case scale parameters
-        self._setup_test_scale(num_to_upgrade)
+        self._setup_test_scale()
 
         if self.should_skip:
             cleanup_on_early_exit(self)
             return
 
         # start redpanda process
-        self._start_redpanda(num_to_upgrade,
-                             with_tiered_storage=with_tiered_storage)
+        self._start_redpanda(mixed_versions,
+                             with_tiered_storage=with_tiered_storage,
+                             with_iceberg=with_iceberg,
+                             with_chunked_compaction=with_chunked_compaction)
 
         self.redpanda.set_cluster_config(
             {"controller_snapshot_max_age_sec": 1})
+
+        if with_iceberg:
+            self.redpanda.set_cluster_config(
+                {"iceberg_catalog_commit_interval_ms": 10000})
 
         client = DefaultClient(self.redpanda)
 
@@ -334,6 +420,7 @@ class RandomNodeOperationsTest(PreallocNodesTest):
                                   redpanda_remote_read=with_tiered_storage,
                                   redpanda_remote_write=with_tiered_storage)
         client.create_topic(regular_topic)
+        self.maybe_enable_iceberg_for_topic(regular_topic, with_iceberg)
 
         if with_tiered_storage:
             # change local retention policy to make some local segments will be deleted during the test
@@ -359,6 +446,7 @@ class RandomNodeOperationsTest(PreallocNodesTest):
                                     redpanda_remote_read=with_tiered_storage,
                                     redpanda_remote_write=with_tiered_storage)
         client.create_topic(compacted_topic)
+        self.maybe_enable_iceberg_for_topic(compacted_topic, with_iceberg)
 
         compacted_producer_consumer = RandomNodeOperationsTest.producer_consumer(
             test_context=self.test_context,
@@ -393,7 +481,7 @@ class RandomNodeOperationsTest(PreallocNodesTest):
                                       default_segment_size)
             self._alter_local_topic_retention_bytes(fast_topic.name,
                                                     8 * default_segment_size)
-
+            self.maybe_enable_iceberg_for_topic(fast_topic, with_iceberg)
             fast_producer_consumer = RandomNodeOperationsTest.producer_consumer(
                 test_context=self.test_context,
                 logger=self.logger,
@@ -422,7 +510,8 @@ class RandomNodeOperationsTest(PreallocNodesTest):
             client.create_topic(write_caching_topic)
             client.alter_topic_config(write_caching_topic.name,
                                       TopicSpec.PROPERTY_WRITE_CACHING, "true")
-
+            self.maybe_enable_iceberg_for_topic(write_caching_topic,
+                                                with_iceberg)
             write_caching_producer_consumer = RandomNodeOperationsTest.producer_consumer(
                 test_context=self.test_context,
                 logger=self.logger,
@@ -462,6 +551,8 @@ class RandomNodeOperationsTest(PreallocNodesTest):
             self.logger,
             lock,
             progress_timeout=120 if enable_failures else 60)
+        if with_iceberg:
+            executor.override_config_params = {"iceberg_enabled": True}
         for i, op in enumerate(
                 generate_random_workload(
                     available_nodes=self.active_node_idxs)):
@@ -474,7 +565,7 @@ class RandomNodeOperationsTest(PreallocNodesTest):
         self.admin_fuzz.wait(20, 180)
         self.admin_fuzz.stop()
 
-        if enable_failures:
+        if fi:
             fi.stop()
 
         # stop producer and consumer and verify results
@@ -488,9 +579,38 @@ class RandomNodeOperationsTest(PreallocNodesTest):
         if enable_fast_partition_movement():
             fast_producer_consumer.verify()
 
-        if with_tiered_storage:
-            self.redpanda.stop_and_scrub_object_storage()
+        if mixed_versions:
+            self.logger.info("Upgrading cluster with current Redpanda version")
+            for n in self.nodes_with_prev_version:
+                self.redpanda.stop_node(n)
+            self.installer.install(self.nodes_with_prev_version,
+                                   RedpandaInstaller.HEAD)
+            for n in self.nodes_with_prev_version:
+                self.redpanda.start_node(n,
+                                         omit_seeds_on_idx_one=True,
+                                         auto_assign_node_id=True)
 
+            def cluster_version_updated():
+                admin = Admin(self.redpanda)
+                admin.get_brokers()
+                node_features = [
+                    admin.get_features(n)
+                    for n in self.redpanda.started_nodes()
+                ]
+                self.logger.info(
+                    f"Reported cluster versions: {[f['cluster_version']for f in node_features]}"
+                )
+                return all(f['cluster_version'] == f['node_latest_version']
+                           for f in node_features)
+
+            wait_until(
+                cluster_version_updated,
+                180,
+                backoff_sec=2,
+                err_msg="Error waiting for cluster to report consistent version"
+            )
+
+        verify_offset_translator_state_consistent(self.redpanda)
         # Validate that the controller log written during the test is readable by offline log viewer
         log_viewer = OfflineLogViewer(self.redpanda)
         for node in self.redpanda.started_nodes():
@@ -500,3 +620,7 @@ class RandomNodeOperationsTest(PreallocNodesTest):
             self.logger.info(
                 f"Read {len(controller_records)} controller records from node {node.name} successfully"
             )
+            if log_viewer.has_controller_snapshot(node):
+                controller_snapshot = log_viewer.read_controller_snapshot(node)
+                self.logger.info(
+                    f"Read controller snapshot: {controller_snapshot} ")

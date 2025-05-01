@@ -23,15 +23,22 @@ namespace raft {
 enum class consistency_level { quorum_ack, leader_ack, no_ack };
 
 struct replicate_options {
-    explicit replicate_options(consistency_level l)
+    explicit replicate_options(
+      consistency_level l,
+      std::optional<std::reference_wrapper<ss::abort_source>> as = std::nullopt)
       : consistency(l)
       , timeout(std::nullopt)
-      , _force_flush(false) {}
+      , _force_flush(false)
+      , as(as) {}
 
-    replicate_options(consistency_level l, std::chrono::milliseconds timeout)
+    replicate_options(
+      consistency_level l,
+      std::chrono::milliseconds timeout,
+      std::optional<std::reference_wrapper<ss::abort_source>> as = std::nullopt)
       : consistency(l)
       , timeout(timeout)
-      , _force_flush(false) {}
+      , _force_flush(false)
+      , as(as) {}
 
     // Callers may choose to force flush on an individual replicate request
     // basis. This is useful if certain callers intend to override any
@@ -45,6 +52,7 @@ struct replicate_options {
     consistency_level consistency;
     std::optional<std::chrono::milliseconds> timeout;
     bool _force_flush;
+    std::optional<std::reference_wrapper<ss::abort_source>> as;
 };
 
 struct replicate_result {
@@ -57,7 +65,7 @@ struct replicate_stages {
     replicate_stages(ss::future<>, ss::future<result<replicate_result>>);
     explicit replicate_stages(raft::errc);
     // after this future is ready, request in enqueued in raft and it will not
-    // be reorderd
+    // be reordered
     ss::future<> request_enqueued;
     // after this future is ready, request was successfully replicated with
     // requested consistency level

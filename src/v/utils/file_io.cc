@@ -14,11 +14,10 @@
 #include "bytes/iobuf.h"
 #include "bytes/iostream.h"
 
+#include <seastar/core/coroutine.hh>
 #include <seastar/core/file.hh>
 #include <seastar/core/fstream.hh>
 #include <seastar/core/temporary_buffer.hh>
-
-#include <exception>
 
 ss::future<ss::temporary_buffer<char>>
 read_fully_tmpbuf(const std::filesystem::path& name) {
@@ -31,11 +30,23 @@ read_fully_tmpbuf(const std::filesystem::path& name) {
 }
 
 ss::future<iobuf> read_fully(const std::filesystem::path& name) {
-    return read_fully_tmpbuf(name).then([](ss::temporary_buffer<char> buf) {
-        iobuf iob;
-        iob.append(std::move(buf));
-        return iob;
-    });
+    return ss::with_file(
+      ss::open_file_dma(name.string(), ss::open_flags::ro), [](ss::file file) {
+          auto buf = std::make_unique<iobuf>();
+          auto* buf_ptr = buf.get();
+          return ss::do_with(
+            std::move(buf),
+            ss::make_file_input_stream(std::move(file)),
+            make_iobuf_ref_output_stream(*buf_ptr),
+            [](
+              std::unique_ptr<iobuf>& buf,
+              ss::input_stream<char>& input,
+              ss::output_stream<char>& output) {
+                return ss::copy(input, output).then([&buf] {
+                    return std::move(*buf);
+                });
+            });
+      });
 }
 
 /**
@@ -57,17 +68,11 @@ ss::future<> write_fully(const std::filesystem::path& p, iobuf buf) {
                  | ss::open_flags::truncate;
     /// Closes file on failure, otherwise file is expected to be closed in the
     /// success case where the ss::output_stream calls close()
-    return ss::with_file_close_on_failure(
-      ss::open_file_dma(p.string(), flags),
-      [buf = std::move(buf)](ss::file f) mutable {
-          return ss::make_file_output_stream(std::move(f), buf_size)
-            .then([buf = std::move(buf)](ss::output_stream<char> out) mutable {
-                return ss::do_with(
-                  std::move(out),
-                  [buf = std::move(buf)](ss::output_stream<char>& out) mutable {
-                      return write_iobuf_to_output_stream(std::move(buf), out)
-                        .then([&out]() mutable { return out.close(); });
-                  });
-            });
+    auto out = co_await ss::with_file_close_on_failure(
+      ss::open_file_dma(p.string(), flags), [](ss::file f) {
+          return ss::make_file_output_stream(std::move(f), buf_size);
       });
+    co_await write_iobuf_to_output_stream(std::move(buf), out).finally([&out] {
+        return out.close();
+    });
 }

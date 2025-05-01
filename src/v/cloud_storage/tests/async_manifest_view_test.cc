@@ -9,10 +9,10 @@
  */
 
 #include "bytes/iostream.h"
+#include "cloud_io/tests/s3_imposter.h"
 #include "cloud_storage/async_manifest_view.h"
 #include "cloud_storage/spillover_manifest.h"
 #include "cloud_storage/tests/cloud_storage_fixture.h"
-#include "cloud_storage/tests/s3_imposter.h"
 #include "cloud_storage/tests/util.h"
 #include "cloud_storage/types.h"
 #include "model/fundamental.h"
@@ -43,6 +43,7 @@ using eof = async_manifest_view_cursor::eof;
 
 static ss::logger test_log("async_manifest_view_log");
 static const model::initial_revision_id manifest_rev(111);
+static const remote_path_provider path_provider(std::nullopt, std::nullopt);
 
 class set_config_mixin {
 public:
@@ -71,7 +72,7 @@ public:
       , rtc(as)
       , ctxlog(test_log, rtc)
       , probe(manifest_ntp)
-      , view(api, cache, stm_manifest, bucket) {
+      , view(api, cache, stm_manifest, bucket, path_provider) {
         stm_manifest.set_archive_start_offset(
           model::offset{0}, model::offset_delta{0});
         stm_manifest.set_archive_clean_offset(model::offset{0}, 0);
@@ -85,7 +86,7 @@ public:
     expectation spill_manifest(const spillover_manifest& spm, bool hydrate) {
         stm_manifest.spillover(spm.make_manifest_metadata());
         // update cache
-        auto path = spm.get_manifest_path();
+        auto path = spm.get_manifest_path(path_provider);
         if (hydrate) {
             auto stream = spm.serialize().get();
             auto reservation = cache.local().reserve_space(123, 1).get();
@@ -130,7 +131,7 @@ public:
     }
 
     void put_spill_to_cache(const spillover_manifest& spm) {
-        auto path = spm.get_manifest_path();
+        auto path = spm.get_manifest_path(path_provider);
         auto stream = spm.serialize().get();
         auto reservation = cache.local().reserve_space(123, 1).get();
         cache.local()
@@ -162,7 +163,7 @@ public:
         in_stream.close().get();
         out_stream.close().get();
         ss::sstring body = linearize_iobuf(std::move(tmp_buf));
-        auto path = pm.get_manifest_path();
+        auto path = pm.get_manifest_path(path_provider);
         _expectations.push_back({
           .url = path().string(),
           .body = body,
@@ -208,7 +209,7 @@ public:
         stm_manifest.spillover(spm.make_manifest_metadata());
 
         // update cache
-        auto path = spm.get_manifest_path();
+        auto path = spm.get_manifest_path(path_provider);
         if (hydrate) {
             auto stream = spm.serialize().get();
             auto reservation = cache.local().reserve_space(123, 1).get();
@@ -455,8 +456,19 @@ FIXTURE_TEST(test_async_manifest_view_truncate, async_manifest_view_fixture) {
 
     model::offset so = model::offset{0};
     auto maybe_cursor = view.get_cursor(so).get();
+    BOOST_REQUIRE(
+      maybe_cursor.has_error()
+      && maybe_cursor.error() == cloud_storage::error_outcome::out_of_range);
+
     // The clean offset should still be accesible such that retention
     // can operate above it.
+    maybe_cursor = view
+                     .get_cursor(
+                       so,
+                       std::nullopt,
+                       cloud_storage::async_manifest_view::cursor_base_t::
+                         archive_clean_offset)
+                     .get();
     BOOST_REQUIRE(!maybe_cursor.has_failure());
 
     maybe_cursor = view.get_cursor(new_so).get();
@@ -704,16 +716,15 @@ FIXTURE_TEST(test_async_manifest_view_retention, async_manifest_view_fixture) {
     }
 
     // Check the case when retention overshoots
-    // auto rr1 = view.compute_retention(total_size * 2,
-    // std::nullopt).get(); BOOST_REQUIRE(rr1.has_value());
-    // BOOST_REQUIRE_EQUAL(rr1.value().offset, model::offset{});
-    // BOOST_REQUIRE_EQUAL(rr1.value().delta, model::offset_delta{});
+    auto rr1 = view.compute_retention(total_size * 2, std::nullopt).get();
+    BOOST_REQUIRE(rr1.has_value());
+    BOOST_REQUIRE_EQUAL(rr1.value().offset, model::offset{});
+    BOOST_REQUIRE_EQUAL(rr1.value().delta, model::offset_delta{});
 
     auto rr2 = view.compute_retention(std::nullopt, storage_duration * 2).get();
     BOOST_REQUIRE(rr2.has_value());
     BOOST_REQUIRE_EQUAL(rr2.value().offset, model::offset{});
     BOOST_REQUIRE_EQUAL(rr2.value().delta, model::offset_delta{});
-    return;
 
     auto rr3
       = view.compute_retention(total_size * 2, storage_duration * 2).get();
@@ -794,10 +805,78 @@ FIXTURE_TEST(test_async_manifest_view_retention, async_manifest_view_fixture) {
       prefix_delta);
 
     auto rr6 = view.compute_retention(total_size, storage_duration).get();
-
     BOOST_REQUIRE(rr6.has_value());
     BOOST_REQUIRE_EQUAL(rr6.value().offset, prefix_base_offset);
     BOOST_REQUIRE_EQUAL(rr6.value().delta, prefix_delta);
+
+    // Check that an offset pinned above the normal retention point will not
+    // change the retention point.
+    auto prefix_kafka_offset = prefix_base_offset - prefix_delta;
+    auto rr7 = view
+                 .compute_retention(
+                   total_size,
+                   storage_duration,
+                   prefix_kafka_offset + kafka::offset{100000})
+                 .get();
+    BOOST_REQUIRE(rr7.has_value());
+    BOOST_CHECK_EQUAL(rr7.value().offset, prefix_base_offset);
+    BOOST_CHECK_EQUAL(rr7.value().delta, prefix_delta);
+
+    // Check that an offset pinned below the normal retention point will cause
+    // retention to return a lower value.
+    auto rr8 = view
+                 .compute_retention(
+                   total_size,
+                   storage_duration,
+                   kafka::prev_offset(prefix_kafka_offset))
+                 .get();
+    BOOST_REQUIRE(rr8.has_value());
+    BOOST_CHECK_LT(rr8.value().offset, prefix_base_offset);
+    BOOST_CHECK_EQUAL(rr8.value().delta, prefix_delta);
+}
+
+FIXTURE_TEST(
+  test_async_manifest_view_retention_with_pin, async_manifest_view_fixture) {
+    std::vector<segment_meta> segments;
+    collect_segments_to(segments);
+    for (int i = 0; i < 10; i++) {
+        generate_manifest_section(100);
+    }
+    listen();
+
+    // Sanity check that aggressive size limits results in removing the entire
+    // spillover region.
+    auto res = view.compute_retention(0, storage_duration).get();
+    BOOST_REQUIRE(res.has_value());
+    auto& stm_manifest = view.stm_manifest();
+    BOOST_CHECK_EQUAL(res.value().offset, stm_manifest.get_start_offset());
+    BOOST_CHECK_EQUAL(
+      res.value().delta,
+      stm_manifest.first_addressable_segment()->delta_offset);
+
+    // Any pin within a given spillover manifest should pin the whole manifest.
+    auto first_manifest = view.stm_manifest().get_spillover_map().begin();
+    for (auto o :
+         {first_manifest->base_kafka_offset(),
+          first_manifest->last_kafka_offset()}) {
+        auto pinned_res = view.compute_retention(0, storage_duration, o).get();
+        BOOST_REQUIRE(pinned_res.has_value());
+        BOOST_CHECK_EQUAL(pinned_res.value().offset, model::offset{0});
+        BOOST_CHECK_EQUAL(pinned_res.value().delta, model::offset_delta{0});
+    }
+    // A pin past a manifest should allow the manifest to be removed.
+    auto second_manifest = std::next(
+      view.stm_manifest().get_spillover_map().begin());
+    for (auto o :
+         {second_manifest->base_kafka_offset(),
+          second_manifest->last_kafka_offset()}) {
+        auto pinned_res = view.compute_retention(0, storage_duration, o).get();
+        BOOST_REQUIRE(pinned_res.has_value());
+        BOOST_CHECK_EQUAL(
+          pinned_res.value().offset, second_manifest->base_offset);
+        BOOST_CHECK_EQUAL(
+          pinned_res.value().delta, second_manifest->delta_offset);
+    }
 }
 
 FIXTURE_TEST(test_async_manifest_view_after_gc, async_manifest_view_fixture) {
@@ -1106,7 +1185,8 @@ FIXTURE_TEST(test_async_manifest_view_timequery, async_manifest_view_fixture) {
 
     // Find exact matches for all segments
     for (const auto& meta : expected) {
-        auto target = meta.base_timestamp;
+        auto target = async_view_timestamp_query(
+          kafka::offset(0), meta.base_timestamp, kafka::offset::max());
         auto maybe_cursor = view.get_cursor(target).get();
         BOOST_REQUIRE(!maybe_cursor.has_failure());
         auto cursor = std::move(maybe_cursor.value());
@@ -1119,9 +1199,9 @@ FIXTURE_TEST(test_async_manifest_view_timequery, async_manifest_view_fixture) {
                 m.last_segment()->max_timestamp,
                 stm_manifest.begin()->base_timestamp,
                 stm_manifest.last_segment()->max_timestamp);
-              auto res = m.timequery(target);
+              auto res = m.timequery(target.ts);
               BOOST_REQUIRE(res.has_value());
-              BOOST_REQUIRE(res.value().base_timestamp == target);
+              BOOST_REQUIRE(res.value().base_timestamp == target.ts);
           })
           .get();
     }
@@ -1148,7 +1228,10 @@ FIXTURE_TEST(
     // that there is a gap between any two segments.
 
     for (const auto& meta : expected) {
-        auto target = model::timestamp(meta.base_timestamp.value() - 1);
+        auto target = async_view_timestamp_query(
+          kafka::offset(0),
+          model::timestamp(meta.base_timestamp() - 1),
+          kafka::offset::max());
         auto maybe_cursor = view.get_cursor(target).get();
         BOOST_REQUIRE(!maybe_cursor.has_failure());
         auto cursor = std::move(maybe_cursor.value());
@@ -1162,11 +1245,11 @@ FIXTURE_TEST(
                 m.last_segment()->max_timestamp,
                 stm_manifest.begin()->base_timestamp,
                 stm_manifest.last_segment()->max_timestamp);
-              auto res = m.timequery(target);
+              auto res = m.timequery(target.ts);
               BOOST_REQUIRE(res.has_value());
               BOOST_REQUIRE(
                 model::timestamp(res.value().base_timestamp.value() - 1)
-                == target);
+                == target.ts);
           })
           .get();
     }

@@ -17,6 +17,8 @@
 #include "raft/state_machine_base.h"
 #include "raft/types.h"
 #include "serde/envelope.h"
+#include "serde/rw/envelope.h"
+#include "serde/rw/map.h"
 #include "storage/snapshot.h"
 #include "utils/absl_sstring_hash.h"
 #include "utils/mutex.h"
@@ -32,6 +34,9 @@
 #include <utility>
 #include <vector>
 
+namespace cluster {
+struct topic_configuration;
+}
 namespace raft {
 
 template<typename T>
@@ -62,6 +67,15 @@ concept StateMachineIterateFunc = requires(
  */
 class state_machine_manager final {
 public:
+    /**
+     * A result returned after taking a snapshot it contains a serde serialized
+     * snapshot data and last offset included into the snapshot.
+     */
+    struct snapshot_result {
+        iobuf data;
+        model::offset last_included_offset;
+    };
+
     // wait until at least offset is applied to all the state machines
     ss::future<> wait(
       model::offset,
@@ -73,13 +87,26 @@ public:
      * state i.e last snapshot index is derived from last_applied_offset. In
      * Redpanda we use different approach. Data eviction policy forces us to
      * allow state machines to take snapshot at arbitrary offsets.
+     *
+     * IMPORTANT: This API is only supported if all state machines support
+     * taking snapshots at arbitrary offset.
      */
-    ss::future<iobuf> take_snapshot(model::offset);
+    ss::future<snapshot_result> take_snapshot(model::offset);
+
+    /**
+     * If any of the state machines in the manager doesn't support fast
+     * reconfigurations this is the only API that the user is allowed to call,
+     * the take snapshot with offset other than _last_applied_offset will fail.
+     */
+    ss::future<snapshot_result> take_snapshot();
 
     ss::future<> start();
     ss::future<> stop();
 
-    model::offset last_applied() const { return model::prev_offset(_next); }
+    snapshot_at_offset_supported supports_snapshot_at_offset() const {
+        return _supports_snapshot_at_offset;
+    }
+
     /**
      * Returns a pointer to specific type of state machine.
      *
@@ -115,6 +142,31 @@ private:
         ss::sstring name;
         stm_ptr stm;
     };
+    /**
+     * Initial recovery snapshot is used by the state machine manager to store
+     * the information about the State Machines initial recovery. This way a
+     * state machine manager can skip to the end the log for the state machines
+     * that require that.
+     */
+    struct initial_recovery_snapshot
+      : serde::checksum_envelope<
+          initial_recovery_snapshot,
+          serde::version<0>,
+          serde::compat_version<0>> {
+        friend bool operator==(
+          const initial_recovery_snapshot&, const initial_recovery_snapshot&)
+          = default;
+
+        auto serde_fields() { return std::tie(initial_recovery_next_offsets); }
+
+        // The initial recovery offset map contains the initial next offset for
+        // each state machine that has been added to the manager.
+        absl::flat_hash_map<ss::sstring, model::offset>
+          initial_recovery_next_offsets;
+    };
+
+    friend std::ostream&
+    operator<<(std::ostream&, const initial_recovery_snapshot&);
 
     state_machine_manager(
       consensus* raft,
@@ -152,11 +204,30 @@ private:
 
     ss::future<> apply_raft_snapshot();
     ss::future<> do_apply_raft_snapshot(
-      raft::snapshot_metadata metadata, storage::snapshot_reader& reader);
+      std::vector<entry_ptr> state_machines,
+      raft::snapshot_metadata metadata,
+      storage::snapshot_reader& reader,
+      std::vector<ssx::semaphore_units> background_apply_units);
     ss::future<> apply();
+    ss::future<> try_apply_in_foreground();
 
     ss::future<std::vector<ssx::semaphore_units>>
     acquire_background_apply_mutexes();
+
+    std::vector<entry_ptr> all_state_machines() const;
+    model::offset max_next_offset() const;
+    model::offset last_applied() const { return model::prev_offset(_next); }
+
+    ss::future<> apply_initial_recovery_policy();
+
+    /**
+     * Methods to access/write the local state machine manager snapshot. The
+     * snapshot is currently used to maintain the state of initial recovery for
+     * state machines.
+     */
+    ss::future<std::optional<initial_recovery_snapshot>>
+    read_initial_recovery_snapshot();
+    ss::future<> write_initial_recovery_snapshot(initial_recovery_snapshot);
     /**
      * Simple data structure allowing manager to store independent snapshot
      * for each of the STMs
@@ -187,6 +258,8 @@ private:
     ss::gate _gate;
     ss::abort_source _as;
     ss::scheduling_group _apply_sg;
+    snapshot_at_offset_supported _supports_snapshot_at_offset{true};
+    storage::simple_snapshot_manager _initial_recovery_snapshot_mgr;
 };
 
 /**

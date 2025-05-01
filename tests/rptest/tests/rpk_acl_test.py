@@ -71,8 +71,7 @@ class RpkACLTest(RedpandaTest):
                 FailureSpec(FailureSpec.FAILURE_ISOLATE,
                             self.redpanda.controller()))
 
-            # Timeout must be larger then hardcoded timeout of 5s within redpanda
-            _ = superclient.acl_list(request_timeout_overhead=30)
+            _ = superclient.acl_list()
 
             # Of the other remaining nodes, none can be declared a leader before
             # the election timeout occurs; also the "current" leader is technically
@@ -123,7 +122,8 @@ class RpkACLTest(RedpandaTest):
         # We check that we can list the topics:
         assert topic in topic_list
 
-        out = self._rpk.sasl_update_user(self.username, new_password)
+        out = self._rpk.sasl_update_user(self.username, new_password,
+                                         self.mechanism)
         assert f'Updated user "{self.username}" successfully' in out
 
         with expect_exception(

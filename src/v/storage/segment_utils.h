@@ -16,6 +16,7 @@
 #include "storage/compacted_index_reader.h"
 #include "storage/compacted_index_writer.h"
 #include "storage/compacted_offset_list.h"
+#include "storage/logger.h"
 #include "storage/probe.h"
 #include "storage/readers_cache.h"
 #include "storage/segment.h"
@@ -25,17 +26,34 @@
 #include <seastar/core/circular_buffer.hh>
 #include <seastar/core/rwlock.hh>
 #include <seastar/core/shared_ptr.hh>
+#include <seastar/util/noncopyable_function.hh>
 
 #include <roaring/roaring.hh>
 
 namespace storage::internal {
+
+// Rebuilds the compaction index for a segment, if it is needed.
+// Requires a rwlock::holder to be passed in, which is likely to be the
+// segment's read_lock(). The lock owned by the holder will be held after this
+// function call completes, allowing the caller to proceed to self compaction or
+// other destructive operations.
+//
+// Returns the recovery_state, indicating status of the compaction index and
+// whether self-compaction should be executed or not.
+ss::future<compacted_index::recovery_state> maybe_rebuild_compaction_index(
+  ss::lw_shared_ptr<segment> s,
+  ss::lw_shared_ptr<storage::stm_manager> stm_manager,
+  const compaction_config& cfg,
+  ss::rwlock::holder& read_holder,
+  storage_resources& resources,
+  storage::probe& pb);
 
 /// \brief, this method will acquire it's own locks on the segment
 ///
 ss::future<compaction_result> self_compact_segment(
   ss::lw_shared_ptr<storage::segment>,
   ss::lw_shared_ptr<storage::stm_manager>,
-  storage::compaction_config,
+  const storage::compaction_config&,
   storage::probe&,
   storage::readers_cache&,
   storage::storage_resources&,
@@ -116,12 +134,6 @@ ss::future<ss::file> make_handle(
   ss::file_open_options opt,
   std::optional<ntp_sanitizer_config> ntp_sanitizer_config);
 
-ss::future<compacted_index_writer> make_compacted_index_writer(
-  const std::filesystem::path& path,
-  ss::io_priority_class iopc,
-  storage_resources& resources,
-  std::optional<ntp_sanitizer_config> ntp_sanitizer_config);
-
 ss::future<segment_appender_ptr> make_segment_appender(
   const segment_full_path& path,
   size_t number_of_chunks,
@@ -175,7 +187,8 @@ model::record_batch_reader create_segment_full_reader(
   ss::lw_shared_ptr<storage::segment>,
   storage::compaction_config,
   storage::probe&,
-  ss::rwlock::holder);
+  ss::rwlock::holder,
+  std::optional<model::offset> start_offset = std::nullopt);
 
 ss::future<storage::index_state> do_copy_segment_data(
   ss::lw_shared_ptr<storage::segment>,
@@ -209,11 +222,22 @@ struct clean_segment_value
       serde::version<0>,
       serde::compat_version<0>> {
     ss::sstring segment_name;
+    auto serde_fields() { return std::tie(segment_name); }
 };
+
+inline bool
+is_compactible_control_batch(const model::record_batch_type batch_type) {
+    // Control batches in consumer offsets are special compared to
+    // the ones in data partitions can be safely compacted away.
+    return batch_type == model::record_batch_type::group_fence_tx
+           || batch_type == model::record_batch_type::group_prepare_tx
+           || batch_type == model::record_batch_type::group_abort_tx
+           || batch_type == model::record_batch_type::group_commit_tx;
+}
 
 inline bool is_compactible(const model::record_batch_header& h) {
     if (
-      h.attrs.is_control()
+      (h.attrs.is_control() && !is_compactible_control_batch(h.type))
       || h.type == model::record_batch_type::compaction_placeholder) {
         // Keep control batches to ensure we maintain transaction boundaries.
         // They should be rare.
@@ -231,6 +255,37 @@ inline bool is_compactible(const model::record_batch& b) {
 offset_delta_time should_apply_delta_time_offset(
   ss::sharded<features::feature_table>& feature_table);
 
+// Checks if a segment is past the tombstone deletion horizon.
+//
+// Returns true iff the segment `s` has been marked as cleanly
+// compacted, the `compaction_config` has a value assigned for
+// `tombstone_retention_ms`, and the current timestamp is greater than
+// `clean_compact_timestamp + tombstone_retention_ms`. In all other cases,
+// the returned value is false, indicating that tombstone records in the segment
+// are not yet eligible for removal.
+bool is_past_tombstone_delete_horizon(
+  ss::lw_shared_ptr<segment> seg, const compaction_config& cfg);
+
+// Checks if a segment may have any tombstones currently eligible for deletion.
+//
+// Returns true if the segment is marked as potentially having tombstone
+// records, and if the result of evaluating
+// `is_past_tombstone_delete_horizon(seg, cfg)` is also true. This can return
+// false-positives, since segments that have not yet gone through the compaction
+// process are assumed to potentially contain tombstones until proven otherwise.
+bool may_have_removable_tombstones(
+  ss::lw_shared_ptr<segment> seg, const compaction_config& cfg);
+
+// Mark a segment as completed window compaction, and whether it is "clean" (in
+// which case the `clean_compact_timestamp` is set in the segment's index).
+// Also potentially issues a call to seg->index()->flush(), if the
+// `clean_compact_timestamp` was set in the index.
+//
+// Returns a boolean indicating if the segment was marked as cleanly compacted
+// for the first time and assigned a cleanly compacted timestamp.
+ss::future<bool> mark_segment_as_finished_window_compaction(
+  ss::lw_shared_ptr<segment> seg, bool set_clean_compact_timestamp, probe& pb);
+
 template<typename Func>
 auto with_segment_reader_handle(segment_reader_handle handle, Func func) {
     static_assert(
@@ -245,6 +300,53 @@ auto with_segment_reader_handle(segment_reader_handle handle, Func func) {
                 [] { return ss::make_ready_future<>(); });
           });
       });
+}
+
+template<typename Func>
+ss::future<bool> should_keep(
+  const model::record_batch& b,
+  const model::record& r,
+  bool is_last_record_in_batch,
+  Func&& is_latest_key,
+  probe& pb,
+  ss::sharded<features::feature_table>& feature_table,
+  model::offset segment_last_offset,
+  bool past_tombstone_delete_horizon,
+  bool& may_have_tombstone_records) {
+    auto compaction_placeholder_enabled = feature_table.local().is_active(
+      features::feature::compaction_placeholder_batch);
+    auto is_last_batch = b.last_offset() == segment_last_offset;
+    // once compaction placeholder feature is enabled, we are not
+    // worried about empty batches as the reducer then installs a
+    // placeholder batch if all the records are compacted away.
+    if (
+      !compaction_placeholder_enabled
+      && (is_last_batch && is_last_record_in_batch)) {
+        vlog(
+          gclog.trace,
+          "retaining last record: {} of segment from batch: {}",
+          r,
+          b.header());
+        if (r.is_tombstone()) {
+            may_have_tombstone_records = true;
+        }
+
+        co_return true;
+    }
+
+    // Deal with tombstone record removal
+    if (r.is_tombstone() && past_tombstone_delete_horizon) {
+        pb.add_removed_tombstone();
+        co_return false;
+    }
+
+    auto keep = co_await is_latest_key(b, r);
+
+    if (r.is_tombstone() && keep) {
+        may_have_tombstone_records = true;
+    }
+
+    co_return keep;
 }
 
 } // namespace storage::internal

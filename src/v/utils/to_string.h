@@ -17,6 +17,8 @@
 #include <seastar/core/lowres_clock.hh>
 #include <seastar/core/print.hh>
 
+#include <absl/container/flat_hash_map.h>
+#include <absl/container/node_hash_map.h>
 #include <fmt/core.h>
 
 #include <optional>
@@ -39,15 +41,6 @@ requires(sizeof...(T) > 0)
 std::ostream& operator<<(std::ostream& os, const std::variant<T...>& v) {
     std::visit([&os](auto& arg) { fmt::print(os, "{{{}}}", arg); }, v);
     return os;
-}
-
-inline std::ostream&
-operator<<(std::ostream& o, const ss::lowres_clock::duration& d) {
-    fmt::print(
-      o,
-      "{}",
-      std::chrono::duration_cast<std::chrono::milliseconds>(d).count());
-    return o;
 }
 
 } // namespace std
@@ -76,3 +69,35 @@ struct fmt::formatter<ss::chunked_fifo<T, chunk_size>> {
         return ctx.out();
     }
 };
+
+namespace absl {
+template<typename K, typename V>
+std::ostream& operator<<(std::ostream& o, const absl::flat_hash_map<K, V>& r) {
+    o << "{";
+    bool first = true;
+    for (const auto& [k, v] : r) {
+        if (!first) {
+            o << ", ";
+        }
+        o << "{" << k << " -> " << v << "}";
+        first = false;
+    }
+    o << "}";
+    return o;
+}
+
+template<typename K, typename V>
+std::ostream& operator<<(std::ostream& o, const absl::node_hash_map<K, V>& r) {
+    o << "{";
+    bool first = true;
+    for (const auto& [k, v] : r) {
+        if (!first) {
+            o << ", ";
+        }
+        o << "{" << k << " -> " << v << "}";
+        first = false;
+    }
+    o << "}";
+    return o;
+}
+} // namespace absl

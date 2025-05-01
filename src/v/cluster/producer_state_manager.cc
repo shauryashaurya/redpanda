@@ -15,19 +15,19 @@
 #include "cluster/producer_state.h"
 #include "cluster/types.h"
 #include "config/property.h"
-#include "prometheus/prometheus_sanitize.h"
+#include "metrics/prometheus_sanitize.h"
 
 #include <seastar/core/lowres_clock.hh>
 #include <seastar/core/metrics.hh>
 #include <seastar/util/defer.hh>
 
-namespace cluster {
+namespace cluster::tx {
 
 producer_state_manager::producer_state_manager(
   config::binding<uint64_t> max_producer_ids,
-  std::chrono::milliseconds producer_expiration_ms,
+  config::binding<std::chrono::milliseconds> producer_expiration_ms,
   config::binding<size_t> virtual_cluster_min_producer_ids)
-  : _producer_expiration_ms(producer_expiration_ms)
+  : _producer_expiration_ms(std::move(producer_expiration_ms))
   , _max_ids(std::move(max_producer_ids))
   , _virtual_cluster_min_producer_ids(
       std::move(virtual_cluster_min_producer_ids))
@@ -41,7 +41,7 @@ producer_state_manager::producer_state_manager(
 
 ss::future<> producer_state_manager::start() {
     _reaper.set_callback([this] { evict_excess_producers(); });
-    _reaper.arm(period);
+    _reaper.arm(_reaper_period);
     vlog(clusterlog.info, "Started producer state manager");
     return ss::now();
 }
@@ -67,6 +67,12 @@ void producer_state_manager::setup_metrics() {
          "evicted_producers",
          [this] { return _eviction_counter; },
          sm::description("Number of evicted producers so far."))});
+}
+
+void producer_state_manager::rearm_eviction_timer_for_testing(
+  std::chrono::milliseconds new_period) {
+    _reaper_period = new_period;
+    _reaper.rearm(ss::lowres_clock::now() + _reaper_period);
 }
 
 void producer_state_manager::register_producer(
@@ -95,9 +101,9 @@ void producer_state_manager::touch(
 }
 void producer_state_manager::evict_excess_producers() {
     _cache.evict_older_than<ss::lowres_system_clock>(
-      ss::lowres_system_clock::now() - _producer_expiration_ms);
+      ss::lowres_system_clock::now() - _producer_expiration_ms());
     if (!_gate.is_closed()) {
-        _reaper.arm(period);
+        _reaper.arm(_reaper_period);
     }
 }
 
@@ -113,6 +119,6 @@ producer_state_manager::post_eviction_hook::post_eviction_hook(
 void producer_state_manager::post_eviction_hook::operator()(
   producer_state& state) const noexcept {
     _state_manger._eviction_counter++;
-    return state._post_eviction_hook();
+    return state._post_eviction_hook(state.id());
 }
-}; // namespace cluster
+}; // namespace cluster::tx

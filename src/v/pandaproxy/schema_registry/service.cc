@@ -20,11 +20,10 @@
 #include "kafka/client/exceptions.h"
 #include "kafka/protocol/create_topics.h"
 #include "kafka/protocol/errors.h"
-#include "kafka/protocol/list_offsets.h"
-#include "kafka/server/handlers/topics/types.h"
+#include "kafka/protocol/list_offset.h"
+#include "kafka/protocol/topic_properties.h"
 #include "model/fundamental.h"
 #include "pandaproxy/api/api-doc/schema_registry.json.hh"
-#include "pandaproxy/auth_utils.h"
 #include "pandaproxy/logger.h"
 #include "pandaproxy/schema_registry/configuration.h"
 #include "pandaproxy/schema_registry/handlers.h"
@@ -43,7 +42,10 @@
 #include <seastar/coroutine/parallel_for_each.hh>
 #include <seastar/http/api_docs.hh>
 #include <seastar/http/exception.hh>
+#include <seastar/util/log.hh>
 #include <seastar/util/noncopyable_function.hh>
+
+#include <boost/algorithm/string/predicate.hpp>
 
 namespace pandaproxy::schema_registry {
 
@@ -55,35 +57,30 @@ const security::acl_principal principal{
 
 class wrap {
 public:
-    wrap(ss::gate& g, one_shot& os, server::function_handler h)
+    enum class auth_level {
+        // Unauthenticated endpoint (not a typo, 'public' is a keyword)
+        publik,
+        // Requires authentication (if enabled) but not superuser status
+        user,
+        // Requires authentication (if enabled) and superuser status
+        superuser
+    };
+
+    wrap(ss::gate& g, one_shot& os, auth_level lvl, server::function_handler h)
       : _g{g}
       , _os{os}
+      , _auth_level(lvl)
       , _h{std::move(h)} {}
 
     ss::future<server::reply_t>
     operator()(server::request_t rq, server::reply_t rp) const {
-        rq.authn_method = config::get_authn_method(
-          rq.service().config().schema_registry_api.value(),
-          rq.req->get_listener_idx());
-        try {
-            rq.user = maybe_authenticate_request(
-              rq.authn_method, rq.service().authenticator(), *rq.req);
-        } catch (unauthorized_user_exception& e) {
-            audit_authn_failure(rq, e.get_username(), e.what());
-            throw;
-        } catch (ss::httpd::base_exception& e) {
-            audit_authn_failure(rq, "", e.what());
-            throw;
-        }
-
-        audit_authn(rq);
+        handle_auth(rq);
 
         co_await _os();
         auto guard = _g.hold();
-        audit_authz(rq);
         try {
             co_return co_await _h(std::move(rq), std::move(rp));
-        } catch (kafka::client::partition_error const& ex) {
+        } catch (const kafka::client::partition_error& ex) {
             if (
               ex.error == kafka::error_code::unknown_topic_or_partition
               && ex.tp.topic == model::schema_registry_internal_tp.topic) {
@@ -96,6 +93,62 @@ public:
     }
 
 private:
+    // Authenticates and authorizes the request when HTTP Basic Auth is enabled
+    // and handles audit logging. It throws on failure.
+    void handle_auth(server::request_t& rq) const {
+        rq.authn_method = config::get_authn_method(
+          rq.service().config().schema_registry_api.value(),
+          rq.req->get_listener_idx());
+
+        if (rq.authn_method != config::rest_authn_method::none) {
+            // Will throw 400 & 401 if auth fails
+            auto auth_result = [this, &rq]() {
+                try {
+                    return rq.service().authenticator().authenticate(*rq.req);
+                } catch (const unauthorized_user_exception& e) {
+                    audit_authn_failure(rq, e.get_username(), e.what());
+                    throw;
+                } catch (const ss::httpd::base_exception& e) {
+                    audit_authn_failure(rq, "", e.what());
+                    throw;
+                }
+            }();
+
+            rq.user = credential_t{
+              auth_result.get_username(),
+              auth_result.get_password(),
+              auth_result.get_sasl_mechanism()};
+            audit_authn_success(rq);
+
+            // Will throw 403 if user enabled HTTP Basic Auth but
+            // did not give the authorization header.
+            [this, &rq, &auth_result]() {
+                try {
+                    switch (_auth_level) {
+                    case auth_level::superuser:
+                        auth_result.require_superuser();
+                        break;
+                    case auth_level::user:
+                        auth_result.require_authenticated();
+                        break;
+                    case auth_level::publik:
+                        auth_result.pass();
+                        break;
+                    }
+                } catch (const ss::httpd::base_exception& e) {
+                    audit_authz_failure(rq, auth_result, e.what());
+                    throw;
+                }
+            }();
+
+            audit_authz_success(rq);
+        } else {
+            rq.user = credential_t{};
+            audit_authn_success(rq);
+            audit_authz_success(rq);
+        }
+    }
+
     inline net::unresolved_address
     from_ss_sa(const ss::socket_address& sa) const {
         return {fmt::format("{}", sa.addr()), sa.port(), sa.addr().in_family()};
@@ -143,23 +196,54 @@ private:
           rq, make_authn_event_error(rq, username, std::move(reason)));
     }
 
-    void audit_authn(const server::request_t& rq) const {
+    void audit_authn_success(const server::request_t& rq) const {
         do_audit_authn(rq, make_authn_event_options(rq));
     }
 
-    void audit_authz(const server::request_t& rq) const { do_audit_authz(rq); }
+    void audit_authz_success(const server::request_t& rq) const {
+        do_audit_authz(rq);
+    }
+
+    void audit_authz_failure(
+      const server::request_t& rq,
+      const request_auth_result auth_result,
+      ss::sstring reason) const {
+        vlog(
+          srlog.trace,
+          "Attempting to audit authz for {}",
+          rq.req->format_url());
+        auto success = rq.service().audit_mgr().enqueue_api_activity_event(
+          security::audit::event_type::schema_registry,
+          *rq.req,
+          auth_result,
+          audit_svc_name,
+          false,
+          std::move(reason));
+
+        if (!success) {
+            vlog(
+              srlog.error,
+              "Failed to audit authorization request for endpoint: {}",
+              rq.req->format_url());
+            throw ss::httpd::base_exception(
+              "Failed to audit authorization request",
+              ss::http::reply::status_type::service_unavailable);
+        }
+    }
 
     void do_audit_authn(
       const server::request_t& rq,
       security::audit::authentication_event_options options) const {
         vlog(
-          plog.trace, "Attempting to audit authn for {}", rq.req->format_url());
+          srlog.trace,
+          "Attempting to audit authn for {}",
+          rq.req->format_url());
         auto success = rq.service().audit_mgr().enqueue_authn_event(
           std::move(options));
         if (!success) {
             vlog(
-              plog.error,
-              "Failed to audit authnetication request for endpoint: {}",
+              srlog.error,
+              "Failed to audit authentication request for endpoint: {}",
               rq.req->format_url());
             throw ss::httpd::base_exception(
               "Failed to audit authentication request",
@@ -169,7 +253,9 @@ private:
 
     void do_audit_authz(const server::request_t& rq) const {
         vlog(
-          plog.trace, "Attempting to audit authz for {}", rq.req->format_url());
+          srlog.trace,
+          "Attempting to audit authz for {}",
+          rq.req->format_url());
         auto success = rq.service().audit_mgr().enqueue_api_activity_event(
           security::audit::event_type::schema_registry,
           *rq.req,
@@ -178,7 +264,7 @@ private:
 
         if (!success) {
             vlog(
-              plog.error,
+              srlog.error,
               "Failed to audit authorization request for endpoint: {}",
               rq.req->format_url());
             throw ss::httpd::base_exception(
@@ -190,99 +276,128 @@ private:
 private:
     ss::gate& _g;
     one_shot& _os;
+    auth_level _auth_level;
     server::function_handler _h;
 };
 
 server::routes_t get_schema_registry_routes(ss::gate& gate, one_shot& es) {
+    using auth_level = wrap::auth_level;
     server::routes_t routes;
     routes.api = ss::httpd::schema_registry_json::name;
 
     routes.routes.emplace_back(server::route_t{
-      ss::httpd::schema_registry_json::get_config, wrap(gate, es, get_config)});
+      ss::httpd::schema_registry_json::get_config,
+      wrap(gate, es, auth_level::user, get_config)});
 
     routes.routes.emplace_back(server::route_t{
-      ss::httpd::schema_registry_json::put_config, wrap(gate, es, put_config)});
+      ss::httpd::schema_registry_json::put_config,
+      wrap(gate, es, auth_level::user, put_config)});
 
     routes.routes.emplace_back(server::route_t{
       ss::httpd::schema_registry_json::get_config_subject,
-      wrap(gate, es, get_config_subject)});
+      wrap(gate, es, auth_level::user, get_config_subject)});
 
     routes.routes.emplace_back(server::route_t{
       ss::httpd::schema_registry_json::put_config_subject,
-      wrap(gate, es, put_config_subject)});
+      wrap(gate, es, auth_level::user, put_config_subject)});
 
     routes.routes.emplace_back(server::route_t{
       ss::httpd::schema_registry_json::delete_config_subject,
-      wrap(gate, es, delete_config_subject)});
+      wrap(gate, es, auth_level::user, delete_config_subject)});
 
     routes.routes.emplace_back(server::route_t{
-      ss::httpd::schema_registry_json::get_mode, wrap(gate, es, get_mode)});
+      ss::httpd::schema_registry_json::get_mode,
+      wrap(gate, es, auth_level::user, get_mode)});
+
+    routes.routes.emplace_back(server::route_t{
+      ss::httpd::schema_registry_json::put_mode,
+      wrap(gate, es, auth_level::superuser, put_mode)});
+
+    routes.routes.emplace_back(server::route_t{
+      ss::httpd::schema_registry_json::get_mode_subject,
+      wrap(gate, es, auth_level::user, get_mode_subject)});
+
+    routes.routes.emplace_back(server::route_t{
+      ss::httpd::schema_registry_json::put_mode_subject,
+      wrap(gate, es, auth_level::superuser, put_mode_subject)});
+
+    routes.routes.emplace_back(server::route_t{
+      ss::httpd::schema_registry_json::delete_mode_subject,
+      wrap(gate, es, auth_level::superuser, delete_mode_subject)});
 
     routes.routes.emplace_back(server::route_t{
       ss::httpd::schema_registry_json::get_schemas_types,
-      wrap(gate, es, get_schemas_types)});
+      wrap(gate, es, auth_level::publik, get_schemas_types)});
 
     routes.routes.emplace_back(server::route_t{
       ss::httpd::schema_registry_json::get_schemas_ids_id,
-      wrap(gate, es, get_schemas_ids_id)});
+      wrap(gate, es, auth_level::user, get_schemas_ids_id)});
 
     routes.routes.emplace_back(server::route_t{
       ss::httpd::schema_registry_json::get_schemas_ids_id_versions,
-      wrap(gate, es, get_schemas_ids_id_versions)});
+      wrap(gate, es, auth_level::user, get_schemas_ids_id_versions)});
 
     routes.routes.emplace_back(server::route_t{
       ss::httpd::schema_registry_json::get_schemas_ids_id_subjects,
-      wrap(gate, es, get_schemas_ids_id_subjects)});
+      wrap(gate, es, auth_level::user, get_schemas_ids_id_subjects)});
 
     routes.routes.emplace_back(server::route_t{
       ss::httpd::schema_registry_json::get_subjects,
-      wrap(gate, es, get_subjects)});
+      wrap(gate, es, auth_level::user, get_subjects)});
 
     routes.routes.emplace_back(server::route_t{
       ss::httpd::schema_registry_json::get_subject_versions,
-      wrap(gate, es, get_subject_versions)});
+      wrap(gate, es, auth_level::user, get_subject_versions)});
 
     routes.routes.emplace_back(server::route_t{
       ss::httpd::schema_registry_json::post_subject,
-      wrap(gate, es, post_subject)});
+      wrap(gate, es, auth_level::user, post_subject)});
 
     routes.routes.emplace_back(server::route_t{
       ss::httpd::schema_registry_json::post_subject_versions,
-      wrap(gate, es, post_subject_versions)});
+      wrap(gate, es, auth_level::user, post_subject_versions)});
 
     routes.routes.emplace_back(server::route_t{
       ss::httpd::schema_registry_json::get_subject_versions_version,
-      wrap(gate, es, get_subject_versions_version)});
+      wrap(gate, es, auth_level::user, get_subject_versions_version)});
 
     routes.routes.emplace_back(server::route_t{
       ss::httpd::schema_registry_json::get_subject_versions_version_schema,
-      wrap(gate, es, get_subject_versions_version_schema)});
+      wrap(gate, es, auth_level::user, get_subject_versions_version_schema)});
 
     routes.routes.emplace_back(server::route_t{
       ss::httpd::schema_registry_json::
         get_subject_versions_version_referenced_by,
-      wrap(gate, es, get_subject_versions_version_referenced_by)});
+      wrap(
+        gate,
+        es,
+        auth_level::user,
+        get_subject_versions_version_referenced_by)});
 
     routes.routes.emplace_back(server::route_t{
       ss::httpd::schema_registry_json::
         get_subject_versions_version_referenced_by_deprecated,
-      wrap(gate, es, get_subject_versions_version_referenced_by)});
+      wrap(
+        gate,
+        es,
+        auth_level::user,
+        get_subject_versions_version_referenced_by)});
 
     routes.routes.emplace_back(server::route_t{
       ss::httpd::schema_registry_json::delete_subject,
-      wrap(gate, es, delete_subject)});
+      wrap(gate, es, auth_level::user, delete_subject)});
 
     routes.routes.emplace_back(server::route_t{
       ss::httpd::schema_registry_json::delete_subject_version,
-      wrap(gate, es, delete_subject_version)});
+      wrap(gate, es, auth_level::user, delete_subject_version)});
 
     routes.routes.emplace_back(server::route_t{
       ss::httpd::schema_registry_json::compatibility_subject_version,
-      wrap(gate, es, compatibility_subject_version)});
+      wrap(gate, es, auth_level::user, compatibility_subject_version)});
 
     routes.routes.emplace_back(server::route_t{
       ss::httpd::schema_registry_json::schema_registry_status_ready,
-      wrap(gate, es, status_ready)});
+      wrap(gate, es, auth_level::publik, status_ready)});
 
     return routes;
 }
@@ -294,17 +409,19 @@ ss::future<> service::do_start() {
     auto guard = _gate.hold();
     try {
         co_await create_internal_topic();
-        vlog(plog.info, "Schema registry successfully initialized");
+        vlog(srlog.info, "Schema registry successfully initialized");
     } catch (...) {
         vlog(
-          plog.error,
+          srlog.error,
           "Schema registry failed to initialize: {}",
           std::current_exception());
         throw;
     }
     co_await container().invoke_on_all(_ctx.smp_sg, [](service& s) {
         s._is_started = true;
-        return s.fetch_internal_topic();
+        return ss::this_shard_id() == seq_writer::reader_shard
+                 ? s.fetch_internal_topic()
+                 : ss::now();
     });
 }
 
@@ -328,13 +445,13 @@ ss::future<> create_acls(cluster::security_frontend& security_fe) {
 
     if (it != err_vec.end()) {
         vlog(
-          plog.warn,
+          srlog.warn,
           "Failed to create ACLs for {}, err {} - {}",
           principal,
           *it,
           cluster::make_error_code(*it).message());
     } else {
-        vlog(plog.debug, "Successfully created ACLs for {}", principal);
+        vlog(srlog.debug, "Successfully created ACLs for {}", principal);
     }
 }
 
@@ -346,7 +463,7 @@ ss::future<> service::configure() {
       principal);
     co_await kafka::client::set_client_credentials(*config, _client);
 
-    auto const& store = _controller->get_ephemeral_credential_store().local();
+    const auto& store = _controller->get_ephemeral_credential_store().local();
     bool has_ephemeral_credentials = store.has(store.find(principal));
     co_await container().invoke_on_all(
       _ctx.smp_sg, [has_ephemeral_credentials](service& s) {
@@ -359,10 +476,10 @@ ss::future<> service::mitigate_error(std::exception_ptr eptr) {
         // Return so that the client doesn't try to mitigate.
         return ss::now();
     }
-    vlog(plog.warn, "mitigate_error: {}", eptr);
+    vlog(srlog.warn, "mitigate_error: {}", eptr);
     return ss::make_exception_future<>(eptr)
       .handle_exception_type(
-        [this, eptr](kafka::client::broker_error const& ex) {
+        [this, eptr](const kafka::client::broker_error& ex) {
             if (
               ex.error == kafka::error_code::sasl_authentication_failed
               && _has_ephemeral_credentials) {
@@ -376,7 +493,7 @@ ss::future<> service::mitigate_error(std::exception_ptr eptr) {
             return ss::make_exception_future<>(eptr);
         })
       .handle_exception_type([this,
-                              eptr](kafka::client::topic_error const& ex) {
+                              eptr](const kafka::client::topic_error& ex) {
           if (
             ex.error == kafka::error_code::topic_authorization_failed
             && _has_ephemeral_credentials) {
@@ -388,7 +505,7 @@ ss::future<> service::mitigate_error(std::exception_ptr eptr) {
 }
 
 ss::future<> service::inform(model::node_id id) {
-    vlog(plog.trace, "inform: {}", id);
+    vlog(srlog.trace, "inform: {}", id);
 
     // Inform a particular node
     if (id != kafka::client::unknown_node_id) {
@@ -404,7 +521,7 @@ ss::future<> service::inform(model::node_id id) {
 ss::future<> service::do_inform(model::node_id id) {
     auto& fe = _controller->get_ephemeral_credential_frontend().local();
     auto ec = co_await fe.inform(id, principal);
-    vlog(plog.info, "Informed: broker: {}, ec: {}", id, ec);
+    vlog(srlog.info, "Informed: broker: {}, ec: {}", id, ec);
 }
 
 ss::future<> service::create_internal_topic() {
@@ -415,7 +532,7 @@ ss::future<> service::create_internal_topic() {
         _controller->internal_topic_replication());
 
     vlog(
-      plog.debug,
+      srlog.debug,
       "Schema registry: attempting to create internal topic (replication={})",
       replication_factor);
 
@@ -455,11 +572,11 @@ ss::future<> service::create_internal_topic() {
 
     const auto& topic = res.data.topics[0];
     if (topic.error_code == kafka::error_code::none) {
-        vlog(plog.debug, "Schema registry: created internal topic");
+        vlog(srlog.debug, "Schema registry: created internal topic");
     } else if (topic.error_code == kafka::error_code::topic_already_exists) {
-        vlog(plog.debug, "Schema registry: found internal topic");
+        vlog(srlog.debug, "Schema registry: found internal topic");
     } else if (topic.error_code == kafka::error_code::not_controller) {
-        vlog(plog.debug, "Schema registry: not controller");
+        vlog(srlog.debug, "Schema registry: not controller");
     } else {
         throw kafka::exception(
           topic.error_code,
@@ -471,7 +588,7 @@ ss::future<> service::create_internal_topic() {
 }
 
 ss::future<> service::fetch_internal_topic() {
-    vlog(plog.debug, "Schema registry: loading internal topic");
+    vlog(srlog.debug, "Schema registry: loading internal topic");
 
     // TODO: should check the replication_factor of the topic is
     // what our config calls for
@@ -479,7 +596,7 @@ ss::future<> service::fetch_internal_topic() {
     auto offset_res = co_await _client.local().list_offsets(
       model::schema_registry_internal_tp);
     auto max_offset = offset_res.data.topics[0].partitions[0].offset;
-    vlog(plog.debug, "Schema registry: _schemas max_offset: {}", max_offset);
+    vlog(srlog.debug, "Schema registry: _schemas max_offset: {}", max_offset);
 
     co_await kafka::client::make_client_fetch_batch_reader(
       _client.local(),
@@ -487,6 +604,11 @@ ss::future<> service::fetch_internal_topic() {
       model::offset{0},
       max_offset)
       .consume(consume_to_store{_store, writer()}, model::no_timeout);
+
+    // If a schema failed to be compiled, it will be marked. We attempt to
+    // reprocess them once now that the whole topic has been read,  in case they
+    // have a reference to a schema declared later in the topic.
+    co_await _store.process_marked_schemas();
 }
 
 service::service(
@@ -506,7 +628,7 @@ service::service(
       config::shard_local_cfg()
         .max_in_flight_schema_registry_requests_per_shard.bind())
   , _client(client)
-  , _ctx{{{}, _mem_sem, _inflight_sem, {}, smp_sg}, *this}
+  , _ctx{{{}, max_memory, _mem_sem, _inflight_config_binding(), _inflight_sem, {}, smp_sg}, *this}
   , _server(
       "schema_registry", // server_name
       "schema_registry", // public_metric_group_name
@@ -514,7 +636,9 @@ service::service(
       "schema_registry_header",
       "/schema_registry_definitions",
       _ctx,
-      json::serialization_format::schema_registry_v1_json)
+      json::serialization_format::schema_registry_v1_json,
+      srlog,
+      srreqs)
   , _store(store)
   , _writer(sequencer)
   , _controller(controller)
@@ -524,8 +648,11 @@ service::service(
       config::always_true(),
       config::shard_local_cfg().superusers.bind(),
       controller.get()} {
-    _inflight_config_binding.watch(
-      [this]() { _inflight_sem.set_capacity(_inflight_config_binding()); });
+    _inflight_config_binding.watch([this]() {
+        const size_t capacity = _inflight_config_binding();
+        _inflight_sem.set_capacity(capacity);
+        _ctx.max_inflight = capacity;
+    });
 }
 
 ss::future<> service::start() {

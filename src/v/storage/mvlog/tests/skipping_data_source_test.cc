@@ -8,15 +8,14 @@
 // by the Apache License, Version 2.0
 
 #include "base/units.h"
-#include "bytes/random.h"
-#include "io/page_cache.h"
-#include "io/pager.h"
-#include "io/persistence.h"
-#include "io/scheduler.h"
+#include "bytes/iostream.h"
 #include "random/generators.h"
+#include "storage/mvlog/file.h"
 #include "storage/mvlog/skipping_data_source.h"
+#include "test_utils/random_bytes.h"
 
 #include <seastar/core/seastar.hh>
+#include <seastar/util/short_streams.hh>
 
 #include <gtest/gtest.h>
 
@@ -26,19 +25,11 @@ using namespace experimental;
 class SkippingStreamTest : public ::testing::Test {
 public:
     void SetUp() override {
-        storage_ = std::make_unique<io::disk_persistence>();
-        storage_->create(file_.string()).get()->close().get();
         cleanup_files_.emplace_back(file_);
-
-        io::page_cache::config cache_config{
-          .cache_size = 2_MiB, .small_size = 1_MiB};
-        cache_ = std::make_unique<io::page_cache>(cache_config);
-        scheduler_ = std::make_unique<io::scheduler>(100);
-        pager_ = std::make_unique<io::pager>(
-          file_, 0, storage_.get(), cache_.get(), scheduler_.get());
+        paging_file_ = file_manager_.create_file(file_).get();
     }
     void TearDown() override {
-        pager_->close().get();
+        paging_file_->close().get();
         for (auto& file : cleanup_files_) {
             try {
                 ss::remove_file(file.string()).get();
@@ -48,19 +39,19 @@ public:
     }
 
     ss::future<> write_buf(iobuf buf) {
-        for (auto& io_frag : buf) {
-            co_await pager_->append(std::move(io_frag).release());
-        }
+        co_await paging_file_->append(std::move(buf));
     }
     ss::input_stream<char>
     make_skipping_stream(skipping_data_source::read_list_t read_list) {
         return ss::input_stream<char>(
           ss::data_source(std::make_unique<skipping_data_source>(
-            pager_.get(), std::move(read_list))));
+            paging_file_.get(), std::move(read_list))));
     }
 
     void check_equivalent(ss::input_stream<char> stream, iobuf expected_buf) {
         auto data = stream.read_exactly(expected_buf.size_bytes()).get();
+        auto no_more = stream.read_exactly(1).get();
+        EXPECT_TRUE(no_more.empty()) << "Stream isn't empty after reading";
 
         iobuf actual_stream_buf;
         actual_stream_buf.append(std::move(data));
@@ -73,15 +64,13 @@ public:
 
 protected:
     const std::filesystem::path file_{"skipping_file"};
-    std::unique_ptr<io::persistence> storage_;
-    std::unique_ptr<io::page_cache> cache_;
-    std::unique_ptr<io::scheduler> scheduler_;
-    std::unique_ptr<io::pager> pager_;
+    file_manager file_manager_;
+    std::unique_ptr<file> paging_file_;
     std::vector<std::filesystem::path> cleanup_files_;
 };
 
 TEST_F(SkippingStreamTest, TestEmptyReadList) {
-    auto buf = random_generators::make_iobuf();
+    auto buf = tests::random_iobuf();
     write_buf(std::move(buf)).get();
 
     // Empty read list.
@@ -91,7 +80,7 @@ TEST_F(SkippingStreamTest, TestEmptyReadList) {
 }
 
 TEST_F(SkippingStreamTest, TestEmptyInterval) {
-    auto buf = random_generators::make_iobuf();
+    auto buf = tests::random_iobuf();
     write_buf(std::move(buf)).get();
 
     // Bogus list.
@@ -103,20 +92,22 @@ TEST_F(SkippingStreamTest, TestEmptyInterval) {
 }
 
 TEST_F(SkippingStreamTest, TestOutOfBounds) {
-    auto buf = random_generators::make_iobuf();
+    auto buf = tests::random_iobuf();
     write_buf(buf.copy()).get();
 
     // Bogus list.
-    skipping_data_source::read_list_t reads;
-    reads.emplace_back(
-      skipping_data_source::read_interval{buf.size_bytes() + 1, 10});
-    auto stream = make_skipping_stream(std::move(reads));
-    auto data = stream.read().get();
-    ASSERT_TRUE(data.empty());
+    for (int i = 0; i < 5; i++) {
+        skipping_data_source::read_list_t reads;
+        reads.emplace_back(
+          skipping_data_source::read_interval{buf.size_bytes() + i, 10});
+        auto stream = make_skipping_stream(std::move(reads));
+        auto data = stream.read().get();
+        ASSERT_TRUE(data.empty());
+    }
 }
 
 TEST_F(SkippingStreamTest, TestFullInterval) {
-    auto buf = random_generators::make_iobuf();
+    auto buf = tests::random_iobuf();
     write_buf(buf.copy()).get();
 
     // Read exactly the right sized buffer.
@@ -129,21 +120,32 @@ TEST_F(SkippingStreamTest, TestFullInterval) {
 }
 
 TEST_F(SkippingStreamTest, TestOversizedInterval) {
-    auto buf = random_generators::make_iobuf();
+    const auto buf = tests::random_iobuf();
     write_buf(buf.copy()).get();
 
-    // Read just over the right sized buffer.
-    skipping_data_source::read_list_t reads;
-    reads.emplace_back(
-      skipping_data_source::read_interval{0, buf.size_bytes() + 10});
-    auto stream = make_skipping_stream(std::move(reads));
+    for (size_t i = 0; i < buf.size_bytes(); i++) {
+        // Make an expected buffer starting from offset i, reading to past the
+        // end of the buffer.
+        auto input_stream = make_iobuf_input_stream(buf.copy());
+        auto str = ss::util::read_entire_stream_contiguous(input_stream).get();
+        auto substr = str.substr(i);
+        iobuf subbuf;
+        subbuf.append(substr.data(), substr.size());
 
-    ASSERT_NO_FATAL_FAILURE(
-      check_equivalent(std::move(stream), std::move(buf)));
+        // Now create a skipping stream on the original buffer that definitely
+        // goes past the end.
+        skipping_data_source::read_list_t reads;
+        reads.emplace_back(
+          skipping_data_source::read_interval{i, buf.size_bytes() + 10});
+        auto stream = make_skipping_stream(std::move(reads));
+
+        ASSERT_NO_FATAL_FAILURE(
+          check_equivalent(std::move(stream), std::move(subbuf)));
+    }
 }
 
 TEST_F(SkippingStreamTest, TestSkipFront) {
-    auto buf = random_generators::make_iobuf();
+    auto buf = tests::random_iobuf();
     write_buf(buf.copy()).get();
 
     // Skip the beginning.
@@ -159,7 +161,7 @@ TEST_F(SkippingStreamTest, TestSkipFront) {
 }
 
 TEST_F(SkippingStreamTest, TestSkipBack) {
-    auto buf = random_generators::make_iobuf();
+    auto buf = tests::random_iobuf();
     write_buf(buf.copy()).get();
 
     // Skip the back.
@@ -175,7 +177,7 @@ TEST_F(SkippingStreamTest, TestSkipBack) {
 }
 
 TEST_F(SkippingStreamTest, TestUnorderedReads) {
-    auto buf = random_generators::make_iobuf();
+    auto buf = tests::random_iobuf();
     write_buf(buf.copy()).get();
 
     skipping_data_source::read_list_t reads;
@@ -208,7 +210,7 @@ TEST_F(SkippingStreamTest, TestRandomOrderedReads) {
     iobuf buf;
     for (int i = 0; i < random_generators::get_int(1, 100); i++) {
         const size_t size = random_generators::get_int(0, 10);
-        auto random_buf = random_generators::make_iobuf(size);
+        auto random_buf = tests::random_iobuf(size);
         bool should_read = random_generators::get_int(0, 1);
         if (should_read) {
             // Build the expected output with just the intervals that are read.

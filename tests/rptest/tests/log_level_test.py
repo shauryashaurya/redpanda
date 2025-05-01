@@ -7,11 +7,13 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0
 
+import time
 import ducktape.errors
 import requests.exceptions
 import urllib.parse
 import json
 
+from ducktape.mark import parametrize
 from ducktape.utils.util import wait_until
 from rptest.services.cluster import cluster
 from rptest.tests.redpanda_test import RedpandaTest
@@ -47,7 +49,7 @@ class LogLevelTest(RedpandaTest):
         # Any logger we get we should be able to set.
         for logger in loggers:
             # Skip to avoid bad log lines.
-            if logger == "assert":
+            if logger in ["assert", "assert-unreachable"]:
                 continue
 
             with self.redpanda.monitor_log(node) as mon:
@@ -100,6 +102,60 @@ class LogLevelTest(RedpandaTest):
                 timeout_sec=10,
                 backoff_sec=1,
                 err_msg="Never saw message")
+
+    @cluster(num_nodes=1)
+    @parametrize(loggers=("admin_api_server", "raft"))
+    @parametrize(loggers=("raft", "admin_api_server"))
+    def test_log_level_multiple_expiry(self, loggers=tuple[str, str]):
+        """
+        Check that more than one logger can be in a modified level and be expired correctly
+        see https://redpandadata.atlassian.net/browse/CORE-96
+        """
+        admin = Admin(self.redpanda)
+        node = self.redpanda.nodes[0]
+
+        first_logger, second_logger = loggers
+        # set two loggers to trace, expect that both of them expires in a timely fashion
+        with self.redpanda.monitor_log(node) as mon:
+            admin.set_log_level(first_logger, "trace", expires=10)
+            time.sleep(1)
+            admin.set_log_level(second_logger, "trace", expires=10)
+            mon.wait_until(f"Expiring log level for {{{first_logger}}}",
+                           timeout_sec=15,
+                           backoff_sec=1,
+                           err_msg=f"Never saw Expiring for {first_logger}")
+            mon.wait_until(f"Expiring log level for {{{second_logger}}}",
+                           timeout_sec=15,
+                           backoff_sec=1,
+                           err_msg=f"Never saw Expiring for {second_logger}")
+
+    @cluster(num_nodes=1)
+    def test_log_level_persist_a_never_expire_request(self):
+        """
+        check that this sequence of actions
+        set log-level admin_api_server trace 10
+        set log-level admin_api_server error 0
+
+        never resets the logger to the info level
+        """
+        admin = Admin(self.redpanda)
+        node = self.redpanda.nodes[0]
+
+        with self.redpanda.monitor_log(node) as mon:
+            admin.set_log_level("admin_api_server", "trace", expires=10)
+            time.sleep(1)
+            admin.set_log_level("admin_api_server", "error", expires=0)
+
+            try:
+                mon.wait_until("Expiring log level for {admin_api_server}",
+                               timeout_sec=15,
+                               backoff_sec=1)
+                assert False, "Should not have seen message"
+            except ducktape.errors.TimeoutError:
+                pass
+
+        level = admin.get_log_level("admin_api_server")[0]["level"]
+        assert level == "error", f"expected level=error, got {level=}"
 
     @cluster(num_nodes=3)
     def test_max_expiry(self):
@@ -207,7 +263,7 @@ class LogLevelTest(RedpandaTest):
         logger = 'test\nlog'
 
         def check_log_for_invalid_parameter(val: str):
-            pattern = f'Parameter contained invalid control characters: {val}'
+            pattern = f'Parameter \'name\' contained invalid control characters'
             wait_until(lambda: self.redpanda.search_log_any(pattern),
                        timeout_sec=5)
 

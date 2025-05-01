@@ -31,14 +31,14 @@
                 "type": "string"
               },
               "version": {
-                  "type": "integer"
+                "type": "integer"
               }
             }
           }
         }
       }
     },
-    "subject_schema": {
+    "stored_schema": {
       "type": "object",
       "properties": {
         "subject": {
@@ -65,7 +65,7 @@
                 "type": "string"
               },
               "version": {
-                  "type": "integer"
+                "type": "integer"
               }
             }
           }
@@ -78,16 +78,42 @@
     "get_compatibility": {
       "type": "object",
       "properties": {
-          "compatibilityLevel": {
-            "type": "string"
-          }
+        "compatibilityLevel": {
+          "type": "string"
+        }
       }
     },
     "put_compatibility": {
       "type": "object",
       "properties": {
-          "compatibility": {
+        "compatibility": {
+          "type": "string"
+        }
+      }
+    },
+    "mode": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": [
+            "READWRITE",
+            "READONLY"
+          ]
+        }
+      }
+    },
+    "is_compatibile": {
+      "type": "object",
+      "properties": {
+        "is_compatible": {
+          "type": "boolean"
+        },
+        "messages": {
+          "type": "array",
+          "items": {
             "type": "string"
           }
+        },
       }
     }

@@ -12,6 +12,7 @@ from ducktape.utils.util import wait_until
 from rptest.services.cluster import cluster
 import ducktape.errors
 
+from rptest.services.producer_swarm import ProducerSwarm
 from rptest.tests.redpanda_test import RedpandaTest
 from rptest.clients.rpk import RpkTool, RpkException
 from rptest.services.rpk_consumer import RpkConsumer
@@ -240,3 +241,93 @@ class RpkToolTest(RedpandaTest):
 
         raise ducktape.errors.TimeoutError(
             f'Message in {topic} never appeared.')
+
+    @cluster(num_nodes=4)
+    def test_produce_and_consume_tombstones(self):
+        topic = 'rp_dt_test_produce_and_consume_tombstones'
+        self._rpk.create_topic(topic)
+
+        num_messages = 2
+
+        tombstone_key = 'ISTOMBSTONE'
+        tombstone_value = ''
+
+        # Producing a record with an empty value and -Z flag results in a tombstone.
+        self._rpk.produce(topic,
+                          tombstone_key,
+                          tombstone_value,
+                          tombstone=True)
+
+        not_tombstone_key = 'ISNOTTOMBSTONE'
+
+        # Producing a record with an empty value without the -Z flag results in an empty value.
+        self._rpk.produce(topic,
+                          not_tombstone_key,
+                          tombstone_value,
+                          tombstone=False)
+
+        c = RpkConsumer(self._ctx, self.redpanda, topic)
+        c.start()
+
+        def cond():
+            return len(c.messages) == num_messages
+
+        wait_until(cond,
+                   timeout_sec=30,
+                   backoff_sec=2,
+                   err_msg=f'Messages in {topic} never appeared.')
+
+        # Tombstone records do not have a value in the returned JSON
+        assert c.messages[0]['key'] == tombstone_key
+        assert 'value' not in c.messages[0]
+
+        # Records with an empty string have a value of `""` in the returned JSON
+        assert c.messages[1]['key'] == not_tombstone_key
+        assert c.messages[1]['value'] == ""
+
+    @cluster(num_nodes=4)
+    def test_analyze(self):
+        topic = "test_analyze_topic"
+        partitions = 25
+        runtime_s = 15
+        throughput_bytes_s = 25 * 1024  # 25 KiB/s
+        record_size = 1024  # 1 KiB
+
+        self._rpk.create_topic(topic, partitions=partitions, replicas=3)
+
+        producer = ProducerSwarm(
+            self._ctx,
+            self.redpanda,
+            topic=topic,
+            producers=1,
+            records_per_producer=(runtime_s * throughput_bytes_s) //
+            record_size,
+            properties={
+                "batch.size": record_size,
+            },
+            min_record_size=record_size,
+            max_record_size=record_size,
+            messages_per_second_per_producer=throughput_bytes_s // record_size,
+        )
+        producer.start()
+        producer.wait_for_all_started()
+
+        # Ensure there is enough data to analyze.
+        time.sleep(5)
+        res = {t.topic: t for t in self._rpk.analyze_topic(topic, "-5s:end")}
+        assert topic in res
+
+        def within(actual, expected, err) -> bool:
+            return (actual >= expected * (1 - err)) & (actual <= expected *
+                                                       (1 + err))
+
+        analyzed_topic = res[topic]
+        assert analyzed_topic.partitions == partitions
+        assert within(analyzed_topic.bytes_per_second, throughput_bytes_s,
+                      0.15)
+        assert within(analyzed_topic.batches_per_second,
+                      throughput_bytes_s / record_size, 0.15)
+        assert within(analyzed_topic.average_bytes_per_batch, record_size,
+                      0.15)
+
+        producer.wait()

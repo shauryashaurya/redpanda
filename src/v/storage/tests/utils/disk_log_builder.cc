@@ -73,15 +73,16 @@ ss::future<> disk_log_builder::add_random_batches(
   log_append_config config,
   should_flush_after flush,
   std::optional<model::timestamp> base_ts) {
-    auto batches = model::test::make_random_batches(
+    auto batches = co_await model::test::make_random_batches(
       offset, count, bool(comp), base_ts);
     advance_time(batches.back());
-    return write(std::move(batches), config, flush);
+    co_return co_await write(std::move(batches), config, flush);
 }
 
 ss::future<> disk_log_builder::add_random_batches(
   model::offset offset, log_append_config config, should_flush_after flush) {
-    return write(model::test::make_random_batches(offset), config, flush);
+    co_return co_await write(
+      co_await model::test::make_random_batches(offset), config, flush);
 }
 
 ss::future<> disk_log_builder::add_batch(
@@ -118,7 +119,8 @@ ss::future<> disk_log_builder::truncate(model::offset o) {
 
 ss::future<> disk_log_builder::gc(
   model::timestamp collection_upper_bound,
-  std::optional<size_t> max_partition_retention_size) {
+  std::optional<size_t> max_partition_retention_size,
+  std::optional<std::chrono::milliseconds> tombstone_retention_ms) {
     ss::abort_source as;
     auto eviction_future = get_log()->monitor_eviction(as);
 
@@ -127,6 +129,7 @@ ss::future<> disk_log_builder::gc(
         collection_upper_bound,
         max_partition_retention_size,
         model::offset::max(),
+        tombstone_retention_ms,
         ss::default_priority_class(),
         _abort_source))
       .get();
@@ -155,14 +158,25 @@ disk_log_builder::apply_retention(gc_config cfg) {
     return get_disk_log_impl().do_gc(cfg);
 }
 
-ss::future<> disk_log_builder::apply_compaction(
+ss::future<> disk_log_builder::apply_adjacent_merge_compaction(
   compaction_config cfg, std::optional<model::offset> new_start_offset) {
     return get_disk_log_impl().adjacent_merge_compact(cfg, new_start_offset);
+}
+
+ss::future<bool> disk_log_builder::apply_sliding_window_compaction(
+  compaction_config cfg, std::optional<model::offset> new_start_offset) {
+    return get_disk_log_impl().sliding_window_compact(cfg, new_start_offset);
 }
 
 ss::future<bool>
 disk_log_builder::update_start_offset(model::offset start_offset) {
     return get_disk_log_impl().update_start_offset(start_offset);
+}
+void disk_log_builder::add_dirty_segment_bytes(ssize_t bytes) {
+    get_disk_log_impl().add_dirty_segment_bytes(bytes);
+}
+void disk_log_builder::add_closed_segment_bytes(ssize_t bytes) {
+    get_disk_log_impl().add_closed_segment_bytes(bytes);
 }
 
 ss::future<> disk_log_builder::stop() {

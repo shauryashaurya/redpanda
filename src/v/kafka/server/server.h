@@ -14,16 +14,19 @@
 #include "cluster/fwd.h"
 #include "config/configuration.h"
 #include "features/feature_table.h"
-#include "kafka/latency_probe.h"
 #include "kafka/protocol/types.h"
-#include "kafka/sasl_probe.h"
 #include "kafka/server/connection_context.h"
-#include "kafka/server/fetch_metadata_cache.hh"
+#include "kafka/server/fetch_metadata_cache.h"
+#include "kafka/server/fetch_pid_controller.h"
 #include "kafka/server/fetch_session_cache.h"
 #include "kafka/server/fwd.h"
 #include "kafka/server/handlers/fetch/replica_selector.h"
 #include "kafka/server/handlers/handler_probe.h"
+#include "kafka/server/kafka_probe.h"
 #include "kafka/server/queue_depth_monitor.h"
+#include "kafka/server/queue_depth_monitor_config.h"
+#include "kafka/server/read_distribution_probe.h"
+#include "kafka/server/sasl_probe.h"
 #include "metrics/metrics.h"
 #include "net/server.h"
 #include "pandaproxy/schema_registry/fwd.h"
@@ -32,13 +35,16 @@
 #include "security/gssapi_principal_mapper.h"
 #include "security/krb5_configurator.h"
 #include "security/mtls.h"
-#include "ssx/fwd.h"
 #include "utils/ema.h"
 
 #include <seastar/core/future.hh>
 #include <seastar/core/scheduling.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/smp.hh>
+
+namespace ssx {
+class singleton_thread_worker;
+}
 
 namespace kafka {
 
@@ -49,11 +55,15 @@ public:
     server(
       ss::sharded<net::server_configuration>*,
       ss::smp_service_group,
-      ss::scheduling_group,
+      ss::scheduling_group fetch_sg,
+      ss::scheduling_group produce_sg,
+      ss::scheduling_group handler_sg,
       ss::sharded<cluster::metadata_cache>&,
       ss::sharded<cluster::topics_frontend>&,
       ss::sharded<cluster::config_frontend>&,
       ss::sharded<features::feature_table>&,
+      ss::sharded<cluster::client_quota::frontend>&,
+      ss::sharded<cluster::client_quota::store>&,
       ss::sharded<quota_manager>&,
       ss::sharded<snc_quota_manager>&,
       ss::sharded<kafka::group_router>&,
@@ -68,7 +78,8 @@ public:
       ss::sharded<cluster::security_frontend>&,
       ss::sharded<cluster::controller_api>&,
       ss::sharded<cluster::tx_gateway_frontend>&,
-      std::optional<qdc_monitor::config>,
+      ss::sharded<datalake_throttle_manager>&,
+      std::optional<qdc_monitor_config>,
       ssx::singleton_thread_worker&,
       const std::unique_ptr<pandaproxy::schema_registry::api>&) noexcept;
 
@@ -93,6 +104,8 @@ public:
      * them with most other tasks in the default scheduling group.
      */
     ss::scheduling_group fetch_scheduling_group() const;
+
+    ss::scheduling_group produce_scheduling_group() const;
 
     cluster::topics_frontend& topics_frontend() {
         return _topics_frontend.local();
@@ -121,6 +134,10 @@ public:
     coordinator_ntp_mapper& coordinator_mapper();
 
     fetch_session_cache& fetch_sessions_cache() { return _fetch_session_cache; }
+    cluster::client_quota::frontend& quota_frontend() {
+        return _quota_frontend.local();
+    }
+    cluster::client_quota::store& quota_store() { return _quota_store.local(); }
     quota_manager& quota_mgr() { return _quota_mgr.local(); }
     usage_manager& usage_mgr() { return _usage_manager.local(); }
     snc_quota_manager& snc_quota_mgr() { return _snc_quota_mgr.local(); }
@@ -170,9 +187,11 @@ public:
         return _gssapi_principal_mapper;
     }
 
-    latency_probe& latency_probe() { return *_probe; }
+    kafka_probe& kafka_probe() { return *_probe; }
 
     sasl_probe& sasl_probe() { return *_sasl_probe; }
+
+    read_distribution_probe& read_probe() { return *_read_dist_probe; }
 
     ssx::singleton_thread_worker& thread_worker() { return _thread_worker; }
 
@@ -201,25 +220,51 @@ public:
         return _handler_probes.get_probe(key);
     }
 
+    fetch_pid_controller& pid_controller() noexcept {
+        return _fetch_pid_controller;
+    }
+
     ssx::semaphore& memory_fetch_sem() noexcept { return _memory_fetch_sem; }
 
     ss::future<> revoke_credentials(std::string_view name);
+
+    // Returns a default scheduling group that is intended to be used for
+    // processing incoming requests.
+    ss::scheduling_group get_request_handler_sg() const;
+
+    /**
+     * Returns a throttle for a producer that may be producing to datalake
+     * enabled topics.
+     */
+    ss::future<std::chrono::milliseconds>
+    get_datalake_producer_throttle(std::optional<std::string_view> client_id);
+    /**
+     * Marks producer as datalake producer. I.e. a producer that produced to the
+     * datalake enabled topics.
+     */
+    void
+    mark_datalake_producer(const std::optional<std::string_view>& client_id);
 
 private:
     void setup_metrics();
 
     ss::smp_service_group _smp_group;
     ss::scheduling_group _fetch_scheduling_group;
+    ss::scheduling_group _produce_scheduling_group;
+    ss::scheduling_group _request_handler_scheduling_group;
     ss::sharded<cluster::topics_frontend>& _topics_frontend;
     ss::sharded<cluster::config_frontend>& _config_frontend;
     ss::sharded<features::feature_table>& _feature_table;
     ss::sharded<cluster::metadata_cache>& _metadata_cache;
+    ss::sharded<cluster::client_quota::frontend>& _quota_frontend;
+    ss::sharded<cluster::client_quota::store>& _quota_store;
     ss::sharded<quota_manager>& _quota_mgr;
     ss::sharded<snc_quota_manager>& _snc_quota_mgr;
     ss::sharded<kafka::group_router>& _group_router;
     ss::sharded<kafka::usage_manager>& _usage_manager;
     ss::sharded<cluster::shard_table>& _shard_table;
     ss::sharded<cluster::partition_manager>& _partition_manager;
+    kafka::fetch_pid_controller _fetch_pid_controller;
     kafka::fetch_session_cache _fetch_session_cache;
     ss::sharded<cluster::id_allocator_frontend>& _id_allocator_frontend;
     bool _is_idempotence_enabled{false};
@@ -232,6 +277,7 @@ private:
     ss::sharded<cluster::security_frontend>& _security_frontend;
     ss::sharded<cluster::controller_api>& _controller_api;
     ss::sharded<cluster::tx_gateway_frontend>& _tx_gateway_frontend;
+    ss::sharded<kafka::datalake_throttle_manager>& _datalake_throttle_manager;
     std::optional<qdc_monitor> _qdc_mon;
     kafka::fetch_metadata_cache _fetch_metadata_cache;
     security::tls::principal_mapper _mtls_principal_mapper;
@@ -241,8 +287,9 @@ private:
 
     handler_probe_manager _handler_probes;
     metrics::internal_metric_groups _metrics;
-    std::unique_ptr<class latency_probe> _probe;
+    std::unique_ptr<class kafka_probe> _probe;
     std::unique_ptr<class sasl_probe> _sasl_probe;
+    std::unique_ptr<read_distribution_probe> _read_dist_probe;
     ssx::singleton_thread_worker& _thread_worker;
     std::unique_ptr<replica_selector> _replica_selector;
     const std::unique_ptr<pandaproxy::schema_registry::api>& _schema_registry;

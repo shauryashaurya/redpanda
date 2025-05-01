@@ -1,4 +1,6 @@
+from typing import Any, Literal, overload
 import requests
+from typing import Union
 
 
 class RpCloudApiClient(object):
@@ -8,7 +10,7 @@ class RpCloudApiClient(object):
         self._logger = log
         self.lasterror = None
 
-    def _handle_error(self, response, quite=False):
+    def _handle_error(self, response: requests.Response, quite=False):
         try:
             response.raise_for_status()
         except requests.HTTPError as e:
@@ -46,67 +48,96 @@ class RpCloudApiClient(object):
             self._token = j['access_token']
         return self._token
 
+    @overload
+    def _http_get(self,
+                  endpoint: str = ...,
+                  base_url=...,
+                  override_headers=...,
+                  *,
+                  text_response: Literal[True],
+                  quite: bool = ...,
+                  **kwargs) -> str:
+        ...
+
+    @overload
+    def _http_get(self,
+                  endpoint: str = ...,
+                  base_url=...,
+                  override_headers=...,
+                  text_response: Literal[False] = False,
+                  quite: bool = ...,
+                  **kwargs) -> Any:
+        ...
+
     def _http_get(self,
                   endpoint='',
                   base_url=None,
-                  override_headers=None,
+                  override_headers={},
                   text_response=False,
                   quite=False,
-                  **kwargs):
-        headers = override_headers
-        if headers is None:
-            token = self._get_token()
-            headers = {
-                'Authorization': f'Bearer {token}',
-                'Accept': 'application/json'
-            }
+                  **kwargs) -> Union[None, dict, str]:
+        token = self._get_token()
+        headers = override_headers or {
+            'Authorization': f'Bearer {token}',
+            'Accept': 'application/json'
+        }
         _base = base_url if base_url else self._config.api_url
         resp = requests.get(f'{_base}{endpoint}', headers=headers, **kwargs)
         _r = self._handle_error(resp, quite=quite)
         if text_response:
-            return _r if _r is None else _r.text
-        return _r if _r is None else _r.json()
+            return _r.text
+        else:
+            return _r.json()
 
-    def _http_post(self, base_url=None, endpoint='', **kwargs):
+    def _http_post(self,
+                   base_url=None,
+                   endpoint='',
+                   override_headers={},
+                   **kwargs):
         token = self._get_token()
         headers = {
             'Authorization': f'Bearer {token}',
             'Accept': 'application/json'
-        }
-        if base_url is None:
-            base_url = self._config.api_url
-        resp = requests.post(f'{base_url}{endpoint}',
-                             headers=headers,
-                             **kwargs)
+        } | override_headers
+        _base = base_url if base_url else self._config.api_url
+        resp = requests.post(f'{_base}{endpoint}', headers=headers, **kwargs)
         _r = self._handle_error(resp)
         return _r if _r is None else _r.json()
 
-    def _http_delete(self, endpoint='', **kwargs):
+    def _http_delete(self, base_url=None, endpoint='', **kwargs):
         token = self._get_token()
         headers = {
             'Authorization': f'Bearer {token}',
             'Accept': 'application/json'
         }
-        resp = requests.delete(f'{self._config.api_url}{endpoint}',
-                               headers=headers,
-                               **kwargs)
+        _base = base_url if base_url else self._config.api_url
+        resp = requests.delete(f'{_base}{endpoint}', headers=headers, **kwargs)
         _r = self._handle_error(resp)
         return _r if _r is None else _r.json()
 
     @staticmethod
     def namespace_endpoint(uuid=None):
-        _e = "/api/v1/namespaces"
+        _e = '/v1beta2/resource-groups'
         if uuid:
-            _e += f"/{uuid}"
+            _e += f'/{uuid}'
         return _e
 
     @staticmethod
     def cluster_endpoint(id=None):
+        _e = "/v1beta2/clusters"
+        if id:
+            _e += f"/{id}"
+        return _e
+
+    # delete for DEVPROD-2525
+    @staticmethod
+    def legacy_cluster_endpoint(id=None):
         _e = "/api/v1/clusters"
         if id:
             _e += f"/{id}"
         return _e
 
+    # try converting to /v1beta2/networks again for DEVPROD-2525
     @staticmethod
     def network_endpoint(id=None):
         _e = "/api/v1/networks"
@@ -116,6 +147,8 @@ class RpCloudApiClient(object):
 
     @staticmethod
     def network_peering_endpoint(id=None, peering_id=None):
+        # the network_peerings API has no public API replacement yet.
+        # revisit for DEVPROD-2525
         _e = "/api/v1/networks"
         if id:
             _e += f"/{id}/network-peerings"
@@ -129,9 +162,19 @@ class RpCloudApiClient(object):
             params['namespaceUuid'] = ns_uuid
         return params
 
+    def list_clusters(self, ns_uuid=None):
+        # get clusters for a namespace
+        _ret = self._http_get(self.cluster_endpoint(),
+                              base_url=self._config.public_api_url,
+                              params=self._prepare_params(ns_uuid))
+        # return it
+        return _ret['clusters']
+
     def list_namespaces(self, include_deleted=False):
         # Use local var to manupulate output
-        _ret = self._http_get(self.namespace_endpoint())
+        _ret = self._http_get(
+            self.namespace_endpoint(),
+            base_url=self._config.public_api_url)['resource_groups']
         # Filter out deleted ones
         if include_deleted:
             _namespaces = _ret
@@ -147,23 +190,29 @@ class RpCloudApiClient(object):
         # return it
         return _ret
 
-    def list_clusters(self, ns_uuid=None):
-        # get networks for a namespace
-        _ret = self._http_get(self.cluster_endpoint(),
-                              params=self._prepare_params(ns_uuid))
-        # return it
-        return _ret
-
+    # the network_peerings API has no public API replacement yet.
+    # revisit for DEVPROD-2525
     def list_network_peerings(self, network_id, ns_uuid=None):
         _ret = self._http_get(self.network_peering_endpoint(id=network_id),
                               params=self._prepare_params(ns_uuid=ns_uuid))
         return _ret
 
+    def get_cluster(self, cluster_id: str):
+        _cluster = self._http_get(self.cluster_endpoint(id=cluster_id),
+                                  base_url=self._config.public_api_url)
+        return _cluster['cluster']
+
+    # delete for DEVPROD-2525
+    def get_legacy_cluster(self, cluster_id: str):
+        _cluster = self._http_get(self.legacy_cluster_endpoint(id=cluster_id))
+        return _cluster
+
+    # not porting this endpoint until DEVPROD-2525
     def get_network(self, network_id):
         _network = self._http_get(self.network_endpoint(id=network_id))
         return _network
 
-    def get_resource(self, resource_handle):
+    def get_resource(self, resource_handle) -> Union[None, dict, str]:
         _r = None
         try:
             _r = self._http_get(endpoint=resource_handle)
@@ -174,7 +223,8 @@ class RpCloudApiClient(object):
         return _r
 
     def delete_namespace(self, uuid):
-        _r = self._http_delete(endpoint=self.namespace_endpoint(uuid=uuid))
+        _r = self._http_delete(endpoint=self.namespace_endpoint(uuid=uuid),
+                               base_url=self._config.public_api_url)
         # Check status
         return _r
 

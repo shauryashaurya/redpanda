@@ -9,6 +9,7 @@
 #define BOOST_TEST_MODULE kafka_security
 #include "random/generators.h"
 #include "security/scram_algorithm.h"
+#include "test_utils/random_bytes.h"
 #include "utils/base64.h"
 
 #include <seastar/testing/thread_test_case.hh>
@@ -65,8 +66,8 @@ BOOST_AUTO_TEST_CASE(client_first_message_valid) {
     // <kafka>Default format used by Kafka client: only user and nonce are
     // specified</kafka>
     {
-        client_first_message m(
-          bytes(ssx::sformat("n,,n=testuser,r={}", nonce).c_str()));
+        client_first_message m(bytes::from_string(
+          ssx::sformat("n,,n=testuser,r={}", nonce).c_str()));
         BOOST_REQUIRE_EQUAL(m.username(), "testuser");
         BOOST_REQUIRE_EQUAL(m.nonce(), nonce);
         BOOST_REQUIRE_EQUAL(m.authzid(), "");
@@ -74,8 +75,8 @@ BOOST_AUTO_TEST_CASE(client_first_message_valid) {
 
     // <kafka>Username containing comma, encoded as =2C</kafka>
     {
-        client_first_message m(
-          bytes(ssx::sformat("n,,n=test=2Cuser,r={}", nonce).c_str()));
+        client_first_message m(bytes::from_string(
+          ssx::sformat("n,,n=test=2Cuser,r={}", nonce).c_str()));
         BOOST_REQUIRE_EQUAL(m.username(), "test=2Cuser");
         BOOST_REQUIRE_EQUAL(m.nonce(), nonce);
         BOOST_REQUIRE_EQUAL(m.authzid(), "");
@@ -84,8 +85,8 @@ BOOST_AUTO_TEST_CASE(client_first_message_valid) {
 
     // <kafka>Username containing equals, encoded as =3D</kafka>
     {
-        client_first_message m(
-          bytes(ssx::sformat("n,,n=test=3Duser,r={}", nonce).c_str()));
+        client_first_message m(bytes::from_string(
+          ssx::sformat("n,,n=test=3Duser,r={}", nonce).c_str()));
         BOOST_REQUIRE_EQUAL(m.username(), "test=3Duser");
         BOOST_REQUIRE_EQUAL(m.nonce(), nonce);
         BOOST_REQUIRE_EQUAL(m.authzid(), "");
@@ -94,7 +95,7 @@ BOOST_AUTO_TEST_CASE(client_first_message_valid) {
 
     // <kafka>Optional authorization id specified</kafka>
     {
-        client_first_message m(bytes(
+        client_first_message m(bytes::from_string(
           ssx::sformat("n,a=testauthzid,n=testuser,r={}", nonce).c_str()));
         BOOST_REQUIRE_EQUAL(m.username(), "testuser");
         BOOST_REQUIRE_EQUAL(m.nonce(), nonce);
@@ -104,7 +105,7 @@ BOOST_AUTO_TEST_CASE(client_first_message_valid) {
 
     // <kafka>Optional reserved value specified</kafka>
     for (auto reserved : valid_reserved()) {
-        client_first_message m(bytes(
+        client_first_message m(bytes::from_string(
           ssx::sformat("n,,{},n=testuser,r={}", reserved, nonce).c_str()));
         BOOST_REQUIRE_EQUAL(m.username(), "testuser");
         BOOST_REQUIRE_EQUAL(m.nonce(), nonce);
@@ -114,7 +115,7 @@ BOOST_AUTO_TEST_CASE(client_first_message_valid) {
 
     // <kafka>Optional extension specified</kafka>
     for (auto extension : valid_extensions()) {
-        client_first_message m(bytes(
+        client_first_message m(bytes::from_string(
           ssx::sformat("n,,n=testuser,r={},{}", nonce, extension).c_str()));
         BOOST_REQUIRE_EQUAL(m.username(), "testuser");
         BOOST_REQUIRE_EQUAL(m.nonce(), nonce);
@@ -124,7 +125,7 @@ BOOST_AUTO_TEST_CASE(client_first_message_valid) {
 
     // <kafka>optional tokenauth specified as extensions</kafka>
     {
-        client_first_message m(bytes(
+        client_first_message m(bytes::from_string(
           ssx::sformat("n,,n=testuser,r={},tokenauth=true", nonce).c_str()));
         BOOST_REQUIRE_EQUAL(m.username(), "testuser");
         BOOST_REQUIRE_EQUAL(m.nonce(), nonce);
@@ -138,8 +139,8 @@ BOOST_AUTO_TEST_CASE(client_first_message_invalid) {
 
     // <kafka>Invalid entry in gs2-header</kafka>
     BOOST_REQUIRE_EXCEPTION(
-      client_first_message(
-        bytes(ssx::sformat("n,x=something,n=testuser,r={}", nonce).c_str())),
+      client_first_message(bytes::from_string(
+        ssx::sformat("n,x=something,n=testuser,r={}", nonce).c_str())),
       scram_exception,
       [](const scram_exception& e) {
           return std::string(e.what()).find(
@@ -150,7 +151,7 @@ BOOST_AUTO_TEST_CASE(client_first_message_invalid) {
     // <kafka>Invalid reserved entry</kafka>
     for (auto reserved : invalid_reserved()) {
         BOOST_REQUIRE_EXCEPTION(
-          client_first_message(bytes(
+          client_first_message(bytes::from_string(
             ssx::sformat("n,,{},n=testuser,r={}", reserved, nonce).c_str())),
           scram_exception,
           [](const scram_exception& e) {
@@ -163,7 +164,7 @@ BOOST_AUTO_TEST_CASE(client_first_message_invalid) {
     // <kafka>Invalid extension</kafka>
     for (auto extension : invalid_extensions()) {
         BOOST_REQUIRE_EXCEPTION(
-          client_first_message(bytes(
+          client_first_message(bytes::from_string(
             ssx::sformat("n,,n=testuser,r={},{}", nonce, extension).c_str())),
           scram_exception,
           [](const scram_exception& e) {
@@ -177,7 +178,7 @@ BOOST_AUTO_TEST_CASE(client_first_message_invalid) {
 BOOST_AUTO_TEST_CASE(server_first_message_ctor) {
     const auto client_nonce = make_nonce();
     const auto server_nonce = make_nonce();
-    auto salt = random_generators::get_bytes(30);
+    auto salt = tests::random_bytes(30);
     auto iterations = 33;
 
     server_first_message m(client_nonce, server_nonce, salt, iterations);
@@ -193,7 +194,7 @@ BOOST_AUTO_TEST_CASE(server_first_message_ctor) {
 
 BOOST_AUTO_TEST_CASE(client_final_message_valid) {
     auto random_base64_bytes = [] {
-        auto bytes = random_generators::get_bytes(30);
+        auto bytes = tests::random_bytes(30);
         return bytes_to_base64(bytes);
     };
 
@@ -204,9 +205,9 @@ BOOST_AUTO_TEST_CASE(client_final_message_valid) {
     // <kafka>Default format used by Kafka client: channel-binding, nonce and
     // proof are specified</kafka>
     {
-        client_final_message m(
-          bytes(ssx::sformat("c={},r={},p={}", channel_binding, nonce, proof)
-                  .c_str()));
+        client_final_message m(bytes::from_string(
+          ssx::sformat("c={},r={},p={}", channel_binding, nonce, proof)
+            .c_str()));
         BOOST_REQUIRE_EQUAL(
           base64_to_bytes(channel_binding), m.channel_binding());
         BOOST_REQUIRE_EQUAL(base64_to_bytes(proof), m.proof());
@@ -215,10 +216,10 @@ BOOST_AUTO_TEST_CASE(client_final_message_valid) {
 
     // <kafka>Optional extension specified</kafka>
     for (auto extension : valid_extensions()) {
-        client_final_message m(
-          bytes(ssx::sformat(
-                  "c={},r={},{},p={}", channel_binding, nonce, extension, proof)
-                  .c_str()));
+        client_final_message m(bytes::from_string(
+          ssx::sformat(
+            "c={},r={},{},p={}", channel_binding, nonce, extension, proof)
+            .c_str()));
         BOOST_REQUIRE_EQUAL(
           base64_to_bytes(channel_binding), m.channel_binding());
         BOOST_REQUIRE_EQUAL(base64_to_bytes(proof), m.proof());
@@ -228,7 +229,7 @@ BOOST_AUTO_TEST_CASE(client_final_message_valid) {
 
 BOOST_AUTO_TEST_CASE(client_final_message_invalid) {
     auto random_base64_bytes = [] {
-        auto bytes = random_generators::get_bytes(30);
+        auto bytes = tests::random_bytes(30);
         return bytes_to_base64(bytes);
     };
 
@@ -238,8 +239,8 @@ BOOST_AUTO_TEST_CASE(client_final_message_invalid) {
 
     // <kafka>Invalid channel binding</kafka>
     BOOST_REQUIRE_EXCEPTION(
-      client_final_message(
-        bytes(ssx::sformat("c=ab,r={},p={}", nonce, proof).c_str())),
+      client_final_message(bytes::from_string(
+        ssx::sformat("c=ab,r={},p={}", nonce, proof).c_str())),
       scram_exception,
       [](const scram_exception& e) {
           return std::string(e.what()).find(
@@ -249,8 +250,8 @@ BOOST_AUTO_TEST_CASE(client_final_message_invalid) {
 
     // <kafka>Invalid proof</kafka>
     BOOST_REQUIRE_EXCEPTION(
-      client_final_message(
-        bytes(ssx::sformat("c={},r={},p=123", channel_binding, nonce).c_str())),
+      client_final_message(bytes::from_string(
+        ssx::sformat("c={},r={},p=123", channel_binding, nonce).c_str())),
       scram_exception,
       [](const scram_exception& e) {
           return std::string(e.what()).find(
@@ -261,7 +262,7 @@ BOOST_AUTO_TEST_CASE(client_final_message_invalid) {
     // <kafka>Invalid extensions</kafka>
     for (auto extension : invalid_extensions()) {
         BOOST_REQUIRE_EXCEPTION(
-          client_final_message(bytes(
+          client_final_message(bytes::from_string(
             ssx::sformat(
               "c={},r={},{},p={}", channel_binding, nonce, extension, proof)
               .c_str())),
@@ -275,7 +276,7 @@ BOOST_AUTO_TEST_CASE(client_final_message_invalid) {
 }
 
 BOOST_AUTO_TEST_CASE(server_final_message_ctor) {
-    auto signature = random_generators::get_bytes(30);
+    auto signature = tests::random_bytes(30);
 
     {
         server_final_message m(std::nullopt, signature);

@@ -40,7 +40,7 @@ namespace cloud_storage {
 std::filesystem::path
 generate_index_path(const cloud_storage::remote_segment_path& p);
 
-static constexpr size_t remote_segment_sampling_step_bytes = 64_KiB;
+inline constexpr size_t remote_segment_sampling_step_bytes = 64_KiB;
 
 class remote_segment_exception : public std::runtime_error {
 public:
@@ -125,7 +125,7 @@ public:
     /// Hydrate a part of a segment, identified by the given range. The range
     /// can contain data for multiple contiguous chunks, in which case multiple
     /// files are written to cache.
-    ss::future<> hydrate_chunk(segment_chunk_range range);
+    ss::future<> hydrate_chunk(chunk_start_offset_t start_offset);
 
     /// Loads the segment chunk file from cache into an open file handle. If the
     /// file is not present in cache, the returned file handle is unopened.
@@ -177,6 +177,10 @@ public:
     // cache. if ret.second is false then the returned size is based on segment
     // granularity, otherwise the size is chunk granularity.
     std::pair<size_t, bool> min_cache_cost() const;
+
+    ss::future<ss::file> download_chunk(chunk_start_offset_t chunk_start);
+
+    size_t concurrency() { return _api.concurrency(); }
 
 private:
     /// get a file offset for the corresponding kafka offset
@@ -243,11 +247,21 @@ private:
     /// download chunks of the segment instead of the entire segment file.
     bool is_legacy_mode_engaged() const;
 
+    /// Switches to legacy mode while also aborting all pending chunk downloads.
+    /// The switch to legacy mode is performed when we cannot download the
+    /// segment index. Since segment index is required to download chunks,
+    /// aborting any pending downloads is necessary when switching to legacy
+    /// mode.
+    void switch_to_legacy_mode();
+
     /// Is the remote segment state materialized, IE do we need to hydrate or
     /// not. For segment format v0, v1 and v2, the data file handle should be
     /// opened. For newer formats, v3 or later, the index should be
     /// materialized.
     bool is_state_materialized() const;
+
+    ss::future<ss::file>
+    hydrate_and_materialize_chunk(chunk_start_offset_t start_offset);
 
     ss::gate _gate;
     remote& _api;
@@ -305,7 +319,29 @@ private:
     partition_probe& _probe;
     ts_read_path_probe& _ts_probe;
 
-    friend class split_segment_into_chunk_range_consumer;
+    /// Pending chunk download request. The start offset and prefetch are
+    /// supplied by the caller. The promise is created before adding a request
+    /// to the queue and the associated future is returned to the caller.
+    struct chunk_request {
+        chunk_start_offset_t start;
+        ss::promise<ss::file> promise;
+    };
+
+    /// Download all pending chunk requests, waiting until all chunks are
+    /// materialized. Collects requests where the chunk was downloaded but
+    /// failed to materialize (possibly due to cache eviction), and returns the
+    /// collected set of such failed requests. These should then be requeued by
+    /// the caller.
+    ss::future<fragmented_vector<chunk_request>> service_chunk_requests();
+
+    /// Waiters pending chunk downloads. Only the first hydration request for a
+    /// given chunk ends up here. All following requests for that chunk are
+    /// stored by the chunk API in its own wait list. This way only a single
+    /// file handle is created for a given chunk, and the chunk API distributes
+    /// shared ptrs to that handle to consumers.
+    fragmented_vector<chunk_request> _chunk_waiters;
+
+    friend class remote_segment_test_helper;
 };
 
 class remote_segment_batch_consumer;

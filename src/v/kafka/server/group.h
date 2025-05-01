@@ -13,16 +13,19 @@
 #include "base/seastarx.h"
 #include "cluster/fwd.h"
 #include "cluster/simple_batch_builder.h"
+#include "cluster/tx_protocol_types.h"
 #include "cluster/tx_utils.h"
-#include "cluster/types.h"
+#include "config/configuration.h"
+#include "config/property.h"
+#include "config/types.h"
+#include "container/chunked_hash_map.h"
 #include "container/fragmented_vector.h"
 #include "features/feature_table.h"
-#include "kafka/group_probe.h"
 #include "kafka/protocol/fwd.h"
 #include "kafka/protocol/offset_commit.h"
 #include "kafka/server/group_metadata.h"
+#include "kafka/server/group_probe.h"
 #include "kafka/server/member.h"
-#include "kafka/types.h"
 #include "model/fundamental.h"
 #include "model/record.h"
 #include "model/timestamp.h"
@@ -48,6 +51,9 @@ struct configuration;
 }
 
 namespace kafka {
+
+using assignments_type = std::unordered_map<member_id, bytes>;
+
 struct group_log_group_metadata;
 
 /**
@@ -101,14 +107,13 @@ enum class group_state {
     dead,
 };
 
-using enable_group_metrics = ss::bool_class<struct enable_gr_metrics_tag>;
-
 std::ostream& operator<<(std::ostream&, group_state gs);
 
 ss::sstring group_state_to_kafka_name(group_state);
-cluster::begin_group_tx_reply make_begin_tx_reply(cluster::tx_errc);
-cluster::commit_group_tx_reply make_commit_tx_reply(cluster::tx_errc);
-cluster::abort_group_tx_reply make_abort_tx_reply(cluster::tx_errc);
+std::optional<group_state> group_state_from_kafka_name(std::string_view);
+cluster::begin_group_tx_reply make_begin_tx_reply(cluster::tx::errc);
+cluster::commit_group_tx_reply make_commit_tx_reply(cluster::tx::errc);
+cluster::abort_group_tx_reply make_abort_tx_reply(cluster::tx::errc);
 kafka::error_code map_store_offset_error_code(std::error_code);
 
 /// \brief A Kafka group.
@@ -149,11 +154,58 @@ public:
     using offset_commit_stages = stages<offset_commit_response>;
     using join_group_stages = stages<join_group_response>;
     using sync_group_stages = stages<sync_group_response>;
-
-    struct tx_data {
-        model::tx_seq tx_seq;
-        model::partition_id tm_partition;
+    /**
+     * represents an offset that is to be stored as a part of transaction
+     */
+    struct pending_tx_offset {
+        group_tx::partition_offset offset_metadata;
+        model::offset log_offset;
     };
+    /**
+     * In memory representation of active transaction. The transaction is added
+     * when a state machine executes begin transaction request. The transaction
+     * is removed when the state machine executes commit or abort transaction
+     * request. The transaction holds all pending offset commits.
+     */
+    struct ongoing_transaction {
+        ongoing_transaction(
+          model::tx_seq,
+          model::partition_id,
+          model::timeout_clock::duration,
+          model::offset);
+
+        model::tx_seq tx_seq;
+        model::partition_id coordinator_partition;
+
+        model::timeout_clock::duration timeout;
+        model::timeout_clock::time_point last_update;
+
+        bool is_expiration_requested{false};
+        model::offset begin_offset{-1};
+
+        model::timeout_clock::time_point deadline() const {
+            return last_update + timeout;
+        }
+
+        bool is_expired() const {
+            return is_expiration_requested || deadline() <= clock_type::now();
+        }
+
+        void update_last_update_time() {
+            last_update = model::timeout_clock::now();
+        }
+
+        chunked_hash_map<model::topic_partition, pending_tx_offset> offsets;
+    };
+
+    struct tx_producer {
+        explicit tx_producer(model::producer_epoch);
+
+        model::producer_epoch epoch;
+        std::unique_ptr<ongoing_transaction> transaction;
+    };
+
+    using producers_map = chunked_hash_map<model::producer_id, tx_producer>;
 
     struct offset_metadata {
         model::offset log_offset;
@@ -176,22 +228,32 @@ public:
     struct offset_metadata_with_probe {
         offset_metadata metadata;
         group_offset_probe probe;
+        metrics_conversion_binding enable_group_metrics;
 
         offset_metadata_with_probe(
           offset_metadata _metadata,
           const kafka::group_id& group_id,
           const model::topic_partition& tp,
-          enable_group_metrics enable_metrics)
+          metrics_conversion_binding _enable_group_metrics)
           : metadata(std::move(_metadata))
-          , probe(metadata.offset) {
-            if (enable_metrics) {
-                probe.setup_metrics(group_id, tp);
-                probe.setup_public_metrics(group_id, tp);
-            }
+          , probe(metadata.offset)
+          , enable_group_metrics(std::move(_enable_group_metrics)) {
+            const auto metrics_registration = [this, group_id, tp]() {
+                if (enable_group_metrics().partition) {
+                    probe.register_metrics(group_id, tp);
+                    probe.register_public_metrics(group_id, tp);
+                } else {
+                    probe.deregister_metrics();
+                    probe.deregister_public_metrics();
+                }
+            };
+
+            enable_group_metrics.watch(metrics_registration);
+            metrics_registration();
         }
     };
 
-    struct prepared_tx {
+    struct ongoing_tx_offsets {
         model::producer_identity pid;
         model::tx_seq tx_seq;
         absl::node_hash_map<model::topic_partition, offset_metadata> offsets;
@@ -206,8 +268,7 @@ public:
       model::term_id,
       ss::sharded<cluster::tx_gateway_frontend>& tx_frontend,
       ss::sharded<features::feature_table>&,
-      group_metadata_serializer,
-      enable_group_metrics);
+      group_metadata_serializer);
 
     // constructor used when loading state from log
     group(
@@ -219,8 +280,7 @@ public:
       model::term_id,
       ss::sharded<cluster::tx_gateway_frontend>& tx_frontend,
       ss::sharded<features::feature_table>&,
-      group_metadata_serializer,
-      enable_group_metrics);
+      group_metadata_serializer);
 
     ~group() noexcept;
 
@@ -351,13 +411,24 @@ public:
      * \returns join response promise set at the end of the join phase.
      */
     ss::future<join_group_response> update_member(
-      member_ptr member, chunked_vector<member_protocol>&& new_protocols);
+      member_ptr member,
+      chunked_vector<member_protocol>&& new_protocols,
+      const std::optional<kafka::client_id>& new_client_id,
+      const kafka::client_host& new_client_host,
+      std::chrono::milliseconds new_session_timeout,
+      std::chrono::milliseconds new_rebalance_timeout);
+
     /**
      * Same as update_member but without returning the join promise. Used when
      * reverting member state after failed group checkpoint
      */
     void update_member_no_join(
-      member_ptr member, chunked_vector<member_protocol>&& new_protocols);
+      member_ptr member,
+      chunked_vector<member_protocol>&& new_protocols,
+      const std::optional<kafka::client_id>& new_client_id,
+      const kafka::client_host& new_client_host,
+      std::chrono::milliseconds new_session_timeout,
+      std::chrono::milliseconds new_rebalance_timeout);
 
     /**
      * \brief Get the timeout duration for rebalancing.
@@ -564,77 +635,35 @@ public:
     ss::future<offset_fetch_response>
     handle_offset_fetch(offset_fetch_request&& r);
 
-    void insert_offset(model::topic_partition tp, offset_metadata md) {
+    void insert_offset(const model::topic_partition& tp, offset_metadata md) {
         if (auto o_it = _offsets.find(tp); o_it != _offsets.end()) {
             o_it->second->metadata = std::move(md);
         } else {
             _offsets.emplace(
-              std::move(tp),
+              tp,
               std::make_unique<offset_metadata_with_probe>(
-                std::move(md), _id, tp, _enable_group_metrics));
+                std::move(md),
+                _id,
+                tp,
+                _conf.enable_consumer_group_metrics.bind(
+                  std::function{enabled_metrics::from_vector})));
         }
     }
 
-    bool try_upsert_offset(model::topic_partition tp, offset_metadata md) {
-        if (auto o_it = _offsets.find(tp); o_it != _offsets.end()) {
-            if (o_it->second->metadata.log_offset < md.log_offset) {
-                o_it->second->metadata = std::move(md);
-                return true;
-            }
-            return false;
-        } else {
-            _offsets.emplace(
-              std::move(tp),
-              std::make_unique<offset_metadata_with_probe>(
-                std::move(md), _id, tp, _enable_group_metrics));
-            return true;
-        }
-    }
+    bool
+    try_upsert_offset(const model::topic_partition& tp, offset_metadata md);
 
-    void insert_prepared(prepared_tx);
-
+    void
+    insert_ongoing_tx(model::producer_identity pid, ongoing_transaction tx);
     void try_set_fence(model::producer_id id, model::producer_epoch epoch) {
-        auto [fence_it, _] = _fence_pid_epoch.try_emplace(id, epoch);
-        if (fence_it->second <= epoch) {
-            fence_it->second = epoch;
+        auto [it, _] = _producers.try_emplace(id, epoch);
+        if (it->second.epoch < epoch) {
+            it->second.epoch = epoch;
+            it->second.transaction.reset();
         }
     }
 
-    void try_set_tx_data(
-      model::producer_identity id,
-      model::tx_seq txseq,
-      model::partition_id tm_partition) {
-        auto fence_it = _fence_pid_epoch.find(id.get_id());
-        if (fence_it == _fence_pid_epoch.end()) {
-            return;
-        }
-        if (fence_it->second != id.get_epoch()) {
-            return;
-        }
-        auto [ongoing_it, _] = _tx_data.try_emplace(
-          id.get_id(), tx_data{txseq, tm_partition});
-        if (ongoing_it->second.tx_seq <= txseq) {
-            ongoing_it->second.tx_seq = txseq;
-            ongoing_it->second.tm_partition = tm_partition;
-        }
-    }
-
-    void try_set_timeout(
-      model::producer_identity id,
-      model::timeout_clock::duration transaction_timeout_ms) {
-        auto fence_it = _fence_pid_epoch.find(id.get_id());
-        if (fence_it == _fence_pid_epoch.end()) {
-            return;
-        }
-        if (fence_it->second != id.get_epoch()) {
-            return;
-        }
-        auto [info_it, inserted] = _expiration_info.try_emplace(
-          id, expiration_info(transaction_timeout_ms));
-        if (inserted) {
-            try_arm(info_it->second.deadline());
-        }
-    }
+    const producers_map& producers() const { return _producers; }
 
     // helper for the kafka api: describe groups
     described_group describe() const;
@@ -659,6 +688,8 @@ public:
       const std::optional<group_instance_id>&,
       const ss::sstring&) const;
 
+    // Cancel metrics to prevent double_mtrics registration;
+    void pre_shutdown();
     // shutdown group. cancel all pending operations
     ss::future<> shutdown();
 
@@ -688,6 +719,8 @@ public:
      */
     std::vector<model::topic_partition>
     delete_offsets(std::vector<model::topic_partition> offsets);
+
+    void set_lag_metrics(consumer_lag_metrics lag_metrics);
 
 private:
     using member_map = absl::node_hash_map<kafka::member_id, member_ptr>;
@@ -814,10 +847,9 @@ private:
     error_code
     validate_expected_group(const txn_offset_commit_request& r) const;
 
-    cluster::abort_origin
-    get_abort_origin(const model::producer_identity&, model::tx_seq) const;
-
     bool has_offsets() const;
+
+    bool has_transactions_in_progress() const;
 
     bool has_pending_transaction(const model::topic_partition& tp) {
         if (std::any_of(
@@ -828,19 +860,9 @@ private:
         }
 
         if (std::any_of(
-              _volatile_txs.begin(),
-              _volatile_txs.end(),
-              [&tp](const auto& tp_info) {
-                  return tp_info.second.offsets.contains(tp);
-              })) {
-            return true;
-        }
-
-        if (std::any_of(
-              _prepared_txs.begin(),
-              _prepared_txs.end(),
-              [&tp](const auto& tp_info) {
-                  return tp_info.second.offsets.contains(tp);
+              _producers.begin(), _producers.end(), [&tp](const auto& p) {
+                  return p.second.transaction
+                         && p.second.transaction->offsets.contains(tp);
               })) {
             return true;
         }
@@ -863,8 +885,10 @@ private:
       model::producer_identity pid,
       model::tx_seq tx_seq);
 
-    ss::future<cluster::commit_group_tx_reply>
-    do_commit(kafka::group_id group_id, model::producer_identity pid);
+    ss::future<cluster::commit_group_tx_reply> do_commit(
+      kafka::group_id group_id,
+      model::producer_identity pid,
+      model::tx_seq sequence);
 
     void start_abort_timer() {
         _auto_abort_timer.set_callback([this] { abort_old_txes(); });
@@ -873,15 +897,10 @@ private:
 
     void abort_old_txes();
     ss::future<> do_abort_old_txes();
-    ss::future<> try_abort_old_tx(model::producer_identity);
-    ss::future<cluster::tx_errc> do_try_abort_old_tx(model::producer_identity);
+    ss::future<cluster::tx::errc> try_abort_old_tx(model::producer_identity);
+    ss::future<cluster::tx::errc> do_try_abort_old_tx(model::producer_identity);
     void try_arm(time_point_type);
     void maybe_rearm_timer();
-
-    bool is_transaction_partitioning() const {
-        return _feature_table.local().is_active(
-          features::feature::transaction_partitioning);
-    }
 
     void update_subscriptions();
     std::optional<absl::node_hash_set<model::topic>> _subscriptions;
@@ -894,13 +913,28 @@ private:
     std::vector<model::topic_partition>
     get_expired_offsets(std::chrono::seconds retention_period);
 
+    bool use_dedicated_batch_type_for_fence() const {
+        // Prior to this change group_tx_fence shared the fence record
+        // batch type with data partitions (tx_fence). This made compaction
+        // logic complicated particularly because different compaction rules
+        // applied for fence batch in groups and data paritions. With the new
+        // feature, group fence has a separate dedicated batch type so it is
+        // easy to diambiguate both fence types.
+        return _feature_table.local().is_active(
+          features::feature::group_tx_fence_dedicated_batch_type);
+    }
+
+    cluster::tx::errc map_tx_replication_error(std::error_code ec);
+
+    void setup_metrics();
+
     kafka::group_id _id;
     group_state _state;
     std::optional<model::timestamp> _state_timestamp;
     kafka::generation_id _generation;
     protocol_support _supported_protocols;
     member_map _members;
-    absl::node_hash_map<group_instance_id, member_id> _static_members;
+    chunked_hash_map<group_instance_id, member_id> _static_members;
     int _num_members_joining;
     absl::node_hash_map<kafka::member_id, ss::timer<clock_type>>
       _pending_members;
@@ -912,10 +946,11 @@ private:
     config::configuration& _conf;
     ss::lw_shared_ptr<ssx::rwlock> _catchup_lock;
     ss::lw_shared_ptr<cluster::partition> _partition;
-    absl::node_hash_map<
+    chunked_hash_map<
       model::topic_partition,
       std::unique_ptr<offset_metadata_with_probe>>
       _offsets;
+    consumer_lag_metrics _lag_metrics;
     group_probe<
       model::topic_partition,
       std::unique_ptr<offset_metadata_with_probe>>
@@ -933,50 +968,10 @@ private:
 
     absl::flat_hash_map<model::producer_id, ss::lw_shared_ptr<mutex>> _tx_locks;
     model::term_id _term;
-    absl::node_hash_map<model::producer_id, model::producer_epoch>
-      _fence_pid_epoch;
-    absl::node_hash_map<model::producer_id, tx_data> _tx_data;
-    absl::node_hash_map<model::topic_partition, offset_metadata>
+    producers_map _producers;
+    chunked_hash_map<model::topic_partition, offset_metadata>
       _pending_offset_commits;
-    enable_group_metrics _enable_group_metrics;
-    struct volatile_offset {
-        model::offset offset;
-        kafka::leader_epoch leader_epoch;
-        std::optional<ss::sstring> metadata;
-    };
-
-    struct volatile_tx {
-        model::tx_seq tx_seq;
-        absl::node_hash_map<model::topic_partition, volatile_offset> offsets;
-    };
-
-    absl::node_hash_map<model::producer_identity, volatile_tx> _volatile_txs;
-    absl::node_hash_map<model::producer_identity, prepared_tx> _prepared_txs;
-
-    struct expiration_info {
-        expiration_info(model::timeout_clock::duration timeout)
-          : timeout(timeout)
-          , last_update(model::timeout_clock::now()) {}
-
-        model::timeout_clock::duration timeout;
-        model::timeout_clock::time_point last_update;
-        bool is_expiration_requested{false};
-
-        model::timeout_clock::time_point deadline() const {
-            return last_update + timeout;
-        }
-
-        bool is_expired() const {
-            return is_expiration_requested || deadline() <= clock_type::now();
-        }
-
-        void update_last_update_time() {
-            last_update = model::timeout_clock::now();
-        }
-    };
-
-    absl::node_hash_map<model::producer_identity, expiration_info>
-      _expiration_info;
+    metrics_conversion_binding _enable_group_metrics;
 
     ss::gate _gate;
     ss::timer<clock_type> _auto_abort_timer;

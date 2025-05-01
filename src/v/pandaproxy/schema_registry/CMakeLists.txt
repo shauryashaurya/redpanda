@@ -5,14 +5,15 @@ seastar_generate_swagger(
   OUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/../api/api-doc/
 )
 
-find_package(Protobuf REQUIRED)
 find_package(Avro)
+find_package(jsoncons REQUIRED)
 
 v_cc_library(
   NAME pandaproxy_schema_registry
   SRCS
     api.cc
     configuration.cc
+    compatibility.cc
     handlers.cc
     error.cc
     service.cc
@@ -20,6 +21,7 @@ v_cc_library(
     sharded_store.cc
     types.cc
     avro.cc
+    json.cc
     protobuf.cc
     validation.cc
     ${schema_registry_file}
@@ -38,8 +40,8 @@ v_cc_library(
     Boost::iostreams
     protobuf::libprotobuf
     protobuf::libprotoc
+    jsoncons
   )
 
 add_subdirectory(test)
 add_subdirectory(requests)
-add_subdirectory(protobuf)

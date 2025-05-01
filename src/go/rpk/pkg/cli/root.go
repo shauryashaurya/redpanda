@@ -23,6 +23,7 @@ import (
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/acl"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/cloud"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/cluster"
+	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/connect"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/container"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/debug"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/generate"
@@ -34,6 +35,7 @@ import (
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/topic"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/transform"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/version"
+	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/version/versioncmd"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cobraext"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/config"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/plugin"
@@ -110,6 +112,7 @@ func Execute() {
 		cloud.NewCommand(fs, p, osExec),
 		cluster.NewCommand(fs, p),
 		container.NewCommand(fs, p),
+		connect.NewCommand(fs, p, osExec),
 		profile.NewCommand(fs, p),
 		debug.NewCommand(fs, p),
 		generate.NewCommand(fs, p),
@@ -119,7 +122,7 @@ func Execute() {
 		security.NewCommand(fs, p),
 		topic.NewCommand(fs, p),
 		transform.NewCommand(fs, p, osExec),
-		version.NewCommand(fs, p),
+		versioncmd.NewCommand(fs, p),
 
 		newStatusCommand(), // deprecated
 	)
@@ -162,6 +165,15 @@ func Execute() {
 				runXHelp()
 				cmd.Help()
 			}
+		}
+	})
+
+	// Cobra does not return an 'unknown command' error unless cobra.NoArgs is
+	// specified.
+	// See: https://github.com/spf13/cobra/issues/706
+	cobraext.Walk(root, func(c *cobra.Command) {
+		if c.Args == nil && c.HasSubCommands() {
+			c.Args = cobra.NoArgs
 		}
 	})
 

@@ -17,12 +17,11 @@ import (
 	"reflect"
 	"time"
 
-	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/publicapi"
+	controlplanev1 "buf.build/gen/go/redpandadata/cloud/protocolbuffers/go/redpanda/api/controlplane/v1"
+	rpkos "github.com/redpanda-data/redpanda/src/go/rpk/pkg/os"
 	"github.com/spf13/afero"
 	"go.uber.org/zap"
 	"gopkg.in/yaml.v3"
-
-	rpkos "github.com/redpanda-data/redpanda/src/go/rpk/pkg/os"
 )
 
 // DefaultRpkYamlPath returns the OS equivalent of ~/.config/rpk/rpk.yaml, if
@@ -39,7 +38,7 @@ func defaultVirtualRpkYaml() (RpkYaml, error) {
 	path, _ := DefaultRpkYamlPath() // if err is non-nil, we fail in Write
 	y := RpkYaml{
 		fileLocation: path,
-		Version:      4,
+		Version:      currentRpkYAMLVersion,
 		Profiles:     []RpkProfile{DefaultRpkProfile()},
 		CloudAuths:   []RpkCloudAuth{DefaultRpkCloudAuth()},
 	}
@@ -70,7 +69,7 @@ func DefaultRpkCloudAuth() RpkCloudAuth {
 
 func emptyVirtualRpkYaml() RpkYaml {
 	return RpkYaml{
-		Version: 4,
+		Version: currentRpkYAMLVersion,
 	}
 }
 
@@ -142,6 +141,11 @@ type (
 		KafkaAPI     RpkKafkaAPI          `json:"kafka_api" yaml:"kafka_api"`
 		AdminAPI     RpkAdminAPI          `json:"admin_api" yaml:"admin_api"`
 		SR           RpkSchemaRegistryAPI `json:"schema_registry" yaml:"schema_registry"`
+		LicenseCheck *LicenseStatusCache  `json:"license_check,omitempty" yaml:"license_check,omitempty"`
+
+		// This is an internal configuration, not to be documented nor set
+		// as part of the RpkCloudCluster.
+		CloudEnvironment string `json:"cloud_environment,omitempty" yaml:"cloud_environment,omitempty"`
 
 		// We stash the config struct itself so that we can provide
 		// the logger / dev overrides.
@@ -149,13 +153,14 @@ type (
 	}
 
 	RpkCloudCluster struct {
-		Namespace   string `json:"namespace" yaml:"namespace"`
-		ClusterID   string `json:"cluster_id" yaml:"cluster_id"`
-		ClusterName string `json:"cluster_name" yaml:"cluster_name"`
-		AuthOrgID   string `json:"auth_org_id" yaml:"auth_org_id"`
-		AuthKind    string `json:"auth_kind" yaml:"auth_kind"`
-		ClusterType string `json:"cluster_type" yaml:"cluster_type"`
-		ClusterURL  string `json:"cluster_url,omitempty" yaml:"cluster_url,omitempty"`
+		Namespace     string `json:"namespace" yaml:"namespace"`
+		ResourceGroup string `json:"resource_group" yaml:"resource_group"`
+		ClusterID     string `json:"cluster_id" yaml:"cluster_id"`
+		ClusterName   string `json:"cluster_name" yaml:"cluster_name"`
+		AuthOrgID     string `json:"auth_org_id" yaml:"auth_org_id"`
+		AuthKind      string `json:"auth_kind" yaml:"auth_kind"`
+		ClusterType   string `json:"cluster_type" yaml:"cluster_type"`
+		ClusterURL    string `json:"cluster_url,omitempty" yaml:"cluster_url,omitempty"`
 	}
 
 	// RpkCloudAuth is unique by name and org ID. We support multiple auths
@@ -172,6 +177,10 @@ type (
 	}
 
 	Duration struct{ time.Duration }
+
+	LicenseStatusCache struct {
+		LastUpdate int64 `json:"last_update" yaml:"last_update"`
+	}
 )
 
 // Profile returns the given profile, or nil if it does not exist.
@@ -289,9 +298,12 @@ func (y *RpkYaml) CurrentAuth() *RpkCloudAuth {
 }
 
 const (
-	CloudAuthUninitialized     = ""
-	CloudAuthSSO               = "sso"
-	CloudAuthClientCredentials = "client-credentials"
+	CloudAuthUninitialized      = ""
+	CloudAuthSSO                = "sso"
+	CloudAuthClientCredentials  = "client-credentials"
+	ServerlessClusterType       = "TYPE_SERVERLESS" // Configuration setting to identify a serverless cluster.
+	CloudEnvironmentIntegration = "integration"
+	CloudEnvironmentPreprod     = "preprod"
 )
 
 ///////////
@@ -346,6 +358,13 @@ func (p *RpkProfile) VirtualAuth() *RpkCloudAuth {
 		return nil
 	}
 	return p.c.rpkYaml.LookupAuth(p.CloudCluster.AuthOrgID, p.CloudCluster.AuthKind)
+}
+
+func (p *RpkProfile) ActualConfig() (*RpkYaml, bool) {
+	if p.c == nil {
+		return nil, false
+	}
+	return p.c.ActualRpkYaml()
 }
 
 // HasClientCredentials returns if both ClientID and ClientSecret are non-empty.
@@ -413,9 +432,9 @@ func (y *RpkYaml) WriteAt(fs afero.Fs, path string) error {
 	return rpkos.ReplaceFile(fs, path, b, 0o644)
 }
 
-// FullName returns "namespace/cluster_name".
+// FullName returns "resource_group/cluster_name".
 func (c *RpkCloudCluster) FullName() string {
-	return fmt.Sprintf("%s/%s", c.Namespace, c.ClusterName)
+	return fmt.Sprintf("%s/%s", c.ResourceGroup, c.ClusterName)
 }
 
 // HasAuth returns if the cluster has the given auth.
@@ -428,7 +447,11 @@ func (c *RpkCloudCluster) HasAuth(a RpkCloudAuth) bool {
 }
 
 func (c *RpkCloudCluster) IsServerless() bool {
-	return c != nil && c.ClusterType == publicapi.ServerlessClusterType
+	return c != nil && c.ClusterType == ServerlessClusterType
+}
+
+func (c *RpkCloudCluster) IsBYOC() bool {
+	return c != nil && c.ClusterType == controlplanev1.Cluster_TYPE_BYOC.String()
 }
 
 func (c *RpkCloudCluster) CheckClusterURL() (string, error) {

@@ -20,6 +20,7 @@ enum class error_code {
     schema_id_not_found = 1,
     schema_invalid,
     schema_empty,
+    schema_missing_reference,
     schema_incompatible,
     schema_version_invalid,
     subject_not_found,
@@ -29,13 +30,16 @@ enum class error_code {
     subject_version_soft_deleted,
     subject_version_not_deleted,
     compatibility_not_found,
-    subject_version_operaton_not_permitted,
+    mode_not_found,
+    subject_version_operation_not_permitted,
     subject_version_has_references,
     subject_version_schema_id_already_exists,
     subject_schema_invalid,
     write_collision,
     topic_parse_error,
     compatibility_level_invalid,
+    mode_invalid,
+    version_exhausted,
 };
 
 std::error_code make_error_code(error_code);

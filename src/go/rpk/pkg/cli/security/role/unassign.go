@@ -46,9 +46,9 @@ Unassign role "redpanda-admin" from users "red" and "panda"
 			}
 			p, err := p.LoadVirtualProfile(fs)
 			out.MaybeDie(err, "rpk unable to load config: %v", err)
-			config.CheckExitServerlessAdmin(p)
+			config.CheckExitCloudAdmin(p)
 
-			cl, err := adminapi.NewClient(fs, p)
+			cl, err := adminapi.NewClient(cmd.Context(), fs, p)
 			out.MaybeDie(err, "unable to initialize admin api client: %v", err)
 
 			roleName := args[0]

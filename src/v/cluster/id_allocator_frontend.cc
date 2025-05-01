@@ -25,7 +25,6 @@
 #include "model/namespace.h"
 #include "model/record_batch_reader.h"
 #include "rpc/connection_cache.h"
-#include "vformat.h"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/do_with.hh>
@@ -45,14 +44,14 @@ allocate_id_router::allocate_id_router(
   ss::sharded<partition_leaders_table>& leaders,
   const model::node_id node_id)
   : allocate_router(
-    shard_table,
-    metadata_cache,
-    connection_cache,
-    leaders,
-    _handler,
-    node_id,
-    config::shard_local_cfg().metadata_dissemination_retries.value(),
-    config::shard_local_cfg().metadata_dissemination_retry_delay_ms.value())
+      shard_table,
+      metadata_cache,
+      connection_cache,
+      leaders,
+      _handler,
+      node_id,
+      config::shard_local_cfg().metadata_dissemination_retries.value(),
+      config::shard_local_cfg().metadata_dissemination_retry_delay_ms.value())
   , _handler(ssg, partition_manager) {}
 
 reset_id_router::reset_id_router(
@@ -64,14 +63,14 @@ reset_id_router::reset_id_router(
   ss::sharded<partition_leaders_table>& leaders,
   const model::node_id node_id)
   : reset_router(
-    shard_table,
-    metadata_cache,
-    connection_cache,
-    leaders,
-    _handler,
-    node_id,
-    config::shard_local_cfg().metadata_dissemination_retries.value(),
-    config::shard_local_cfg().metadata_dissemination_retry_delay_ms.value())
+      shard_table,
+      metadata_cache,
+      connection_cache,
+      leaders,
+      _handler,
+      node_id,
+      config::shard_local_cfg().metadata_dissemination_retries.value(),
+      config::shard_local_cfg().metadata_dissemination_retry_delay_ms.value())
   , _handler(ssg, partition_manager) {}
 
 ss::future<result<rpc::client_context<allocate_id_reply>>>
@@ -121,11 +120,11 @@ reset_id_handler::process(ss::shard_id shard, reset_id_allocator_request req) {
           }
           return stm->reset_next_id(id, timeout)
             .then([](id_allocator_stm::stm_allocation_result r) {
-                if (r.raft_status != raft::errc::success) {
+                if (!r) {
                     vlog(
                       clusterlog.warn,
                       "allocate id stm call failed with {}",
-                      raft::make_error_code(r.raft_status).message());
+                      r.assume_error().message());
                     return reset_id_allocator_reply{errc::replication_error};
                 }
 
@@ -146,7 +145,7 @@ allocate_id_handler::process(ss::shard_id shard, allocate_id_request req) {
                 "can't get partition by {} ntp",
                 model::id_allocator_ntp);
               return ss::make_ready_future<allocate_id_reply>(
-                allocate_id_reply{0, errc::topic_not_exists});
+                0, errc::topic_not_exists);
           }
           auto stm = partition->id_allocator_stm();
           if (!stm) {
@@ -155,19 +154,19 @@ allocate_id_handler::process(ss::shard_id shard, allocate_id_request req) {
                 "can't get id allocator stm of the {}' partition",
                 model::id_allocator_ntp);
               return ss::make_ready_future<allocate_id_reply>(
-                allocate_id_reply{0, errc::topic_not_exists});
+                0, errc::topic_not_exists);
           }
           return stm->allocate_id(timeout).then(
             [](id_allocator_stm::stm_allocation_result r) {
-                if (r.raft_status != raft::errc::success) {
+                if (!r) {
                     vlog(
                       clusterlog.warn,
                       "allocate id stm call failed with {}",
-                      raft::make_error_code(r.raft_status).message());
-                    return allocate_id_reply{r.id, errc::replication_error};
+                      r.assume_error().message());
+                    return allocate_id_reply{-1, errc::replication_error};
                 }
 
-                return allocate_id_reply{r.id, errc::success};
+                return allocate_id_reply{r.assume_value(), errc::success};
             });
       });
 }

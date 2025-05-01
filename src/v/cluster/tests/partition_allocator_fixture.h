@@ -19,6 +19,7 @@
 #include "cluster/scheduling/partition_allocator.h"
 #include "config/configuration.h"
 #include "config/mock_property.h"
+#include "features/feature_table.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "random/fast_prng.h"
@@ -27,16 +28,20 @@
 
 #include <seastar/core/chunked_fifo.hh>
 
+#include <cstdint>
 #include <limits>
 
 struct partition_allocator_fixture {
-    static constexpr uint32_t partitions_per_shard = 1000;
-    static constexpr uint32_t partitions_reserve_shard0 = 2;
+    static constexpr uint32_t gb_per_core = 5;
 
     partition_allocator_fixture()
-      : partition_allocator_fixture(std::nullopt, std::nullopt) {}
+      : partition_allocator_fixture(std::nullopt, std::nullopt, 1000) {}
 
-    ~partition_allocator_fixture() { members.stop().get0(); }
+    ~partition_allocator_fixture() {
+        _allocator.stop().get();
+        features.stop().get();
+        members.stop().get();
+    }
 
     void register_node(
       int id,
@@ -49,7 +54,7 @@ struct partition_allocator_fixture {
           std::move(rack),
           model::broker_properties{
             .cores = core_count,
-            .available_memory_gb = 5 * core_count,
+            .available_memory_gb = gb_per_core * core_count,
             .available_disk_gb = 10 * core_count});
 
         auto ec = members.local().apply(
@@ -59,24 +64,22 @@ struct partition_allocator_fixture {
               ss::format("unable to apply add node cmd: {}", ec.message()));
         }
 
-        allocator.register_node(std::make_unique<cluster::allocation_node>(
+        allocator().register_node(std::make_unique<cluster::allocation_node>(
           broker.id(),
           broker.properties().cores,
           config::mock_binding<uint32_t>(uint32_t{partitions_per_shard}),
-          config::mock_binding<uint32_t>(uint32_t{partitions_reserve_shard0}),
+          partitions_reserve_shard0.bind(),
           kafka_internal_topics.bind()));
     }
 
     void saturate_all_machines() {
-        auto units = allocator
+        auto units = allocator()
                        .allocate(make_allocation_request(max_capacity(), 1))
                        .get();
 
         for (auto& pas : units.value()->get_assignments()) {
-            allocator.add_allocations_for_new_partition(
-              pas.replicas,
-              pas.group,
-              cluster::partition_allocation_domains::common);
+            allocator().add_allocations_for_new_partition(
+              pas.replicas, pas.group);
         }
     }
 
@@ -93,19 +96,24 @@ struct partition_allocator_fixture {
 
     bool all_nodes_empty() {
         return std::all_of(
-          allocator.state().allocation_nodes().begin(),
-          allocator.state().allocation_nodes().end(),
+          allocator().state().allocation_nodes().begin(),
+          allocator().state().allocation_nodes().end(),
           [](const auto& n) { return n.second->empty(); });
     }
 
     int32_t max_capacity() {
         return std::accumulate(
-          allocator.state().allocation_nodes().begin(),
-          allocator.state().allocation_nodes().end(),
+          allocator().state().allocation_nodes().begin(),
+          allocator().state().allocation_nodes().end(),
           0,
           [](int acc, auto& n) {
               return acc + n.second->partition_capacity();
           });
+    }
+
+    cluster::simple_allocation_request make_simple_allocation_request(
+      int32_t partitions, int16_t replication_factor) {
+        return {tn, partitions, replication_factor};
     }
 
     cluster::allocation_request
@@ -115,8 +123,7 @@ struct partition_allocator_fixture {
 
     cluster::allocation_request make_allocation_request(
       model::topic_namespace tn, int partitions, uint16_t replication_factor) {
-        cluster::allocation_request req(
-          std::move(tn), cluster::partition_allocation_domains::common);
+        cluster::allocation_request req(std::move(tn));
         req.partitions.reserve(partitions);
         for (int i = 0; i < partitions; ++i) {
             req.partitions.emplace_back(
@@ -125,31 +132,44 @@ struct partition_allocator_fixture {
         return req;
     }
 
+    cluster::partition_allocator& allocator() { return _allocator.local(); }
+
     config::mock_property<std::vector<ss::sstring>> kafka_internal_topics{{}};
+    config::mock_property<uint32_t> partitions_reserve_shard0{2};
     model::topic_namespace tn{model::kafka_namespace, model::topic{"test"}};
     ss::sharded<cluster::members_table> members;
-    cluster::partition_allocator allocator;
+    ss::sharded<features::feature_table> features;
+    ss::sharded<cluster::partition_allocator> _allocator;
 
     fast_prng prng;
+
+    uint32_t partitions_per_shard;
 
 protected:
     explicit partition_allocator_fixture(
       std::optional<size_t> memory_per_partition,
-      std::optional<int32_t> fds_per_partition)
-      : allocator(
-        std::ref(members),
-        config::mock_binding<std::optional<size_t>>(memory_per_partition),
-        config::mock_binding<std::optional<int32_t>>(fds_per_partition),
-        config::mock_binding<uint32_t>(uint32_t{partitions_per_shard}),
-        config::mock_binding<uint32_t>(uint32_t{partitions_reserve_shard0}),
-        kafka_internal_topics.bind(),
-        config::mock_binding<bool>(true)) {
-        members.start().get0();
-        ss::smp::invoke_on_all([] {
+      std::optional<int32_t> fds_per_partition,
+      uint32_t partitions_per_shard)
+      : partitions_per_shard(partitions_per_shard) {
+        members.start().get();
+        features.start().get();
+        _allocator
+          .start_single(
+            std::ref(members),
+            std::ref(features),
+            config::mock_binding<std::optional<int32_t>>(fds_per_partition),
+            config::mock_binding<uint32_t>(uint32_t{partitions_per_shard}),
+            partitions_reserve_shard0.bind(),
+            kafka_internal_topics.bind(),
+            config::mock_binding<bool>(true))
+          .get();
+        ss::smp::invoke_on_all([memory_per_partition] {
             config::shard_local_cfg()
               .get("partition_autobalancing_mode")
               .set_value(model::partition_autobalancing_mode::node_add);
-        }).get0();
+            config::shard_local_cfg().topic_memory_per_partition.set_value(
+              memory_per_partition);
+        }).get();
     }
 };
 
@@ -158,7 +178,8 @@ struct partition_allocator_memory_limited_fixture
     static constexpr size_t memory_per_partition
       = std::numeric_limits<size_t>::max();
     partition_allocator_memory_limited_fixture()
-      : partition_allocator_fixture(memory_per_partition, std::nullopt) {}
+      : partition_allocator_fixture(memory_per_partition, std::nullopt, 10000) {
+    }
 };
 
 struct partition_allocator_fd_limited_fixture
@@ -167,5 +188,5 @@ struct partition_allocator_fd_limited_fixture
       = std::numeric_limits<int32_t>::max();
 
     partition_allocator_fd_limited_fixture()
-      : partition_allocator_fixture(std::nullopt, fds_per_partition) {}
+      : partition_allocator_fixture(std::nullopt, fds_per_partition, 10000) {}
 };

@@ -14,26 +14,26 @@
 #include "cluster/cloud_metadata/offsets_snapshot.h"
 #include "cluster/notification.h"
 #include "cluster/topic_table.h"
-#include "kafka/protocol/delete_groups.h"
-#include "kafka/protocol/describe_groups.h"
+#include "container/fragmented_vector.h"
 #include "kafka/protocol/errors.h"
 #include "kafka/protocol/heartbeat.h"
 #include "kafka/protocol/join_group.h"
 #include "kafka/protocol/leave_group.h"
-#include "kafka/protocol/list_groups.h"
 #include "kafka/protocol/offset_commit.h"
 #include "kafka/protocol/offset_delete.h"
 #include "kafka/protocol/offset_fetch.h"
 #include "kafka/protocol/schemata/delete_groups_response.h"
+#include "kafka/protocol/schemata/describe_producers_response.h"
 #include "kafka/protocol/schemata/list_groups_response.h"
 #include "kafka/protocol/sync_group.h"
 #include "kafka/protocol/txn_offset_commit.h"
+#include "kafka/server/fwd.h"
 #include "kafka/server/group.h"
 #include "kafka/server/group_recovery_consumer.h"
 #include "kafka/server/group_stm.h"
-#include "kafka/server/member.h"
 #include "model/metadata.h"
 #include "raft/fwd.h"
+#include "raft/notification.h"
 #include "ssx/semaphore.h"
 #include "utils/rwlock.h"
 
@@ -43,9 +43,9 @@
 #include <seastar/core/loop.hh>
 #include <seastar/core/sharded.hh>
 
+#include <absl/container/flat_hash_set.h>
 #include <absl/container/node_hash_map.h>
 
-#include <span>
 #include <system_error>
 
 namespace kafka {
@@ -128,11 +128,17 @@ public:
       ss::sharded<cluster::topic_table>&,
       ss::sharded<cluster::tx_gateway_frontend>& tx_frontend,
       ss::sharded<features::feature_table>&,
-      group_metadata_serializer_factory,
-      enable_group_metrics group_metrics);
+      ss::sharded<consumer_group_lag_metrics_frontend>&,
+      group_metadata_serializer_factory);
 
     ss::future<> start();
     ss::future<> stop();
+
+    struct list_groups_filter_data {
+        using states_filter_t = absl::flat_hash_set<group_state>;
+
+        states_filter_t states_filter;
+    };
 
 public:
     /// \brief Handle a JoinGroup request
@@ -171,9 +177,13 @@ public:
 
     // returns the set of registered groups, and an error if one occurred while
     // retrieving the group list (e.g. coordinator_load_in_progress).
-    std::pair<error_code, std::vector<listed_group>> list_groups() const;
+    std::pair<error_code, chunked_vector<listed_group>>
+    list_groups(const list_groups_filter_data& filter_data = {}) const;
 
     described_group describe_group(const model::ntp&, const kafka::group_id&);
+
+    using partition_producers = partition_response;
+    partition_response describe_partition_producers(const model::ntp&);
 
     ss::future<std::vector<deletable_group_result>>
       delete_groups(std::vector<std::pair<model::ntp, group_id>>);
@@ -188,6 +198,11 @@ public:
 
     ss::future<kafka::error_code>
       recover_offsets(cluster::cloud_metadata::group_offsets_snapshot);
+
+    size_t attached_partitions_count() const { return _partitions.size(); }
+
+    ss::future<cluster::get_producers_reply>
+      get_group_producers_locally(cluster::get_producers_request);
 
 public:
     error_code validate_group_status(
@@ -225,7 +240,7 @@ private:
         ~attached_partition() noexcept;
     };
 
-    cluster::notification_id_type _leader_notify_handle;
+    raft::group_manager_notification_id _leader_notify_handle;
     cluster::notification_id_type _topic_table_notify_handle;
 
     void handle_leader_change(
@@ -233,7 +248,7 @@ private:
       ss::lw_shared_ptr<cluster::partition>,
       std::optional<model::node_id>);
 
-    void handle_topic_delta(cluster::topic_table::delta_range_t);
+    void handle_topic_delta(cluster::topic_table::ntp_delta_range_t);
 
     ss::future<> cleanup_removed_topic_partitions(
       const chunked_vector<model::topic_partition>&);
@@ -280,10 +295,13 @@ private:
           groups, [](auto group_ptr) { return group_ptr->shutdown(); });
     }
 
+    ss::future<> collect_consumer_lag_metrics();
+
     std::optional<std::chrono::seconds> offset_retention_enabled();
     std::optional<bool> _prev_offset_retention_enabled;
 
-    ss::timer<> _timer;
+    ss::timer<> _expired_group_offset_timer;
+    ss::timer<> _lag_metrics_timer;
     ss::future<> handle_offset_expiration();
     ss::future<size_t> delete_expired_offsets(group_ptr, std::chrono::seconds);
     ss::sharded<raft::group_manager>& _gm;
@@ -291,16 +309,17 @@ private:
     ss::sharded<cluster::topic_table>& _topic_table;
     ss::sharded<cluster::tx_gateway_frontend>& _tx_frontend;
     ss::sharded<features::feature_table>& _feature_table;
+    ss::sharded<consumer_group_lag_metrics_frontend>& _lag_metrics_frontend;
     group_metadata_serializer_factory _serializer_factory;
     config::configuration& _conf;
     absl::node_hash_map<group_id, group_ptr> _groups;
     absl::node_hash_map<model::ntp, ss::lw_shared_ptr<attached_partition>>
       _partitions;
-    //
 
     model::broker _self;
-    enable_group_metrics _enable_group_metrics;
     config::binding<std::chrono::milliseconds> _offset_retention_check;
+    config::binding<std::vector<ss::sstring>> _enabled_metrics;
+    config::binding<std::chrono::seconds> _lag_collection_interval;
 };
 
 } // namespace kafka

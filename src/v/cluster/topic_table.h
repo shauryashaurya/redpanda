@@ -12,6 +12,7 @@
 #pragma once
 
 #include "cluster/commands.h"
+#include "cluster/fwd.h"
 #include "cluster/notification.h"
 #include "cluster/topic_table_probe.h"
 #include "container/chunked_hash_map.h"
@@ -94,22 +95,17 @@ public:
     //   * partition::get_revision_id()
     //   * raft::group_configuration::revision_id()
 
-    class concurrent_modification_error final : public std::exception {
+    class concurrent_modification_error final
+      : public ::concurrent_modification_error {
     public:
         concurrent_modification_error(
           model::revision_id initial_revision,
           model::revision_id current_revision)
-          : _msg(ssx::sformat(
-            "Topic table was modified by concurrent fiber. "
-            "(initial_revision: "
-            "{}, current_revision: {}) ",
-            initial_revision,
-            current_revision)) {}
-
-        const char* what() const noexcept final { return _msg.c_str(); }
-
-    private:
-        ss::sstring _msg;
+          : ::concurrent_modification_error(ssx::sformat(
+              "Topic table was modified by concurrent fiber. "
+              "(initial_revision: {}, current_revision: {}) ",
+              initial_revision,
+              current_revision)) {}
     };
 
     class in_progress_update {
@@ -189,6 +185,11 @@ public:
             return _policy;
         }
 
+        bool is_force_reconfiguration() const {
+            return _state == reconfiguration_state::force_cancelled
+                   || _state == reconfiguration_state::force_update;
+        }
+
         friend std::ostream&
         operator<<(std::ostream&, const in_progress_update&);
 
@@ -244,8 +245,6 @@ public:
         }
     };
 
-    using delta = topic_table_delta;
-
     using underlying_t = chunked_hash_map<
       model::topic_namespace,
       topic_metadata_item,
@@ -264,10 +263,23 @@ public:
       model::topic_namespace_hash,
       model::topic_namespace_eq>;
 
-    using delta_range_t
-      = boost::iterator_range<fragmented_vector<delta>::const_iterator>;
-    using delta_cb_t = ss::noncopyable_function<void(delta_range_t)>;
-    using lw_cb_t = ss::noncopyable_function<void()>;
+    using iceberg_tombstones_t = chunked_hash_map<
+      model::topic_namespace,
+      nt_iceberg_tombstone,
+      model::topic_namespace_hash,
+      model::topic_namespace_eq>;
+
+    using topic_delta = topic_table_topic_delta;
+
+    using topic_delta_cb_t
+      = ss::noncopyable_function<void(const chunked_vector<topic_delta>&)>;
+
+    using ntp_delta = topic_table_ntp_delta;
+
+    using ntp_delta_range_t
+      = boost::iterator_range<fragmented_vector<ntp_delta>::const_iterator>;
+    using ntp_delta_cb_t = ss::noncopyable_function<void(ntp_delta_range_t)>;
+    using lw_ntp_cb_t = ss::noncopyable_function<void()>;
 
     /// A helper struct that has various replica-related metadata all in one
     /// place, so that the API user doesn't have to query several maps manually.
@@ -305,35 +317,50 @@ public:
         const in_progress_update* update = nullptr;
     };
 
-    explicit topic_table()
-      : _probe(*this){};
+    explicit topic_table(data_migrations::migrated_resources&);
 
-    cluster::notification_id_type register_delta_notification(delta_cb_t cb) {
-        auto id = _notification_id++;
-        _notifications.emplace_back(id, std::move(cb));
+    cluster::notification_id_type
+    register_topic_delta_notification(topic_delta_cb_t cb) {
+        auto id = _topic_notification_id++;
+        _topic_notifications.emplace_back(id, std::move(cb));
         return id;
     }
 
-    void unregister_delta_notification(cluster::notification_id_type id) {
+    void unregister_topic_delta_notification(cluster::notification_id_type id) {
         std::erase_if(
-          _notifications,
-          [id](const std::pair<cluster::notification_id_type, delta_cb_t>& n) {
+          _topic_notifications,
+          [id](const std::pair<cluster::notification_id_type, topic_delta_cb_t>&
+                 n) { return n.first == id; });
+    }
+
+    cluster::notification_id_type
+    register_ntp_delta_notification(ntp_delta_cb_t cb) {
+        auto id = _ntp_notification_id++;
+        _ntp_notifications.emplace_back(id, std::move(cb));
+        return id;
+    }
+
+    void unregister_ntp_delta_notification(cluster::notification_id_type id) {
+        std::erase_if(
+          _ntp_notifications,
+          [id](
+            const std::pair<cluster::notification_id_type, ntp_delta_cb_t>& n) {
               return n.first == id;
           });
     }
 
     /// similar to delta notifications but lightweight because a copy of delta
     /// is not included in the notification.
-    cluster::notification_id_type register_lw_notification(lw_cb_t cb) {
-        auto id = _lw_notification_id++;
-        _lw_notifications.emplace_back(id, std::move(cb));
+    cluster::notification_id_type register_lw_ntp_notification(lw_ntp_cb_t cb) {
+        auto id = _lw_ntp_notification_id++;
+        _lw_ntp_notifications.emplace_back(id, std::move(cb));
         return id;
     }
 
-    void unregister_lw_notification(cluster::notification_id_type id) {
+    void unregister_lw_ntp_notification(cluster::notification_id_type id) {
         std::erase_if(
-          _lw_notifications,
-          [id](const std::pair<cluster::notification_id_type, lw_cb_t>& n) {
+          _lw_ntp_notifications,
+          [id](const std::pair<cluster::notification_id_type, lw_ntp_cb_t>& n) {
               return n.first == id;
           });
     }
@@ -376,17 +403,6 @@ public:
     apply_snapshot(model::offset snapshot_offset, const controller_snapshot&);
 
     ss::future<> stop();
-
-    /// Delta API
-    /// NOTE: This API should only be consumed by a single entity, unless
-    /// careful consideration is taken. This is because once notifications are
-    /// fired, all events are consumed, and if both waiters aren't enqueued in
-    /// the \ref _waiters collection by the time the notify occurs, only one
-    /// waiter will recieve the updates, leaving the second one to observe
-    /// skipped events upon recieving its subsequent notification.
-    ss::future<fragmented_vector<delta>> wait_for_changes(ss::abort_source&);
-
-    bool has_pending_changes() const { return !_pending_deltas.empty(); }
 
     /// Query API
 
@@ -522,19 +538,19 @@ public:
     /**
      * Lists all NTPs that replicas are being move to a node
      */
-    std::vector<model::ntp> ntps_moving_to_node(model::node_id) const;
+    chunked_vector<model::ntp> ntps_moving_to_node(model::node_id) const;
 
     /**
      * Lists all NTPs that replicas are being move from a node
      */
-    std::vector<model::ntp> ntps_moving_from_node(model::node_id) const;
+    chunked_vector<model::ntp> ntps_moving_from_node(model::node_id) const;
 
     /**
      * Lists all ntps moving either from or to a node
      */
-    std::vector<model::ntp> all_ntps_moving_per_node(model::node_id) const;
+    chunked_vector<model::ntp> all_ntps_moving_per_node(model::node_id) const;
 
-    std::vector<model::ntp> all_updates_in_progress() const;
+    chunked_vector<model::ntp> all_updates_in_progress() const;
 
     model::revision_id last_applied_revision() const {
         return _last_applied_revision_id;
@@ -549,7 +565,7 @@ public:
     size_t get_node_partition_count(model::node_id) const;
 
     /**
-     * See which topics have pending deletion work
+     * See which topics have pending cloud storage deletion work
      */
     const lifecycle_markers_t& get_lifecycle_markers() const {
         return _lifecycle_markers;
@@ -597,6 +613,11 @@ public:
         return is_disabled(model::topic_namespace_view{ntp}, ntp.tp.partition);
     }
 
+    // Get a set of topics with pending iceberg deletion work.
+    const iceberg_tombstones_t& get_iceberg_tombstones() const {
+        return _iceberg_tombstones;
+    }
+
     auto topics_iterator_begin() const {
         return stable_iterator<
           underlying_t::const_iterator,
@@ -634,18 +655,24 @@ public:
           _partitions_to_force_reconfigure.end());
     }
 
+    /**
+     * Return the result of applying the update to the topic properties.
+     */
+    static topic_properties update_topic_properties(
+      topic_properties updated_properties, update_topic_properties_cmd cmd);
+
 private:
     friend topic_table_probe;
 
     struct waiter {
         explicit waiter(uint64_t id)
           : id(id) {}
-        ss::promise<fragmented_vector<delta>> promise;
+        ss::promise<fragmented_vector<ntp_delta>> promise;
         ss::abort_source::subscription sub;
         uint64_t id;
     };
 
-    void notify_waiters();
+    ss::future<> notify_waiters();
 
     void change_partition_replicas(
       model::ntp ntp,
@@ -657,8 +684,8 @@ private:
 
     class snapshot_applier;
 
-    std::error_code
-    do_local_delete(model::topic_namespace nt, model::offset offset);
+    ss::future<std::error_code> do_local_delete(
+      model::topic_namespace nt, model::offset offset, bool ignore_migration);
     ss::future<std::error_code>
       do_apply(update_partition_replicas_cmd_data, model::offset);
 
@@ -672,32 +699,50 @@ private:
     std::error_code validate_force_reconfigurable_partition(
       const ntp_with_majority_loss&) const;
 
+    // Validation for the final property configuration from a
+    // update_topic_properties_cmd application. Allows user to perform
+    // validations that depend on more than one topic property.
+    //
+    // Returns true if the configured topic_properties is valid, and false
+    // otherwise.
+    bool
+    topic_multi_property_validation(const topic_properties& properties) const;
+
     underlying_t _topics;
     lifecycle_markers_t _lifecycle_markers;
     disabled_partitions_t _disabled_partitions;
+    iceberg_tombstones_t _iceberg_tombstones;
     size_t _partition_count{0};
 
     updates_t _updates_in_progress;
     model::revision_id _last_applied_revision_id;
-    // Monotonic counter that is bumped for every addition/deletion to topics
-    // map. Unlike other revisions this does not correspond to the command
+
+    // Monotonic counter that is bumped each time _topics, _disabled_partitions,
+    // or _updates_in_progress are modified in a way that makes iteration over
+    // them unsafe (i.e. invalidates iterators or references, including
+    // for nested collections like partition sets and replica sets).
+    //
+    // Unlike other revisions this does not correspond to the command
     // revision that updated the map.
     model::revision_id _topics_map_revision{0};
 
-    fragmented_vector<delta> _pending_deltas;
-    std::vector<std::unique_ptr<waiter>> _waiters;
-    cluster::notification_id_type _notification_id{0};
-    cluster::notification_id_type _lw_notification_id{0};
-    std::vector<std::pair<cluster::notification_id_type, delta_cb_t>>
-      _notifications;
-    std::vector<std::pair<cluster::notification_id_type, lw_cb_t>>
-      _lw_notifications;
-    uint64_t _waiter_id{0};
-    std::vector<delta>::difference_type _last_consumed_by_notifier_offset{0};
+    chunked_vector<topic_delta> _pending_topic_deltas;
+    cluster::notification_id_type _topic_notification_id{0};
+    std::vector<std::pair<cluster::notification_id_type, topic_delta_cb_t>>
+      _topic_notifications;
+
+    fragmented_vector<ntp_delta> _pending_ntp_deltas;
+    cluster::notification_id_type _ntp_notification_id{0};
+    cluster::notification_id_type _lw_ntp_notification_id{0};
+    std::vector<std::pair<cluster::notification_id_type, ntp_delta_cb_t>>
+      _ntp_notifications;
+    std::vector<std::pair<cluster::notification_id_type, lw_ntp_cb_t>>
+      _lw_ntp_notifications;
+
     topic_table_probe _probe;
     force_recoverable_partitions_t _partitions_to_force_reconfigure;
     model::revision_id _partitions_to_force_reconfigure_revision{0};
-
+    data_migrations::migrated_resources& _migrated_resources;
     friend class topic_table_partition_generator;
 };
 

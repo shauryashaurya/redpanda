@@ -34,10 +34,7 @@ class id_allocator_stm final : public raft::persisted_stm<> {
 public:
     static constexpr std::string_view name = "id_allocator_stm";
 
-    struct stm_allocation_result {
-        int64_t id;
-        raft::errc raft_status{raft::errc::success};
-    };
+    using stm_allocation_result = result<int64_t>;
 
     explicit id_allocator_stm(ss::logger&, raft::consensus*);
 
@@ -51,6 +48,11 @@ public:
 
     ss::future<stm_allocation_result>
     reset_next_id(int64_t, model::timeout_clock::duration timeout);
+
+    raft::stm_initial_recovery_policy
+    get_initial_recovery_policy() const final {
+        return raft::stm_initial_recovery_policy::read_everything;
+    }
 
 private:
     // legacy structs left for backward compatibility with the "old"
@@ -101,7 +103,7 @@ private:
       do_allocate_id(model::timeout_clock::duration);
     ss::future<bool> set_state(int64_t, model::timeout_clock::duration);
 
-    ss::future<> apply(const model::record_batch&) final;
+    ss::future<> do_apply(const model::record_batch&) final;
 
     // Moves the state forward to the given value if the curent id is lower
     // than it.
@@ -109,9 +111,10 @@ private:
       advance_state(int64_t, model::timeout_clock::duration);
 
     ss::future<> write_snapshot();
-    ss::future<>
+    ss::future<raft::local_snapshot_applied>
     apply_local_snapshot(raft::stm_snapshot_header, iobuf&&) override;
-    ss::future<raft::stm_snapshot> take_local_snapshot() override;
+    ss::future<raft::stm_snapshot>
+    take_local_snapshot(ssx::semaphore_units apply_units) override;
     ss::future<> apply_raft_snapshot(const iobuf&) final;
     ss::future<bool> sync(model::timeout_clock::duration);
 
@@ -149,7 +152,8 @@ public:
 
     void create(
       raft::state_machine_manager_builder& builder,
-      raft::consensus* raft) final;
+      raft::consensus* raft,
+      const cluster::stm_instance_config& cfg) final;
 };
 
 } // namespace cluster

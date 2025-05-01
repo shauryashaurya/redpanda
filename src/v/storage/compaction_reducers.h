@@ -15,6 +15,7 @@
 #include "bytes/bytes.h"
 #include "container/fragmented_vector.h"
 #include "hashing/xx.h"
+#include "model/fundamental.h"
 #include "model/record_batch_reader.h"
 #include "storage/compacted_index.h"
 #include "storage/compacted_index_writer.h"
@@ -24,6 +25,7 @@
 #include "storage/logger.h"
 #include "utils/tracking_allocator.h"
 
+#include <seastar/core/loop.hh>
 #include <seastar/util/noncopyable_function.hh>
 
 #include <absl/container/btree_map.h>
@@ -121,24 +123,62 @@ class copy_data_segment_reducer : public compaction_reducer {
 public:
     using filter_t = ss::noncopyable_function<ss::future<bool>(
       const model::record_batch&, const model::record&, bool)>;
+    struct stats {
+        // Total number of batches passed to this reducer.
+        size_t batches_processed{0};
+        // Number of batches that were completely removed.
+        size_t batches_discarded{0};
+        // Number of records removed by this reducer, including batches that
+        // were entirely removed.
+        size_t records_discarded{0};
+        // Number of batches that were ignored because they are not
+        // of a compactible type.
+        size_t non_compactible_batches{0};
+
+        // Returns whether any data was removed by this reducer.
+        bool has_removed_data() const {
+            return batches_discarded > 0 || records_discarded > 0;
+        }
+
+        friend std::ostream& operator<<(std::ostream& os, const stats& s) {
+            fmt::print(
+              os,
+              "{{ batches_processed: {}, batches_discarded: {}, "
+              "records_discarded: {}, non_compactible_batches: {} }}",
+              s.batches_processed,
+              s.batches_discarded,
+              s.records_discarded,
+              s.non_compactible_batches);
+            return os;
+        }
+    };
+    struct idx_and_stats {
+        index_state new_idx;
+        stats reducer_stats;
+    };
+
     copy_data_segment_reducer(
       filter_t f,
       segment_appender* a,
       bool internal_topic,
       offset_delta_time apply_offset,
       model::offset segment_last_offset,
+      bool compaction_placeholder_enabled,
       compacted_index_writer* cidx = nullptr,
-      bool inject_failure = false)
+      bool inject_failure = false,
+      ss::abort_source* as = nullptr)
       : _should_keep_fn(std::move(f))
       , _segment_last_offset(segment_last_offset)
+      , _compaction_placeholder_enabled(compaction_placeholder_enabled)
       , _appender(a)
       , _compacted_idx(cidx)
       , _idx(index_state::make_empty_index(apply_offset))
       , _internal_topic(internal_topic)
-      , _inject_failure(inject_failure) {}
+      , _inject_failure(inject_failure)
+      , _as(as) {}
 
     ss::future<ss::stop_iteration> operator()(model::record_batch);
-    storage::index_state end_of_stream() { return std::move(_idx); }
+    idx_and_stats end_of_stream() { return {std::move(_idx), _stats}; }
 
 private:
     ss::future<ss::stop_iteration>
@@ -159,6 +199,11 @@ private:
 
     // Offset to keep in case the index is empty as of getting to this offset.
     model::offset _segment_last_offset;
+
+    // Whether feature::compaction_placeholder batch is enabled or not- expected
+    // to be queried from feature table.
+    bool _compaction_placeholder_enabled;
+
     segment_appender* _appender;
 
     // Compacted index writer for the newly written segment. May not be
@@ -174,6 +219,12 @@ private:
 
     /// If set to true, will throw an exception on operator().
     bool _inject_failure;
+
+    /// Allows the reducer to stop early, e.g. in case the partition is being
+    /// shut down.
+    ss::abort_source* _as;
+
+    stats _stats;
 };
 
 class index_rebuilder_reducer : public compaction_reducer {
@@ -191,13 +242,9 @@ private:
 
 /**
  * Filters out the aborted transaction data batches from the segment.
- * Retains the control batches (commit/abort) thus preserving the
+ * Retains the fence and control batches (commit/abort) thus preserving the
  * transaction boundaries.
  *
- * Note: fence batches are retained to preserve the epochs from pids.
- * The state machine uses this information to preserve the monotonicity
- * of epoch and to fence older pids.
-
  * The implementation wraps an index_rebuilder_reducer and filters out
  * the aforementioned batches before delegating them to compact.
  * Bookkeeps an ongoing list of aborted transactions up until the
@@ -207,12 +254,10 @@ private:
  * Few higher level invariants this implementation assumes to be true.
  *  - We only compact a segment if its offset range is within LSO boundary. This
  *    guarantees that any batch we see is either committed/aborted (eventually,
- may
- *    not be within this segment boundary).
+ *    may not be within this segment boundary).
  *  - Aborted tx ranges from the stm are the source of truth. Particularly for
  *    transactions spanning multiple segments (where begin/end or both may not
- be in
- *    the current segment).
+ *    be in the current segment).
  */
 class tx_reducer : public compaction_reducer {
 public:
@@ -223,30 +268,24 @@ public:
       : _delegate(index_rebuilder_reducer(w))
       , _aborted_txs(model::tx_range_cmp(), std::move(txs))
       , _stm_mgr(stm_mgr)
-      , _non_transactional(!stm_mgr->has_tx_stm()) {
-        _stats._num_aborted_txes = _aborted_txs.size();
+      , _transactional_stm_type(stm_mgr->transactional_stm_type()) {
+        _stats.num_aborted_txes = _aborted_txs.size();
     }
     ss::future<ss::stop_iteration> operator()(model::record_batch&&);
 
     struct stats {
-        size_t _tx_data_batches_discarded{0};
-        size_t _non_tx_control_batches_discarded{0};
-        size_t _all_batches_discarded{0};
-        size_t _num_aborted_txes{0};
-        size_t _all_batches{0};
+        size_t batches_discarded{0};
+        size_t num_aborted_txes{0};
+        size_t batches_processed{0};
 
         friend std::ostream& operator<<(std::ostream& os, const stats& s) {
             fmt::print(
               os,
-              "{{ all_batches: {}, aborted_txs: {}, all "
-              "discarded batches: {}, tx data batches discarded: {}, tx "
-              "non tx control batches discarded: "
-              "{}}}",
-              s._all_batches,
-              s._num_aborted_txes,
-              s._all_batches_discarded,
-              s._tx_data_batches_discarded,
-              s._non_tx_control_batches_discarded);
+              "{{ batches processed: {}, aborted_txs: {}, "
+              "discarded batches: {} }}",
+              s.batches_processed,
+              s.num_aborted_txes,
+              s.batches_discarded);
             return os;
         }
     };
@@ -254,12 +293,13 @@ public:
     stats end_of_stream() { return _stats; }
 
 private:
-    void handle_tx_control_batch(const model::record_batch&);
-    bool handle_tx_data_batch(const model::record_batch&);
-    bool handle_non_tx_control_batch(const model::record_batch&);
-    void consume_aborted_txs(model::offset);
-    model::record_batch
-    make_placeholder_batch(model::offset base, model::offset end);
+    bool can_discard_tx_data_batch(const model::record_batch&);
+    bool can_discard_consumer_offsets_batch(const model::record_batch&);
+    // Refreshes the running list of aborted transactions
+    // based on the encountered input batch. New ongoing aborted
+    // transaction (if any) may be added and finished aborted
+    // transactions are removed if an abort batch is encountered.
+    void refresh_ongoing_aborted_txs(const model::record_batch&);
 
     index_rebuilder_reducer _delegate;
     // A min heap of aborted transactions based on begin offset.
@@ -274,14 +314,41 @@ private:
       _ongoing_aborted_txs;
     ss::lw_shared_ptr<storage::stm_manager> _stm_mgr;
     stats _stats;
-    // Set if no transactional stm is attached to the partition of this
-    // segment. This means there are no batches of interest in this segment
-    // for this reducer and we short circuit the logic to directly delegate to
-    // the underlying reducer. This is true for internal topics like
-    // __consumer_offsets where transactional guarantees are enforced by
-    // stm implementations other than the one used for data partitions.
-    // Also true for partitions without any transactional stms attached.
-    bool _non_transactional;
+    // Set if a transactional stm is attached to this partition.
+    std::optional<storage::stm_type> _transactional_stm_type;
+};
+
+// Builds up a key_offset_map for a segment, starting from the offset
+// start_offset_inclusive. Intended to be used for chunked compaction,
+// in which it is expected that the map will not be able to fit the entire
+// key set of the segment at once due to memory constraints.
+// As many keys as possible will be added to the map from start_offset_inclusive
+// onwards until the capacity limit is reached, or the end of the segment is
+// reached.
+//
+// end_of_stream() returns a bool value indicating whether the segment was fully
+// indexed or not.
+class map_building_reducer : public compaction_reducer {
+public:
+    explicit map_building_reducer(
+      key_offset_map* map, model::offset start_offset_inclusive)
+      : _map(map)
+      , _start_offset(start_offset_inclusive) {}
+
+    ss::future<ss::stop_iteration> operator()(model::record_batch);
+    bool end_of_stream() { return _fully_indexed_segment; }
+
+private:
+    ss::future<ss::stop_iteration> maybe_index_record_in_map(
+      const model::record& r,
+      model::offset base_offset,
+      model::record_batch_type type,
+      bool is_control,
+      bool& fully_indexed_batch);
+
+    key_offset_map* _map;
+    model::offset _start_offset;
+    bool _fully_indexed_segment = true;
 };
 
 } // namespace storage::internal

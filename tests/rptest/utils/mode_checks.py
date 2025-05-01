@@ -66,3 +66,60 @@ def skip_debug_mode(*args, **kwargs):
         return ignore(args, kwargs)
     else:
         return args[0]
+
+
+def in_fips_environment() -> bool:
+    """
+    Returns True if the file /proc/sys/crypto/fips_enabled is present and
+    contains '1', otherwise returns False.
+    """
+    fips_file = "/proc/sys/crypto/fips_enabled"
+    if os.path.exists(fips_file) and os.path.isfile(fips_file):
+        with open(fips_file, 'r') as f:
+            contents = f.read().strip()
+            return contents == '1'
+
+    return False
+
+
+def skip_fips_mode(*args, **kwargs):
+    """
+    Decorator indicating that the test should not run in FIPS mode.
+
+    Ideally all tests should run in FIPS mode. The following are some situations
+    in which skipping FIPS mode is required.
+
+    * Exercising a known non-FIPS condition (e.g. virtual-host vs path style
+    testing).
+
+    * We can't test it in FIPS mode because of infrastructure issues, but the
+    implementation doesn't change between FIPS and non-FIPS (auditing & OCSF
+    server).
+
+    * Certain license tests (since enabling FIPS mode enables enterprise license
+    requirement).
+
+    Example::
+
+        When no parameters are provided to the @ignore decorator, ignore all parametrizations of the test function
+
+        @skip_fips_mode  # Ignore all parametrizations
+        @parametrize(x=1, y=0)
+        @parametrize(x=2, y=3)
+        def the_test(...):
+            ...
+
+    Example::
+
+        If parameters are supplied to the @skip_fips_mode decorator, only skip the parametrization with matching parameter(s)
+
+        @skip_fips_mode(x=2, y=3)
+        @parametrize(x=1, y=0)  # This test will run as usual
+        @parametrize(x=2, y=3)  # This test will be ignored
+        def the_test(...):
+            ...
+    """
+    if in_fips_environment():
+        return ignore(args, kwargs)
+    else:
+        return args[0]

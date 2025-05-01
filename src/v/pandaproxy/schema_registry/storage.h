@@ -12,9 +12,8 @@
 #pragma once
 
 #include "base/vlog.h"
-#include "bytes/iobuf_parser.h"
+#include "json/iobuf_writer.h"
 #include "json/json.h"
-#include "json/stringbuffer.h"
 #include "json/types.h"
 #include "json/writer.h"
 #include "model/metadata.h"
@@ -23,6 +22,7 @@
 #include "pandaproxy/json/rjson_util.h"
 #include "pandaproxy/logger.h"
 #include "pandaproxy/schema_registry/error.h"
+#include "pandaproxy/schema_registry/errors.h"
 #include "pandaproxy/schema_registry/exceptions.h"
 #include "pandaproxy/schema_registry/seq_writer.h"
 #include "pandaproxy/schema_registry/sharded_store.h"
@@ -36,7 +36,8 @@
 namespace pandaproxy::schema_registry {
 
 using topic_key_magic = named_type<int32_t, struct topic_key_magic_tag>;
-enum class topic_key_type { noop = 0, schema, config, delete_subject };
+enum class topic_key_type { noop = 0, schema, config, mode, delete_subject };
+
 constexpr std::string_view to_string_view(topic_key_type kt) {
     switch (kt) {
     case topic_key_type::noop:
@@ -45,6 +46,8 @@ constexpr std::string_view to_string_view(topic_key_type kt) {
         return "SCHEMA";
     case topic_key_type::config:
         return "CONFIG";
+    case topic_key_type::mode:
+        return "MODE";
     case topic_key_type::delete_subject:
         return "DELETE_SUBJECT";
     }
@@ -57,6 +60,7 @@ from_string_view<topic_key_type>(std::string_view sv) {
       .match(to_string_view(topic_key_type::noop), topic_key_type::noop)
       .match(to_string_view(topic_key_type::schema), topic_key_type::schema)
       .match(to_string_view(topic_key_type::config), topic_key_type::config)
+      .match(to_string_view(topic_key_type::mode), topic_key_type::mode)
       .match(
         to_string_view(topic_key_type::delete_subject),
         topic_key_type::delete_subject)
@@ -82,7 +86,7 @@ public:
 
     topic_key_type_handler()
       : ::json::
-        BaseReaderHandler<Encoding, topic_key_type_handler<Encoding>>{} {}
+          BaseReaderHandler<Encoding, topic_key_type_handler<Encoding>>{} {}
 
     bool Key(const Ch* str, ::json::SizeType len, bool) {
         auto sv = std::string_view{str, len};
@@ -157,9 +161,9 @@ struct schema_key {
     }
 };
 
-inline void rjson_serialize(
-  ::json::Writer<::json::StringBuffer>& w,
-  const schema_registry::schema_key& key) {
+template<typename Buffer>
+void rjson_serialize(
+  ::json::Writer<Buffer>& w, const schema_registry::schema_key& key) {
     w.StartObject();
     w.Key("keytype");
     ::json::rjson_serialize(w, to_string_view(key.keytype));
@@ -296,9 +300,8 @@ public:
     }
 };
 
-template<typename Tag>
 struct schema_value {
-    typed_schema<Tag> schema;
+    subject_schema schema;
     schema_version version;
     schema_id id;
     is_deleted deleted{false};
@@ -317,12 +320,8 @@ struct schema_value {
     }
 };
 
-using unparsed_schema_value = schema_value<unparsed_schema_defnition_tag>;
-using canonical_schema_value = schema_value<canonical_schema_definition_tag>;
-
-template<typename Tag>
-inline void rjson_serialize(
-  ::json::Writer<::json::StringBuffer>& w, const schema_value<Tag>& val) {
+template<typename Buffer>
+void rjson_serialize(::json::iobuf_writer<Buffer>& w, const schema_value& val) {
     w.StartObject();
     w.Key("subject");
     ::json::rjson_serialize(w, val.schema.sub());
@@ -357,7 +356,7 @@ inline void rjson_serialize(
     w.EndObject();
 }
 
-template<typename Tag, typename Encoding = ::json::UTF8<>>
+template<typename Encoding = ::json::UTF8<>>
 class schema_value_handler final : public json::base_handler<Encoding> {
     enum class state {
         empty = 0,
@@ -378,15 +377,15 @@ class schema_value_handler final : public json::base_handler<Encoding> {
 
     struct mutable_schema {
         subject sub{invalid_subject};
-        typename typed_schema_definition<Tag>::raw_string def;
+        typename schema_definition::raw_string def;
         schema_type type{schema_type::avro};
-        typename typed_schema_definition<Tag>::references refs;
+        typename schema_definition::references refs;
     };
     mutable_schema _schema;
 
 public:
     using Ch = typename json::base_handler<Encoding>::Ch;
-    using rjson_parse_result = schema_value<Tag>;
+    using rjson_parse_result = schema_value;
     rjson_parse_result result;
 
     schema_value_handler()
@@ -502,8 +501,7 @@ public:
             return true;
         }
         case state::definition: {
-            _schema.def = typename typed_schema_definition<Tag>::raw_string{
-              ss::sstring{sv}};
+            _schema.def = schema_definition::raw_string{sv};
             _state = state::object;
             return true;
         }
@@ -603,13 +601,6 @@ public:
     }
 };
 
-template<typename Encoding = ::json::UTF8<>>
-using unparsed_schema_value_handler
-  = schema_value_handler<unparsed_schema_defnition_tag, Encoding>;
-template<typename Encoding = ::json::UTF8<>>
-using canonical_schema_value_handler
-  = schema_value_handler<canonical_schema_definition_tag, Encoding>;
-
 struct config_key {
     static constexpr topic_key_type keytype{topic_key_type::config};
     std::optional<model::offset> seq;
@@ -641,9 +632,9 @@ struct config_key {
     }
 };
 
-inline void rjson_serialize(
-  ::json::Writer<::json::StringBuffer>& w,
-  const schema_registry::config_key& key) {
+template<typename Buffer>
+void rjson_serialize(
+  ::json::Writer<Buffer>& w, const schema_registry::config_key& key) {
     w.StartObject();
     w.Key("keytype");
     ::json::rjson_serialize(w, to_string_view(key.keytype));
@@ -779,9 +770,9 @@ struct config_value {
     }
 };
 
-inline void rjson_serialize(
-  ::json::Writer<::json::StringBuffer>& w,
-  const schema_registry::config_value& val) {
+template<typename Buffer>
+void rjson_serialize(
+  ::json::Writer<Buffer>& w, const schema_registry::config_value& val) {
     w.StartObject();
     if (val.sub.has_value()) {
         w.Key("subject");
@@ -846,6 +837,241 @@ public:
     }
 };
 
+struct mode_key {
+    static constexpr topic_key_type keytype{topic_key_type::mode};
+    std::optional<model::offset> seq;
+    std::optional<model::node_id> node;
+    std::optional<subject> sub;
+    topic_key_magic magic{0};
+
+    friend bool operator==(const mode_key&, const mode_key&) = default;
+
+    friend std::ostream& operator<<(std::ostream& os, const mode_key& v) {
+        if (v.seq.has_value() && v.node.has_value()) {
+            fmt::print(
+              os,
+              "seq: {} node: {} keytype: {}, subject: {}, magic: {}",
+              *v.seq,
+              *v.node,
+              to_string_view(v.keytype),
+              v.sub.value_or(invalid_subject),
+              v.magic);
+        } else {
+            fmt::print(
+              os,
+              "unsequenced keytype: {}, subject: {}, magic: {}",
+              to_string_view(v.keytype),
+              v.sub.value_or(invalid_subject),
+              v.magic);
+        }
+        return os;
+    }
+};
+
+template<typename Buffer>
+void rjson_serialize(
+  ::json::Writer<Buffer>& w, const schema_registry::mode_key& key) {
+    w.StartObject();
+    w.Key("keytype");
+    ::json::rjson_serialize(w, to_string_view(key.keytype));
+    w.Key("subject");
+    if (key.sub) {
+        ::json::rjson_serialize(w, key.sub.value());
+    } else {
+        w.Null();
+    }
+    w.Key("magic");
+    ::json::rjson_serialize(w, key.magic);
+    if (key.seq.has_value()) {
+        w.Key("seq");
+        ::json::rjson_serialize(w, *key.seq);
+    }
+    if (key.node.has_value()) {
+        w.Key("node");
+        ::json::rjson_serialize(w, *key.node);
+    }
+    w.EndObject();
+}
+
+template<typename Encoding = ::json::UTF8<>>
+class mode_key_handler : public json::base_handler<Encoding> {
+    enum class state {
+        empty = 0,
+        object,
+        keytype,
+        seq,
+        node,
+        subject,
+        magic,
+    };
+    state _state = state::empty;
+
+public:
+    using Ch = typename json::base_handler<Encoding>::Ch;
+    using rjson_parse_result = mode_key;
+    rjson_parse_result result;
+
+    mode_key_handler()
+      : json::base_handler<Encoding>{json::serialization_format::none} {}
+
+    bool Key(const Ch* str, ::json::SizeType len, bool) {
+        auto sv = std::string_view{str, len};
+        std::optional<state> s{string_switch<std::optional<state>>(sv)
+                                 .match("keytype", state::keytype)
+                                 .match("seq", state::seq)
+                                 .match("node", state::node)
+                                 .match("subject", state::subject)
+                                 .match("magic", state::magic)
+                                 .default_match(std::nullopt)};
+        return s.has_value() && std::exchange(_state, *s) == state::object;
+    }
+
+    bool Uint(int i) {
+        switch (_state) {
+        case state::magic: {
+            result.magic = topic_key_magic{i};
+            _state = state::object;
+            return true;
+        }
+        case state::seq: {
+            result.seq = model::offset{i};
+            _state = state::object;
+            return true;
+        }
+        case state::node: {
+            result.node = model::node_id{i};
+            _state = state::object;
+            return true;
+        }
+        case state::empty:
+        case state::subject:
+        case state::keytype:
+        case state::object:
+            return false;
+        }
+        return false;
+    }
+
+    bool String(const Ch* str, ::json::SizeType len, bool) {
+        auto sv = std::string_view{str, len};
+        switch (_state) {
+        case state::keytype: {
+            auto kt = from_string_view<topic_key_type>(sv);
+            _state = state::object;
+            return kt == result.keytype;
+        }
+        case state::subject: {
+            result.sub = subject{ss::sstring{sv}};
+            _state = state::object;
+            return true;
+        }
+        case state::empty:
+        case state::seq:
+        case state::node:
+        case state::object:
+        case state::magic:
+            return false;
+        }
+        return false;
+    }
+
+    bool Null() {
+        // The subject, and only the subject, is nullable.
+        return std::exchange(_state, state::object) == state::subject;
+    }
+
+    bool StartObject() {
+        return std::exchange(_state, state::object) == state::empty;
+    }
+
+    bool EndObject(::json::SizeType) {
+        return result.seq.has_value() == result.node.has_value()
+               && std::exchange(_state, state::empty) == state::object;
+    }
+};
+
+struct mode_value {
+    mode mode{mode::read_write};
+    std::optional<subject> sub;
+
+    friend bool operator==(const mode_value&, const mode_value&) = default;
+
+    friend std::ostream& operator<<(std::ostream& os, const mode_value& v) {
+        if (v.sub.has_value()) {
+            fmt::print(os, "subject: {}, ", v.sub.value());
+        }
+        fmt::print(os, "mode: {}", to_string_view(v.mode));
+
+        return os;
+    }
+};
+
+template<typename Buffer>
+void rjson_serialize(
+  ::json::Writer<Buffer>& w, const schema_registry::mode_value& val) {
+    w.StartObject();
+    if (val.sub.has_value()) {
+        w.Key("subject");
+        ::json::rjson_serialize(w, val.sub.value());
+    }
+    w.Key("mode");
+    ::json::rjson_serialize(w, to_string_view(val.mode));
+    w.EndObject();
+}
+
+template<typename Encoding = ::json::UTF8<>>
+class mode_value_handler : public json::base_handler<Encoding> {
+    enum class state {
+        empty = 0,
+        object,
+        mode,
+        subject,
+    };
+    state _state = state::empty;
+
+public:
+    using Ch = typename json::base_handler<Encoding>::Ch;
+    using rjson_parse_result = mode_value;
+    rjson_parse_result result;
+
+    mode_value_handler()
+      : json::base_handler<Encoding>{json::serialization_format::none} {}
+
+    bool Key(const Ch* str, ::json::SizeType len, bool) {
+        auto sv = std::string_view{str, len};
+        std::optional<state> s{string_switch<std::optional<state>>(sv)
+                                 .match("mode", state::mode)
+                                 .match("subject", state::subject)
+                                 .default_match(std::nullopt)};
+        return s.has_value() && std::exchange(_state, *s) == state::object;
+    }
+
+    bool String(const Ch* str, ::json::SizeType len, bool) {
+        auto sv = std::string_view{str, len};
+        if (_state == state::mode) {
+            auto s = from_string_view<mode>(sv);
+            if (s.has_value()) {
+                result.mode = *s;
+                _state = state::object;
+            }
+            return s.has_value();
+        } else if (_state == state::subject) {
+            result.sub.emplace(sv);
+            _state = state::object;
+            return true;
+        }
+        return false;
+    }
+
+    bool StartObject() {
+        return std::exchange(_state, state::object) == state::empty;
+    }
+
+    bool EndObject(::json::SizeType) {
+        return std::exchange(_state, state::empty) == state::object;
+    }
+};
+
 struct delete_subject_key {
     static constexpr topic_key_type keytype{topic_key_type::delete_subject};
     std::optional<model::offset> seq;
@@ -879,8 +1105,8 @@ struct delete_subject_key {
     }
 };
 
-inline void rjson_serialize(
-  ::json::Writer<::json::StringBuffer>& w, const delete_subject_key& key) {
+template<typename Buffer>
+void rjson_serialize(::json::Writer<Buffer>& w, const delete_subject_key& key) {
     w.StartObject();
     w.Key("keytype");
     ::json::rjson_serialize(w, to_string_view(key.keytype));
@@ -1020,8 +1246,9 @@ struct delete_subject_value {
     }
 };
 
-inline void rjson_serialize(
-  ::json::Writer<::json::StringBuffer>& w, const delete_subject_value& val) {
+template<typename Buffer>
+void rjson_serialize(
+  ::json::Writer<Buffer>& w, const delete_subject_value& val) {
     w.StartObject();
     w.Key("subject");
     ::json::rjson_serialize(w, val.sub);
@@ -1109,17 +1336,13 @@ public:
 
 template<typename Handler, typename... Args>
 auto from_json_iobuf(iobuf&& iobuf, Args&&... args) {
-    auto p = iobuf_parser(std::move(iobuf));
-    auto str = p.read_string(p.bytes_left());
-    return json::rjson_parse(str.data(), Handler{std::forward<Args>(args)...});
+    return json::rjson_parse(
+      std::move(iobuf), Handler{std::forward<Args>(args)...});
 }
 
 template<typename T>
-auto to_json_iobuf(T t) {
-    auto val_js = json::rjson_serialize(t);
-    iobuf buf;
-    buf.append(val_js.data(), val_js.size());
-    return buf;
+auto to_json_iobuf(T&& t) {
+    return json::rjson_serialize_iobuf(std::forward<T>(t));
 }
 
 template<typename Key, typename Value>
@@ -1155,7 +1378,7 @@ struct consume_to_store {
 
         auto key_type = from_string_view<topic_key_type>(key_type_str);
         if (!key_type.has_value()) {
-            vlog(plog.error, "Ignoring keytype: {}", key_type_str);
+            vlog(srlog.error, "Ignoring keytype: {}", key_type_str);
             co_await _sequencer.advance_offset(offset);
             co_return;
         }
@@ -1164,9 +1387,9 @@ struct consume_to_store {
         case topic_key_type::noop:
             break;
         case topic_key_type::schema: {
-            std::optional<unparsed_schema_value> val;
+            std::optional<schema_value> val;
             if (!record.value().empty()) {
-                val.emplace(from_json_iobuf<unparsed_schema_value_handler<>>(
+                val.emplace(from_json_iobuf<schema_value_handler<>>(
                   record.release_value()));
             }
             co_await apply(
@@ -1188,7 +1411,18 @@ struct consume_to_store {
               val);
             break;
         }
-        case topic_key_type::delete_subject:
+        case topic_key_type::mode: {
+            std::optional<mode_value> val;
+            if (!record.value().empty()) {
+                auto value = record.release_value();
+                val.emplace(
+                  from_json_iobuf<mode_value_handler<>>(std::move(value)));
+            }
+            co_await apply(
+              offset, from_json_iobuf<mode_key_handler<>>(std::move(key)), val);
+            break;
+        }
+        case topic_key_type::delete_subject: {
             std::optional<delete_subject_value> val;
             if (!record.value().empty()) {
                 val.emplace(from_json_iobuf<delete_subject_value_handler<>>(
@@ -1201,15 +1435,13 @@ struct consume_to_store {
               std::move(val));
             break;
         }
+        }
 
         co_await _sequencer.advance_offset(offset);
     }
 
-    template<typename Tag>
     ss::future<> apply(
-      model::offset offset,
-      schema_key key,
-      std::optional<schema_value<Tag>> val) {
+      model::offset offset, schema_key key, std::optional<schema_value> val) {
         if (key.magic != 0 && key.magic != 1) {
             throw exception(
               error_code::topic_parse_error,
@@ -1225,7 +1457,7 @@ struct consume_to_store {
         // compatibility, which can't collide.
         if (val && key.seq.has_value() && offset != key.seq) {
             vlog(
-              plog.debug,
+              srlog.debug,
               "Ignoring out of order {} (at offset {})",
               key,
               offset);
@@ -1234,7 +1466,7 @@ struct consume_to_store {
 
         try {
             vlog(
-              plog.debug,
+              srlog.debug,
               "Applying: {} tombstone={} (at offset {})",
               key,
               !val.has_value(),
@@ -1248,11 +1480,9 @@ struct consume_to_store {
                     // tombstone all the records referring to a particular
                     // version, we will see more than one get applied, and
                     // after the first one, the rest will not find it.
-                    if (
-                      e.code() == error_code::subject_not_found
-                      || e.code() == error_code::subject_version_not_found) {
+                    if (failed_subject_schema_lookup(e.code())) {
                         vlog(
-                          plog.debug,
+                          srlog.debug,
                           "Ignoring tombstone at offset={}, subject or version "
                           "already removed ({})",
                           offset,
@@ -1274,7 +1504,7 @@ struct consume_to_store {
                   val->deleted);
             }
         } catch (const exception& e) {
-            vlog(plog.debug, "Error replaying: {}: {}", key, e.what());
+            vlog(srlog.debug, "Error replaying: {}: {}", key, e.what());
         }
     }
 
@@ -1286,7 +1516,7 @@ struct consume_to_store {
         // compatibility, which can't collide.
         if (val && key.seq.has_value() && offset != key.seq) {
             vlog(
-              plog.debug,
+              srlog.debug,
               "Ignoring out of order {} (at offset {})",
               key,
               offset);
@@ -1299,7 +1529,7 @@ struct consume_to_store {
               fmt::format("Unexpected magic: {}", key));
         }
         try {
-            vlog(plog.debug, "Applying: {}", key);
+            vlog(srlog.debug, "Applying: {}", key);
             if (key.sub.has_value()) {
                 if (!val.has_value()) {
                     co_await _store.clear_compatibility(
@@ -1323,11 +1553,66 @@ struct consume_to_store {
                 co_await _store.set_compatibility(val->compat);
             } else {
                 vlog(
-                  plog.warn,
+                  srlog.warn,
                   "Tried to apply config with neither subject nor value");
             }
         } catch (const exception& e) {
-            vlog(plog.debug, "Error replaying: {}: {}", key, e);
+            vlog(srlog.debug, "Error replaying: {}: {}", key, e);
+        }
+    }
+
+    ss::future<>
+    apply(model::offset offset, mode_key key, std::optional<mode_value> val) {
+        // Drop out-of-sequence messages
+        //
+        // Check seq if it was provided, otherwise assume 3rdparty
+        // compatibility, which can't collide.
+        if (val && key.seq.has_value() && offset != key.seq) {
+            vlog(
+              srlog.debug,
+              "Ignoring out of order {} (at offset {})",
+              key,
+              offset);
+            co_return;
+        }
+
+        if (key.magic != 0) {
+            throw exception(
+              error_code::topic_parse_error,
+              fmt::format("Unexpected magic: {}", key));
+        }
+        try {
+            vlog(srlog.debug, "Applying: {}", key);
+            if (key.sub.has_value()) {
+                if (!val.has_value()) {
+                    co_await _store.clear_mode(
+                      seq_marker{
+                        .seq = key.seq,
+                        .node = key.node,
+                        .version{invalid_schema_version}, // Not applicable
+                        .key_type = seq_marker_key_type::mode},
+                      *key.sub,
+                      force::yes);
+                } else {
+                    co_await _store.set_mode(
+                      seq_marker{
+                        .seq = key.seq,
+                        .node = key.node,
+                        .version{invalid_schema_version}, // Not applicable
+                        .key_type = seq_marker_key_type::mode},
+                      *key.sub,
+                      val->mode,
+                      force::yes);
+                }
+            } else if (val.has_value()) {
+                co_await _store.set_mode(val->mode, force::yes);
+            } else {
+                vlog(
+                  srlog.warn,
+                  "Tried to apply mode with neither subject nor value");
+            }
+        } catch (const exception& e) {
+            vlog(srlog.debug, "Error replaying: {}: {}", key, e);
         }
     }
 
@@ -1343,7 +1628,7 @@ struct consume_to_store {
         // compatibility, which can't collide.
         if (val && key.seq.has_value() && offset != key.seq) {
             vlog(
-              plog.debug,
+              srlog.debug,
               "Ignoring out of order {} (at offset {})",
               key,
               offset);
@@ -1356,7 +1641,8 @@ struct consume_to_store {
             // actual removal of subjects/versions happens on hard delete, i.e.
             // the tombstone for the schema/version itself, not the tombstone
             // for the soft deletion.
-            vlog(plog.debug, "Ignoring delete_subject tombstone at {}", offset);
+            vlog(
+              srlog.debug, "Ignoring delete_subject tombstone at {}", offset);
             co_return;
         }
 
@@ -1366,7 +1652,7 @@ struct consume_to_store {
               fmt::format("Unexpected magic: {}", key));
         }
         try {
-            vlog(plog.debug, "Applying: {}", key);
+            vlog(srlog.debug, "Applying: {}", key);
             co_await _store.delete_subject(
               seq_marker{
                 .seq = key.seq,
@@ -1376,9 +1662,10 @@ struct consume_to_store {
               key.sub,
               permanent_delete::no);
         } catch (const exception& e) {
-            vlog(plog.debug, "Error replaying: {}: {}", key, e);
+            vlog(srlog.debug, "Error replaying: {}: {}", key, e);
         }
     }
+
     void end_of_stream() {}
     sharded_store& _store;
     seq_writer& _sequencer;

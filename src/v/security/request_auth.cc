@@ -17,7 +17,6 @@
 #include "seastar/http/exception.hh"
 #include "security/credential_store.h"
 #include "security/oidc_authenticator.h"
-#include "security/scram_algorithm.h"
 #include "security/scram_authenticator.h"
 #include "security/types.h"
 
@@ -57,7 +56,7 @@ request_authenticator::authenticate(const ss::http::request& req) {
     const auto& cred_store = _controller->get_credential_store().local();
     try {
         return do_authenticate(req, cred_store, _require_auth());
-    } catch (ss::httpd::base_exception const& e) {
+    } catch (const ss::httpd::base_exception& e) {
         if (e.status() == ss::http::reply::status_type::unauthorized) {
             if (_require_auth()) {
                 throw;
@@ -76,13 +75,13 @@ request_authenticator::authenticate(const ss::http::request& req) {
 }
 
 request_auth_result request_authenticator::do_authenticate(
-  ss::http::request const& req,
-  security::credential_store const& cred_store,
+  const ss::http::request& req,
+  const security::credential_store& cred_store,
   bool require_auth) {
     constexpr auto supports = [](std::string_view m) {
         return absl::c_any_of(
           config::shard_local_cfg().http_authentication(),
-          [m](auto const& mech) { return m == mech; });
+          [m](const auto& mech) { return m == mech; });
     };
 
     auto auth_hdr = req.get_header("authorization");
@@ -98,7 +97,7 @@ request_auth_result request_authenticator::do_authenticate(
         ss::sstring decoded_bytes;
         try {
             decoded_bytes = base64_to_string(base64);
-        } catch (base64_decoder_exception const&) {
+        } catch (const base64_decoder_exception&) {
             vlog(logger.info, "Client auth failure: bad BASE64 encoding");
             throw ss::httpd::bad_request_exception(
               "Malformed Authorization header");
@@ -124,25 +123,9 @@ request_auth_result request_authenticator::do_authenticate(
             throw unauthorized_user_exception(
               std::move(username), "Unauthorized");
         } else {
-            const auto& cred = cred_opt.value();
-            ss::sstring sasl_mechanism;
-            bool is_valid{false};
-            if (security::scram_sha256::validate_password(
-                  password,
-                  cred.stored_key(),
-                  cred.salt(),
-                  cred.iterations())) {
-                is_valid = true;
-                sasl_mechanism = security::scram_sha256_authenticator::name;
-            } else if (security::scram_sha512::validate_password(
-                         password,
-                         cred.stored_key(),
-                         cred.salt(),
-                         cred.iterations())) {
-                is_valid = true;
-                sasl_mechanism = security::scram_sha512_authenticator::name;
-            }
-            if (!is_valid) {
+            auto sasl_mechanism = validate_scram_credential(
+              *cred_opt, password);
+            if (!sasl_mechanism.has_value()) {
                 // User found, password doesn't match
                 vlog(
                   logger.warn,
@@ -159,7 +142,7 @@ request_auth_result request_authenticator::do_authenticate(
                 return request_auth_result(
                   std::move(username),
                   std::move(password),
-                  std::move(sasl_mechanism),
+                  ss::sstring{*sasl_mechanism},
                   request_auth_result::superuser(superuser));
             }
         }
@@ -244,7 +227,14 @@ void request_auth_result::pass() { _checked = true; }
  * knowing that all our member objects have nothrow destructors.
  */
 request_auth_result::~request_auth_result() noexcept(false) {
-    if (!_checked && !std::current_exception()) {
+    // If another exception is already in flight (e.g., thrown during request
+    // handling between authenticate() and the check), it's acceptable that we
+    // didn't perform the check. We only log the error if there is no active
+    // exception, to avoid confusion where the log suggests an authentication
+    // issue when the real cause might be unrelated.
+    const auto another_exception_in_flight = std::current_exception()
+                                             || std::uncaught_exceptions() > 0;
+    if (!_checked && !another_exception_in_flight) {
         vlog(
           logger.error, "request_auth_result destroyed without being checked!");
 

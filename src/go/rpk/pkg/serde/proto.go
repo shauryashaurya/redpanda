@@ -16,6 +16,7 @@ import (
 
 	"github.com/bufbuild/protocompile"
 	"github.com/bufbuild/protocompile/linker"
+	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/serde/embed"
 	"github.com/twmb/franz-go/pkg/sr"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
@@ -66,7 +67,7 @@ func newProtoEncoder(compiledFiles linker.Files, protoFQN string, schemaID int) 
 	}, nil
 }
 
-// newProtoDecoder will generate a deserializar function that decodes a record
+// newProtoDecoder will generate a deserializer function that decodes a record
 // with the given schema. The generated function expects the record to contain
 // the index of the message (schema ID should already be stripped away) in the
 // first bytes of the record.
@@ -154,18 +155,32 @@ func compileSchema(ctx context.Context, cl *sr.Client, schema *sr.Schema) (linke
 	// This is the original schema.
 	accessorMap[inMemFileName] = schema.Schema
 
-	// And we add the rest of schemas if we have references.
+	// Add Schema References.
 	if len(schema.References) > 0 {
 		err := mapReferences(ctx, cl, schema, accessorMap)
 		if err != nil {
 			return nil, fmt.Errorf("unable to map references: %v", err)
 		}
 	}
-
+	// Redpanda includes another set of common protobuf types in
+	// https://github.com/redpanda-data/redpanda/tree/dev/src/v/pandaproxy/schema_registry/protobuf
+	// We embed it into our source accessor map to keep parity with Redpanda.
+	commonMap, err := embed.CommonProtoFileMap()
+	if err != nil {
+		return nil, fmt.Errorf("unable to get common protobuf types: %v", err)
+	}
+	for commonPath, commonSchema := range commonMap {
+		if _, exists := accessorMap[commonPath]; !exists {
+			accessorMap[commonPath] = commonSchema
+		}
+	}
+	resolver := &protocompile.SourceResolver{
+		Accessor: protocompile.SourceAccessorFromMap(accessorMap),
+	}
 	compiler := protocompile.Compiler{
-		Resolver: &protocompile.SourceResolver{
-			Accessor: protocompile.SourceAccessorFromMap(accessorMap),
-		},
+		// And we finally add a set of well-known protobuf types:
+		// https://github.com/bufbuild/protocompile/blob/main/std_imports.go#L42.
+		Resolver:       protocompile.WithStandardImports(resolver),
 		SourceInfoMode: protocompile.SourceInfoStandard,
 	}
 	compiled, err := compiler.Compile(ctx, inMemFileName)

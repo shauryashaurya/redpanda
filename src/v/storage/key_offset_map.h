@@ -10,7 +10,8 @@
 
 #include "container/fragmented_vector.h"
 #include "hashing/secure.h"
-#include "storage/compacted_index.h"
+#include "model/fundamental.h"
+#include "storage/compaction.h"
 #include "utils/tracking_allocator.h"
 
 #include <seastar/core/future.hh>
@@ -59,6 +60,13 @@ public:
      * Returns the number of entries the map has space allocated for.
      */
     virtual size_t capacity() const = 0;
+
+    /**
+     * Prepares the container for use in a new context by resetting
+     * every element to an initial state. This call does not change the size of
+     * the container.
+     */
+    virtual seastar::future<> reset() = 0;
 };
 
 /**
@@ -85,6 +93,8 @@ public:
 
     size_t size() const override;
     size_t capacity() const override;
+
+    seastar::future<> reset() override;
 
 private:
     ss::shared_ptr<util::mem_tracker> _memory_tracker;
@@ -135,7 +145,7 @@ public:
      * every element to an initial state. This call does not change the size of
      * the container.
      */
-    seastar::future<> reset();
+    seastar::future<> reset() override;
 
     /**
      * The ratio of hash table searches (e.g. one get or put) to the number of
@@ -174,12 +184,14 @@ private:
 
     /**
      * hash the compaction key. this helper will catch exceptions and reset the
-     * hashing object which is reused to avoid reinitialization of gnutls state.
+     * hashing object which is reused to avoid reinitialization of OpenSSL
+     * state.
      */
     hash_type::digest_type hash_key(const compaction_key&) const;
 
     mutable hash_type hasher_;
-    chunked_vector<entry> entries_;
+    using entries_t = chunked_vector<entry>;
+    entries_t entries_;
 
     size_t size_{0};
     model::offset max_offset_;

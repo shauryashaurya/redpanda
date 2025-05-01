@@ -31,11 +31,9 @@ deb_deps=(
   clang-tidy
   cmake
   git
-  gnutls-dev
   golang
   libboost-all-dev
   libc-ares-dev
-  libcrypto++-dev
   libgssapi-krb5-2
   libkrb5-dev
   liblz4-dev
@@ -50,6 +48,7 @@ deb_deps=(
   libzstd-dev
   lld
   ninja-build
+  openssl
   protobuf-compiler
   python3
   python3-jinja2
@@ -68,9 +67,7 @@ fedora_deps=(
   clang-tools-extra
   cmake
   compiler-rt
-  cryptopp-devel
   git
-  gnutls-devel
   golang
   hwloc-devel
   krb5-devel
@@ -83,13 +80,14 @@ fedora_deps=(
   lz4-static
   ninja-build
   numactl-devel
+  openssl
   openssl-devel
   procps
   protobuf-devel
   python3
   python3-jinja2
   python3-jsonschema
-  ragel-devel
+  ragel
   re2-devel
   rust
   snappy-devel
@@ -126,14 +124,24 @@ arch_deps=(
 
 case "$ID" in
   ubuntu | debian | pop)
-    apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get install -y "${deb_deps[@]}"
+    export DEBIAN_FRONTEND=noninteractive
+    apt update
+    apt-get install -y "${deb_deps[@]}"
+    if [[ $CLEAN_PKG_CACHE == true ]]; then
+      rm -rf /var/lib/apt/lists/*
+    fi
     ;;
   fedora)
     dnf install -y "${fedora_deps[@]}"
+    if [[ $CLEAN_PKG_CACHE == true ]]; then
+      dnf clean all
+    fi
     ;;
   arch | manjaro)
     pacman -Sy --needed --noconfirm "${arch_deps[@]}"
+    if [[ $CLEAN_PKG_CACHE == true ]]; then
+      pacman -Sc
+    fi
     ;;
   *)
     echo "Please help us make the script better by sending patches with your OS $ID"

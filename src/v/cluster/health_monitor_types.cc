@@ -23,6 +23,7 @@
 #include <seastar/core/sharded.hh>
 #include <seastar/core/shared_ptr.hh>
 
+#include <fmt/core.h>
 #include <fmt/ostream.h>
 
 #include <algorithm>
@@ -77,43 +78,39 @@ std::ostream& operator<<(std::ostream& o, const node_state& s) {
 node_health_report::node_health_report(
   model::node_id id,
   node::local_state local_state,
-  chunked_vector<topic_status> topics,
-  bool include_drain_status,
+  chunked_vector<topic_status> topics_vec,
   std::optional<drain_manager::drain_status> drain_status)
   : id(id)
   , local_state(std::move(local_state))
-  , topics(std::move(topics))
-  , include_drain_status(include_drain_status)
-  , drain_status(drain_status) {}
-
-node_health_report::node_health_report(const node_health_report& other)
-  : id(other.id)
-  , local_state(other.local_state)
-  , topics()
-  , include_drain_status(other.include_drain_status)
-  , drain_status(other.drain_status) {
-    std::copy(
-      other.topics.cbegin(), other.topics.cend(), std::back_inserter(topics));
+  , drain_status(drain_status) {
+    topics.reserve(topics_vec.size());
+    for (auto& topic : topics_vec) {
+        topics.emplace(std::move(topic.tp_ns), std::move(topic.partitions));
+    }
 }
 
-node_health_report&
-node_health_report::operator=(const node_health_report& other) {
-    if (this == &other) {
-        return *this;
+node_health_report node_health_report::copy() const {
+    node_health_report ret{id, local_state, {}, drain_status};
+    ret.topics.reserve(topics.bucket_count());
+    for (const auto& [tp_ns, partitions] : topics) {
+        ret.topics.emplace(tp_ns, partitions.copy());
     }
-    id = other.id;
-    local_state = other.local_state;
-    include_drain_status = other.include_drain_status;
-    drain_status = other.drain_status;
-    chunked_vector<topic_status> t;
-    t.reserve(other.topics.size());
-    std::copy(
-      other.topics.cbegin(), other.topics.cend(), std::back_inserter(t));
-    topics = std::move(t);
-    return *this;
+    return ret;
 }
 
 std::ostream& operator<<(std::ostream& o, const node_health_report& r) {
+    return o << node_health_report_serde{r};
+}
+
+node_health_report_serde::node_health_report_serde(const node_health_report& hr)
+  : node_health_report_serde(hr.id, hr.local_state, {}, hr.drain_status) {
+    topics.reserve(hr.topics.size());
+    for (const auto& [tp_ns, partitions] : hr.topics) {
+        topics.emplace_back(tp_ns, partitions.copy());
+    }
+}
+
+std::ostream& operator<<(std::ostream& o, const node_health_report_serde& r) {
     fmt::print(
       o,
       "{{id: {}, topics: {}, local_state: {}, drain_status: {}}}",
@@ -123,7 +120,9 @@ std::ostream& operator<<(std::ostream& o, const node_health_report& r) {
       r.drain_status);
     return o;
 }
-bool operator==(const node_health_report& a, const node_health_report& b) {
+
+bool operator==(
+  const node_health_report_serde& a, const node_health_report_serde& b) {
     return a.id == b.id && a.local_state == b.local_state
            && a.drain_status == b.drain_status
            && a.topics.size() == b.topics.size()
@@ -146,11 +145,34 @@ std::ostream& operator<<(std::ostream& o, const cluster_health_report& r) {
     return o;
 }
 
+std::ostream& operator<<(std::ostream& o, follower_status status) {
+    switch (status) {
+    case follower_status::in_sync:
+        return o << "in_sync";
+    case follower_status::out_of_sync:
+        return o << "out_of_sync";
+    case follower_status::down:
+        return o << "down";
+    }
+}
+
+std::ostream& operator<<(std::ostream& o, const followers_stats& ls) {
+    fmt::print(
+      o,
+      "{{in_sync: {}, out_of_sync: {}, down: "
+      "{}}}",
+      ls.in_sync,
+      ls.out_of_sync,
+      ls.down);
+    return o;
+}
+
 std::ostream& operator<<(std::ostream& o, const partition_status& ps) {
     fmt::print(
       o,
       "{{id: {}, term: {}, leader_id: {}, revision_id: {}, size_bytes: {}, "
-      "reclaimable_size_bytes: {}, under_replicated: {}, shard: {}}}",
+      "reclaimable_size_bytes: {}, under_replicated: {}, shard: {}, "
+      "followers_stats: {}}}",
       ps.id,
       ps.term,
       ps.leader_id,
@@ -158,7 +180,8 @@ std::ostream& operator<<(std::ostream& o, const partition_status& ps) {
       ps.size_bytes,
       ps.reclaimable_size_bytes,
       ps.under_replicated_replicas,
-      ps.shard);
+      ps.shard,
+      ps.followers_stats);
     return o;
 }
 
@@ -205,13 +228,7 @@ cluster_health_report cluster_health_report::copy() const {
     r.bytes_in_cloud_storage = bytes_in_cloud_storage;
     r.node_reports.reserve(node_reports.size());
     for (auto& nr : node_reports) {
-        node_health_report nr_copy;
-        nr_copy.id = nr->id;
-        nr_copy.drain_status = nr->drain_status;
-        nr_copy.topics = nr->topics.copy();
-        nr_copy.local_state = nr->local_state;
-
-        r.node_reports.emplace_back(ss::make_lw_shared(std::move(nr_copy)));
+        r.node_reports.emplace_back(ss::make_lw_shared(nr->copy()));
     }
     return r;
 }
@@ -267,8 +284,8 @@ std::ostream& operator<<(std::ostream& o, const partitions_filter& filter) {
     return o;
 }
 
-std::ostream& operator<<(std::ostream& o, const get_node_health_request&) {
-    fmt::print(o, "{{}}");
+std::ostream& operator<<(std::ostream& o, const get_node_health_request& r) {
+    fmt::print(o, "{{target_node_id: {}}}", r.get_target_node_id());
     return o;
 }
 
@@ -290,6 +307,16 @@ std::ostream& operator<<(std::ostream& o, const get_cluster_health_request& r) {
 std::ostream& operator<<(std::ostream& o, const get_cluster_health_reply& r) {
     fmt::print(o, "{{error: {}, report: {}}}", r.error, r.report);
     return o;
+}
+
+void restart_risk_report::push(
+  partitions_t restart_risk_report::*member,
+  const model::topic_namespace& nt,
+  model::partition_id pid) {
+    auto& list = this->*member;
+    if (list.size() < limit) {
+        list.emplace_back(nt.ns, nt.tp, pid);
+    }
 }
 
 std::ostream& operator<<(std::ostream& o, const cluster_health_overview& ho) {

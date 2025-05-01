@@ -13,7 +13,7 @@ import tempfile
 from rptest.clients.types import TopicSpec
 import json
 from ducktape.utils.util import wait_until
-from typing import Any, Optional, Sequence, cast
+from typing import Any, Optional, Sequence, cast, NamedTuple
 import os
 
 from rptest.services.keycloak import OAuthConfig
@@ -52,19 +52,40 @@ class KafkaCliToolsError(subprocess.CalledProcessError):
         return self.msg
 
 
+class KafkaDeleteOffsetsResponse(NamedTuple):
+    topic: str
+    partition: int
+    new_start_offset: int
+    error_msg: str
+
+
 class KafkaCliTools:
     """
     Wrapper around the Kafka admin command line tools.
     """
 
-    # See tests/docker/Dockerfile to add new versions
-    VERSIONS = ("3.0.0", "2.7.0", "2.5.0", "2.4.1", "2.3.1")
+    # See tests/docker/ducktape-deps/kafka-tools to add new versions
+    VERSIONS = ("3.9.0", "3.8.0", "3.7.0", "3.0.0", "2.7.0", "2.5.0", "2.4.1",
+                "2.3.1")
+
+    @classmethod
+    def _version_tuple(cls, v: str) -> tuple[int, ...]:
+        return tuple(map(int, v.split('.')))
+
+    @classmethod
+    def min_version(cls) -> str:
+        return min(cls.VERSIONS, key=cls._version_tuple)
+
+    @classmethod
+    def max_version(cls) -> str:
+        return max(cls.VERSIONS, key=cls._version_tuple)
 
     def __init__(self,
                  redpanda: RedpandaServiceForClients,
                  version: str | None = None,
                  user: str | None = None,
                  passwd: str | None = None,
+                 algorithm: str | None = 'SCRAM-SHA-256',
                  protocol: str = 'SASL_PLAINTEXT',
                  oauth_cfg: OAuthConfig | None = None):
         self._redpanda = redpanda
@@ -87,7 +108,7 @@ class KafkaCliTools:
             if user:
                 security = security.override(user,
                                              passwd,
-                                             'SCRAM-SHA-256',
+                                             algorithm,
                                              tls_enabled=None)
 
             if sasl := security.simple_credentials():
@@ -118,14 +139,23 @@ sasl.login.callback.handler.class=io.strimzi.kafka.oauth.client.JaasClientOauthL
             self._command_config = None
 
     @classmethod
-    def instances(cls):
+    def instances(cls,
+                  min_version: Optional[str] = None,
+                  max_version: Optional[str] = None):
+        min_version = min_version or cls.min_version()
+        max_version = max_version or cls.max_version()
+
         def make_factory(version: str):
             def factory(redpanda: RedpandaServiceForClients):
                 return cls(redpanda, version)
 
             return factory
 
-        return list(map(make_factory, cls.VERSIONS))
+        return [
+            make_factory(v) for v in cls.VERSIONS
+            if cls._version_tuple(min_version) <= cls._version_tuple(v) <=
+            cls._version_tuple(max_version)
+        ]
 
     def create_topic(self, spec: TopicSpec):
         self._redpanda.logger.debug("Creating topic: %s", spec.name)
@@ -145,6 +175,15 @@ sasl.login.callback.handler.class=io.strimzi.kafka.oauth.client.JaasClientOauthL
             args += ["--config", f"retention.ms={spec.retention_ms}"]
         if spec.max_message_bytes:
             args += ["--config", f"max.message.bytes={spec.max_message_bytes}"]
+        if spec.delete_retention_ms:
+            args += [
+                "--config", f"delete.retention.ms={spec.delete_retention_ms}"
+            ]
+        if spec.min_cleanable_dirty_ratio is not None:
+            args += [
+                "--config",
+                f"min.cleanable.dirty.ratio={spec.min_cleanable_dirty_ratio}"
+            ]
         return self._run("kafka-topics.sh", args, desc="create_topic")
 
     def create_topic_partitions(self, topic: str, partitions: int):
@@ -234,10 +273,16 @@ sasl.login.callback.handler.class=io.strimzi.kafka.oauth.client.JaasClientOauthL
 
         assert configs is not None, "didn't find Configs: section"
 
-        def maybe_int(key: str, value: str):
-            if key in ["retention_ms", "retention_bytes", 'segment_bytes']:
+        def maybe_convert_value(key: str, value: str):
+            if key in [
+                    "retention_ms", "retention_bytes", 'segment_bytes',
+                    'delete_retention_ms'
+            ]:
                 return int(value)
-            return value
+            elif key in ['min_cleanable_dirty_ratio']:
+                return float(value)
+            else:
+                return value
 
         def fix_key(key: str):
             return key.replace(".", "_")
@@ -249,7 +294,10 @@ sasl.login.callback.handler.class=io.strimzi.kafka.oauth.client.JaasClientOauthL
         ]
 
         configs = {fix_key(kv[0].strip()): kv[1].strip() for kv in configs}
-        configs = {kv[0]: maybe_int(kv[0], kv[1]) for kv in configs.items()}
+        configs = {
+            kv[0]: maybe_convert_value(kv[0], kv[1])
+            for kv in configs.items()
+        }
         configs["replication_factor"] = replication_factor
         configs["partition_count"] = partitions
         # The cast below is needed because a dict cannot be unpacked as keyword args
@@ -313,7 +361,9 @@ sasl.login.callback.handler.class=io.strimzi.kafka.oauth.client.JaasClientOauthL
                 record_size: int,
                 acks: int = -1,
                 throughput: int = -1,
-                batch_size: int = 81960):
+                batch_size: int = 81960,
+                linger_ms: int = 0,
+                enable_idempotence: bool = True):
         self._redpanda.logger.debug("Producing to topic: %s", topic)
         cmd = [self._script("kafka-producer-perf-test.sh")]
         cmd += ["--topic", topic]
@@ -322,13 +372,77 @@ sasl.login.callback.handler.class=io.strimzi.kafka.oauth.client.JaasClientOauthL
         cmd += ["--throughput", str(throughput)]
         cmd += [
             "--producer-props",
-            "acks=%d" % acks, "client.id=ducktape",
+            "acks=%d" % acks,
+            "client.id=ducktape",
             "batch.size=%d" % batch_size,
-            "bootstrap.servers=%s" % self._redpanda.brokers()
+            "bootstrap.servers=%s" % self._redpanda.brokers(),
+            "linger.ms=%d" % linger_ms,
         ]
+        if enable_idempotence is False:
+            cmd += ["enable.idempotence=false"]
         if self._command_config:
             cmd += ["--producer.config", self._command_config.name]
         return self._execute(cmd, "produce")
+
+    def delete_records(self, offsets: dict[str, Any]):
+        """
+        `offsets` is of expected form e.g.:
+        {"partitions":
+         [{"topic": "topic_name",
+                    "partition": 0,
+                    "offset": 10},
+          {"topic": "topic_name",
+                    "partition": 1,
+                    "offset": 15}
+         ],
+         "version": 1
+        }
+        """
+
+        self._redpanda.logger.debug(f"Delete records with json {offsets}")
+        assert "version" in offsets
+        assert offsets["version"] == 1
+        assert "partitions" in offsets
+
+        json_file = tempfile.NamedTemporaryFile(mode="w", delete=False)
+        output = None
+
+        try:
+            json.dump(offsets, json_file)
+            json_file.close()
+            args: list[str] = ["--offset-json-file", json_file.name]
+            output = self._run("kafka-delete-records.sh",
+                               args,
+                               desc="delete_records")
+        finally:
+            os.remove(json_file.name)
+
+        result_list: list[KafkaDeleteOffsetsResponse] = []
+
+        split_str = output.split('\n')
+        assert split_str[-1] == ""
+        partition_watermark_lines = split_str[2:-1]
+        for partition_watermark_line in partition_watermark_lines:
+            if not partition_watermark_line.startswith("partition: "):
+                continue
+            topic_partition_str, result_str = partition_watermark_line.strip(
+            ).split('\t')
+            topic_partition_str_split = topic_partition_str.split(
+                "partition: ")[1]
+            topic_partition_split_index = topic_partition_str_split.rfind('-')
+            topic_str = topic_partition_str_split[:topic_partition_split_index]
+            partition_str = topic_partition_str_split[
+                topic_partition_split_index:]
+            new_start_offset = -1
+            error_msg = ""
+            if "error" in result_str:
+                error_msg = result_str.split("error: ")[1]
+            elif "low_watermark" in result_str:
+                new_start_offset = int(result_str.split("low_watermark: ")[1])
+            result_list.append(
+                KafkaDeleteOffsetsResponse(topic_str, int(partition_str),
+                                           new_start_offset, error_msg))
+        return result_list
 
     def list_acls(self):
         args = ["--list"]
@@ -410,7 +524,7 @@ sasl.login.callback.handler.class=io.strimzi.kafka.oauth.client.JaasClientOauthL
         split_str = res.split("\n")
         info_str = split_str[0]
         info_key = info_str.strip().split("\t")
-        assert info_key == expected_columns, f"{info_key}"
+        assert info_key == expected_columns, f"{info_key} vs {expected_columns}"
 
         assert split_str[-1] == ""
 

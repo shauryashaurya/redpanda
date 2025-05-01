@@ -13,10 +13,11 @@
 #include "model/tests/random_batch.h"
 #include "model/tests/randoms.h"
 #include "model/transform.h"
+#include "schema/registry.h"
 #include "test_utils/randoms.h"
-#include "wasm/api.h"
+#include "test_utils/runfiles.h"
+#include "wasm/engine.h"
 #include "wasm/logger.h"
-#include "wasm/schema_registry.h"
 #include "wasm/tests/wasm_logger.h"
 #include "wasm/transform_probe.h"
 #include "wasm/wasmtime.h"
@@ -28,7 +29,8 @@
 #include <seastar/testing/perf_tests.hh>
 #include <seastar/util/file.hh>
 
-#include <chrono>
+#include <absl/strings/ascii.h>
+
 #include <cstdlib>
 #include <memory>
 #include <unistd.h>
@@ -45,7 +47,7 @@ public:
     WasmBenchTest& operator=(WasmBenchTest&&) = delete;
     ~WasmBenchTest() { cleanup().get(); }
 
-    ss::future<> load(std::string_view filename) {
+    ss::future<> load(std::filesystem::path file) {
         if (_engine) {
             co_await _engine->stop();
         }
@@ -54,8 +56,8 @@ public:
             _runtime = wasm::wasmtime::create_runtime(nullptr);
             constexpr wasm::runtime::config wasm_runtime_config {
                 .heap_memory = {
-                  .per_core_pool_size_bytes = 20_MiB,
-                  .per_engine_memory_limit = 20_MiB,
+                  .per_core_pool_size_bytes = 64_MiB,
+                  .per_engine_memory_limit = 64_MiB,
                 },
                 .stack_memory = {
                   .debug_host_stack_usage = false,
@@ -75,8 +77,15 @@ public:
         };
         auto wasm_binary = model::wasm_binary_iobuf(std::make_unique<iobuf>());
         {
-            auto data = co_await ss::util::read_entire_file_contiguous(
-              filename);
+            auto path
+              = test_utils::get_runfile_path(
+                  std::string(
+                    std::filesystem::path(
+                      "src/transform-sdk/go/transform/internal/testdata")
+                    / file.stem() / file.filename()))
+                  .value_or(std::string(file));
+            fmt::print(std::cerr, "Loading wasm file: {}\n", path);
+            auto data = co_await ss::util::read_entire_file_contiguous(path);
             wasm_binary()->append(data.data(), data.size());
         }
         auto factory = co_await _runtime->make_factory(

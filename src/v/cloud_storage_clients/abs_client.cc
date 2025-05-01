@@ -50,7 +50,6 @@ constexpr boost::beast::string_view delete_snapshot_name
 constexpr boost::beast::string_view is_hns_enabled_name = "x-ms-is-hns-enabled";
 constexpr boost::beast::string_view delete_snapshot_value = "include";
 constexpr boost::beast::string_view error_code_name = "x-ms-error-code";
-constexpr boost::beast::string_view content_type_name = "Content-Type";
 constexpr boost::beast::string_view expiry_option_name = "x-ms-expiry-option";
 constexpr boost::beast::string_view expiry_option_value = "RelativeToNow";
 constexpr boost::beast::string_view expiry_time_name = "x-ms-expiry-time";
@@ -73,23 +72,6 @@ bool is_error_retryable(
 } // namespace
 
 namespace cloud_storage_clients {
-
-enum class response_content_type : int8_t { unknown, xml, json };
-
-static response_content_type
-get_response_content_type(const http::client::response_header& headers) {
-    if (auto iter = headers.find(content_type_name); iter != headers.end()) {
-        if (iter->value().find("json") != std::string_view::npos) {
-            return response_content_type::json;
-        }
-
-        if (iter->value().find("xml") != std::string_view::npos) {
-            return response_content_type::xml;
-        }
-    }
-
-    return response_content_type::unknown;
-}
 
 static abs_rest_error_response
 parse_xml_rest_error_response(boost::beast::http::status result, iobuf buf) {
@@ -178,8 +160,8 @@ abs_request_creator::abs_request_creator(
   , _apply_credentials{std::move(apply_credentials)} {}
 
 result<http::client::request_header> abs_request_creator::make_get_blob_request(
-  bucket_name const& name,
-  object_key const& key,
+  const bucket_name& name,
+  const object_key& key,
   std::optional<http_byte_range> byte_range) {
     // GET /{container-id}/{blob-id} HTTP/1.1
     // Host: {storage-account-id}.blob.core.windows.net
@@ -205,12 +187,12 @@ result<http::client::request_header> abs_request_creator::make_get_blob_request(
     if (error_code) {
         return error_code;
     }
-
+    util::url_encode_target(header);
     return header;
 }
 
 result<http::client::request_header> abs_request_creator::make_put_blob_request(
-  bucket_name const& name, object_key const& key, size_t payload_size_bytes) {
+  const bucket_name& name, const object_key& key, size_t payload_size_bytes) {
     // PUT /{container-id}/{blob-id} HTTP/1.1
     // Host: {storage-account-id}.blob.core.windows.net
     // x-ms-date:{req-datetime in RFC9110} # added by 'add_auth'
@@ -235,13 +217,13 @@ result<http::client::request_header> abs_request_creator::make_put_blob_request(
     if (error_code) {
         return error_code;
     }
-
+    util::url_encode_target(header);
     return header;
 }
 
 result<http::client::request_header>
 abs_request_creator::make_get_blob_metadata_request(
-  bucket_name const& name, object_key const& key) {
+  const bucket_name& name, const object_key& key) {
     // HEAD /{container-id}/{blob-id}?comp=metadata HTTP/1.1
     // Host: {storage-account-id}.blob.core.windows.net
     // x-ms-date:{req-datetime in RFC9110} # added by 'add_auth'
@@ -260,13 +242,13 @@ abs_request_creator::make_get_blob_metadata_request(
     if (error_code) {
         return error_code;
     }
-
+    util::url_encode_target(header);
     return header;
 }
 
 result<http::client::request_header>
 abs_request_creator::make_delete_blob_request(
-  bucket_name const& name, object_key const& key) {
+  const bucket_name& name, const object_key& key) {
     // DELETE /{container-id}/{blob-id} HTTP/1.1
     // Host: {storage-account-id}.blob.core.windows.net
     // x-ms-date:{req-datetime in RFC9110} # added by 'add_auth'
@@ -286,7 +268,7 @@ abs_request_creator::make_delete_blob_request(
     if (error_code) {
         return error_code;
     }
-
+    util::url_encode_target(header);
     return header;
 }
 
@@ -295,11 +277,11 @@ abs_request_creator::make_list_blobs_request(
   const bucket_name& name,
   bool files_only,
   std::optional<object_key> prefix,
-  [[maybe_unused]] std::optional<object_key> start_after,
-  std::optional<size_t> max_keys,
+  std::optional<size_t> max_results,
+  std::optional<ss::sstring> marker,
   std::optional<char> delimiter) {
     // GET /{container-id}?restype=container&comp=list&prefix={prefix}...
-    // ...&max_results{max_keys}
+    // ...&maxresults{max_keys}
     // HTTP/1.1 Host: {storage-account-id}.blob.core.windows.net
     // x-ms-date:{req-datetime in RFC9110} # added by 'add_auth'
     // x-ms-version:"2023-01-23"           # added by 'add_auth'
@@ -309,12 +291,16 @@ abs_request_creator::make_list_blobs_request(
         target += fmt::format("&prefix={}", prefix.value()().string());
     }
 
-    if (max_keys) {
-        target += fmt::format("&max_results={}", max_keys.value());
+    if (max_results) {
+        target += fmt::format("&maxresults={}", max_results.value());
     }
 
     if (delimiter) {
         target += fmt::format("&delimiter={}", delimiter.value());
+    }
+
+    if (marker.has_value()) {
+        target += fmt::format("&marker={}", marker.value());
     }
 
     if (files_only) {
@@ -332,7 +318,7 @@ abs_request_creator::make_list_blobs_request(
     if (error_code) {
         return error_code;
     }
-
+    util::url_encode_target(header);
     return header;
 }
 
@@ -351,14 +337,15 @@ abs_request_creator::make_get_account_info_request() {
     if (error_code) {
         return error_code;
     }
+    util::url_encode_target(header);
 
     return header;
 }
 
 result<http::client::request_header>
 abs_request_creator::make_set_expiry_to_blob_request(
-  bucket_name const& name,
-  object_key const& key,
+  const bucket_name& name,
+  const object_key& key,
   ss::lowres_clock::duration expires_in) const {
     // https://learn.microsoft.com/en-us/rest/api/storageservices/set-blob-expiry?tabs=microsoft-entra-id
     // available only if HNS are enabled for the bucket
@@ -384,14 +371,15 @@ abs_request_creator::make_set_expiry_to_blob_request(
         error_code != std::error_code{}) {
         return error_code;
     }
+    util::url_encode_target(header);
     return header;
 }
 
 result<http::client::request_header>
 abs_request_creator::make_delete_file_request(
   const access_point_uri& adls_ap,
-  bucket_name const& name,
-  object_key const& path) {
+  const bucket_name& name,
+  const object_key& path) {
     // DELETE /{container-id}/{path} HTTP/1.1
     // Host: {storage-account-id}.dfs.core.windows.net
     // x-ms-date:{req-datetime in RFC9110} # added by 'add_auth'
@@ -410,7 +398,7 @@ abs_request_creator::make_delete_file_request(
     if (error_code) {
         return error_code;
     }
-
+    util::url_encode_target(header);
     return header;
 }
 
@@ -418,8 +406,8 @@ abs_client::abs_client(
   const abs_configuration& conf,
   ss::lw_shared_ptr<const cloud_roles::apply_credentials> apply_credentials)
   : _data_lake_v2_client_config(
-    conf.is_hns_enabled ? std::make_optional(conf.make_adls_configuration())
-                        : std::nullopt)
+      conf.is_hns_enabled ? std::make_optional(conf.make_adls_configuration())
+                          : std::nullopt)
   , _is_oauth(apply_credentials->is_oauth())
   , _requestor(conf, std::move(apply_credentials))
   , _client(conf)
@@ -435,8 +423,8 @@ abs_client::abs_client(
   const ss::abort_source& as,
   ss::lw_shared_ptr<const cloud_roles::apply_credentials> apply_credentials)
   : _data_lake_v2_client_config(
-    conf.is_hns_enabled ? std::make_optional(conf.make_adls_configuration())
-                        : std::nullopt)
+      conf.is_hns_enabled ? std::make_optional(conf.make_adls_configuration())
+                          : std::nullopt)
   , _is_oauth(apply_credentials->is_oauth())
   , _requestor(conf, std::move(apply_credentials))
   , _client(conf, &as, conf._probe, conf.max_idle_time)
@@ -482,7 +470,7 @@ ss::future<> abs_client::stop() {
     vlog(abs_log.debug, "Stopped ABS client");
 }
 
-void abs_client::shutdown() { _client.shutdown(); }
+void abs_client::shutdown() { _client.shutdown_now(); }
 
 template<typename T>
 ss::future<result<T, error_outcome>> abs_client::send_request(
@@ -537,6 +525,14 @@ ss::future<result<T, error_outcome>> abs_client::send_request(
             vlog(abs_log.debug, "BlobNotFound response received {}", key);
             outcome = error_outcome::key_not_found;
             _probe->register_failure(err.code());
+        } else if (
+          err.code() == abs_error_code::operation_not_supported_on_directory) {
+            vlog(
+              abs_log.debug,
+              "OperationNotSupportedOnDirectory response received {}",
+              key);
+            outcome = error_outcome::operation_not_supported;
+            _probe->register_failure(err.code());
         } else {
             vlog(
               abs_log.error,
@@ -559,8 +555,8 @@ ss::future<result<T, error_outcome>> abs_client::send_request(
 
 ss::future<result<http::client::response_stream_ref, error_outcome>>
 abs_client::get_object(
-  bucket_name const& name,
-  object_key const& key,
+  const bucket_name& name,
+  const object_key& key,
   ss::lowres_clock::duration timeout,
   bool expect_no_such_key,
   std::optional<http_byte_range> byte_range) {
@@ -572,8 +568,8 @@ abs_client::get_object(
 }
 
 ss::future<http::client::response_stream_ref> abs_client::do_get_object(
-  bucket_name const& name,
-  object_key const& key,
+  const bucket_name& name,
+  const object_key& key,
   ss::lowres_clock::duration timeout,
   bool expect_no_such_key,
   std::optional<http_byte_range> byte_range) {
@@ -614,7 +610,7 @@ ss::future<http::client::response_stream_ref> abs_client::do_get_object(
               response_stream->get_headers());
         }
 
-        const auto content_type = get_response_content_type(
+        const auto content_type = util::get_response_content_type(
           response_stream->get_headers());
         auto buf = co_await util::drain_response_stream(
           std::move(response_stream));
@@ -626,13 +622,15 @@ ss::future<http::client::response_stream_ref> abs_client::do_get_object(
 
 ss::future<result<abs_client::no_response, error_outcome>>
 abs_client::put_object(
-  bucket_name const& name,
-  object_key const& key,
+  const bucket_name& name,
+  const object_key& key,
   size_t payload_size,
   ss::input_stream<char> body,
-  ss::lowres_clock::duration timeout) {
+  ss::lowres_clock::duration timeout,
+  bool accept_no_content) {
     return send_request(
-      do_put_object(name, key, payload_size, std::move(body), timeout)
+      do_put_object(
+        name, key, payload_size, std::move(body), timeout, accept_no_content)
         .then(
           []() { return ss::make_ready_future<no_response>(no_response{}); }),
       key,
@@ -640,11 +638,12 @@ abs_client::put_object(
 }
 
 ss::future<> abs_client::do_put_object(
-  bucket_name const& name,
-  object_key const& key,
+  const bucket_name& name,
+  const object_key& key,
   size_t payload_size,
   ss::input_stream<char> body,
-  ss::lowres_clock::duration timeout) {
+  ss::lowres_clock::duration timeout,
+  bool accept_no_content) {
     auto header = _requestor.make_put_blob_request(name, key, payload_size);
     if (!header) {
         co_await body.close();
@@ -664,8 +663,12 @@ ss::future<> abs_client::do_put_object(
     vassert(response_stream->is_header_done(), "Header is not received");
 
     const auto status = response_stream->get_headers().result();
-    if (status != boost::beast::http::status::created) {
-        const auto content_type = get_response_content_type(
+    using enum boost::beast::http::status;
+
+    if (const auto is_no_content_and_accepted = accept_no_content
+                                                && status == no_content;
+        status != created && !is_no_content_and_accepted) {
+        const auto content_type = util::get_response_content_type(
           response_stream->get_headers());
         auto buf = co_await util::drain_response_stream(
           std::move(response_stream));
@@ -675,15 +678,15 @@ ss::future<> abs_client::do_put_object(
 
 ss::future<result<abs_client::head_object_result, error_outcome>>
 abs_client::head_object(
-  bucket_name const& name,
-  object_key const& key,
+  const bucket_name& name,
+  const object_key& key,
   ss::lowres_clock::duration timeout) {
     return send_request(do_head_object(name, key, timeout), key);
 }
 
 ss::future<abs_client::head_object_result> abs_client::do_head_object(
-  bucket_name const& name,
-  object_key const& key,
+  const bucket_name& name,
+  const object_key& key,
   ss::lowres_clock::duration timeout) {
     auto header = _requestor.make_get_blob_metadata_request(name, key);
     if (!header) {
@@ -727,20 +730,34 @@ abs_client::delete_object(
                  }),
                  key)
           .then([&name, &key](const ret_t& result) {
-              // ABS returns a 404 for attempts to delete a blob that doesn't
-              // exist. The remote doesn't expect this, so we map 404s to a
-              // successful response.
-              if (!result && result.error() == error_outcome::key_not_found) {
-                  vlog(
-                    abs_log.debug,
-                    "Object to be deleted was not found in cloud storage: "
-                    "object={}, bucket={}. Ignoring ...",
-                    name,
-                    key);
-                  return ss::make_ready_future<ret_t>(no_response{});
-              } else {
-                  return ss::make_ready_future<ret_t>(result);
+              if (!result) {
+                  if (result.error() == error_outcome::key_not_found) {
+                      // ABS returns a 404 for attempts to delete a blob that
+                      // doesn't exist. The remote doesn't expect this, so we
+                      // map 404s to a successful response.
+                      vlog(
+                        abs_log.debug,
+                        "Object to be deleted was not found in cloud storage: "
+                        "object={}, bucket={}. Ignoring ...",
+                        name,
+                        key);
+                      return ss::make_ready_future<ret_t>(no_response{});
+                  } else if (
+                    result.error() == error_outcome::operation_not_supported) {
+                      // ABS does not allow for deletion of directories when HNS
+                      // is disabled. The "folder" is "removed" when all blobs
+                      // inside of it are deleted. Map this to a successful
+                      // response.
+                      vlog(
+                        abs_log.warn,
+                        "Cannot delete a directory in ABS cloud storage: "
+                        "object={}, bucket={}. Ignoring ...",
+                        name,
+                        key);
+                      return ss::make_ready_future<ret_t>(no_response{});
+                  }
               }
+              return ss::make_ready_future<ret_t>(result);
           });
     } else {
         return delete_path(name, key, timeout);
@@ -768,7 +785,7 @@ ss::future<> abs_client::do_delete_object(
 
     const auto status = response_stream->get_headers().result();
     if (status != boost::beast::http::status::accepted) {
-        const auto content_type = get_response_content_type(
+        const auto content_type = util::get_response_content_type(
           response_stream->get_headers());
         auto buf = co_await util::drain_response_stream(
           std::move(response_stream));
@@ -800,7 +817,7 @@ ss::future<result<abs_client::list_bucket_result, error_outcome>>
 abs_client::list_objects(
   const bucket_name& name,
   std::optional<object_key> prefix,
-  std::optional<object_key> start_after,
+  [[maybe_unused]] std::optional<object_key> start_after,
   std::optional<size_t> max_keys,
   std::optional<ss::sstring> continuation_token,
   ss::lowres_clock::duration timeout,
@@ -810,7 +827,6 @@ abs_client::list_objects(
       do_list_objects(
         name,
         std::move(prefix),
-        std::move(start_after),
         max_keys,
         std::move(continuation_token),
         timeout,
@@ -822,18 +838,17 @@ abs_client::list_objects(
 ss::future<abs_client::list_bucket_result> abs_client::do_list_objects(
   const bucket_name& name,
   std::optional<object_key> prefix,
-  std::optional<object_key> start_after,
-  std::optional<size_t> max_keys,
-  [[maybe_unused]] std::optional<ss::sstring> continuation_token,
+  std::optional<size_t> max_results,
+  std::optional<ss::sstring> marker,
   ss::lowres_clock::duration timeout,
   std::optional<char> delimiter,
-  std::optional<item_filter>) {
+  std::optional<item_filter> collect_item_if) {
     auto header = _requestor.make_list_blobs_request(
       name,
       _adls_client.has_value(),
       std::move(prefix),
-      std::move(start_after),
-      max_keys,
+      max_results,
+      std::move(marker),
       delimiter);
     if (!header) {
         vlog(
@@ -851,7 +866,7 @@ ss::future<abs_client::list_bucket_result> abs_client::do_list_objects(
     const auto status = response_stream->get_headers().result();
 
     if (status != boost::beast::http::status::ok) {
-        const auto content_type = get_response_content_type(
+        const auto content_type = util::get_response_content_type(
           response_stream->get_headers());
         iobuf buf = co_await util::drain_response_stream(response_stream);
         throw parse_rest_error_response(content_type, status, std::move(buf));
@@ -860,8 +875,9 @@ ss::future<abs_client::list_bucket_result> abs_client::do_list_objects(
     co_return co_await ss::do_with(
       response_stream->as_input_stream(),
       xml_sax_parser{},
-      [](ss::input_stream<char>& stream, xml_sax_parser& p) mutable {
-          p.start_parse(std::make_unique<abs_parse_impl>());
+      [pred = std::move(collect_item_if)](
+        ss::input_stream<char>& stream, xml_sax_parser& p) mutable {
+          p.start_parse(std::make_unique<abs_parse_impl>(std::move(pred)));
           return ss::do_until(
                    [&stream] { return stream.eof(); },
                    [&stream, &p] {
@@ -924,7 +940,7 @@ abs_client::do_test_set_expiry_on_dummy_file(
 
     co_await response_stream->prefetch_headers();
     vassert(response_stream->is_header_done(), "Header is not received");
-    auto const& headers = response_stream->get_headers();
+    const auto& headers = response_stream->get_headers();
 
     if (headers.result() == boost::beast::http::status::bad_request) {
         if (auto error_code_it = headers.find(error_code_name);
@@ -1013,7 +1029,7 @@ ss::future<> abs_client::do_delete_file(
     if (
       status != boost::beast::http::status::accepted
       && status != boost::beast::http::status::ok) {
-        const auto content_type = get_response_content_type(
+        const auto content_type = util::get_response_content_type(
           response_stream->get_headers());
         auto buf = co_await util::drain_response_stream(
           std::move(response_stream));
@@ -1043,7 +1059,9 @@ ss::future<> abs_client::do_delete_path(
         try {
             co_await do_delete_file(name, *iter, timeout);
         } catch (const abs_rest_error_response& abs_error) {
-            if (abs_error.code() == abs_error_code::path_not_found) {
+            if (
+              abs_error.code() == abs_error_code::path_not_found
+              || abs_error.code() == abs_error_code::blob_not_found) {
                 vlog(
                   abs_log.debug,
                   "Object to be deleted was not found in cloud storage: "

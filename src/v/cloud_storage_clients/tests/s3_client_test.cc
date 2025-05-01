@@ -15,6 +15,7 @@
 #include "cloud_storage_clients/client_pool.h"
 #include "cloud_storage_clients/s3_client.h"
 #include "hashing/secure.h"
+#include "http/tests/utils.h"
 #include "net/dns.h"
 #include "net/types.h"
 #include "test_utils/fixture.h"
@@ -31,6 +32,7 @@
 #include <seastar/http/function_handlers.hh>
 #include <seastar/http/handlers.hh>
 #include <seastar/http/httpd.hh>
+#include <seastar/http/request.hh>
 #include <seastar/http/routes.hh>
 #include <seastar/net/api.hh>
 #include <seastar/net/socket_defs.hh>
@@ -52,7 +54,7 @@
 using namespace std::chrono_literals;
 
 static const uint16_t httpd_port_number = 4434;
-static constexpr const char* httpd_host_name = "127.0.0.1";
+static constexpr const char* httpd_host_name = "localhost";
 static constexpr const char* expected_payload
   = "Amazon Simple Storage Service (Amazon S3) is storage for the internet. "
     "You can use Amazon S3 to store and retrieve any amount of data at any "
@@ -60,11 +62,7 @@ static constexpr const char* expected_payload
     "simple and intuitive web interface of the AWS Management Console.";
 static const size_t expected_payload_size = std::strlen(expected_payload);
 static constexpr const char* error_payload
-  = "<?xml version=\"1.0\" "
-    "encoding=\"UTF-8\"?><Error><Code>InternalError</"
-    "Code><Message>Error.Message</"
-    "Message><Resource>Error.Resource</Resource><RequestId>Error.RequestId</"
-    "RequestId></Error>";
+  = R"(<?xml version="1.0" encoding="UTF-8"?><Error><Code>InternalError</Code><Message>Error.Message</Message><Resource>Error.Resource</Resource><RequestId>Error.RequestId</RequestId></Error>)";
 static constexpr const char* no_such_key_payload = R"xml(
 <?xml version="1.0" encoding="UTF-8"?>
 <Error>
@@ -118,9 +116,19 @@ constexpr auto delete_objects_payload_error = R"xml(
     </Error>
 )xml";
 
+static constexpr auto no_such_config_payload = R"xml(
+<?xml version="1.0" encoding="UTF-8"?>
+<Error>
+    <Code>NoSuchConfiguration</Code>
+    <Message>Configuration not found</Message>
+</Error>
+)xml";
+
 void set_routes(ss::httpd::routes& r) {
     using namespace ss::httpd;
     using reply = ss::http::reply;
+    using flexible_function_handler
+      = http::test_utils::flexible_function_handler;
     auto empty_put_response = new function_handler(
       [](const_req req) {
           BOOST_REQUIRE(!req.get_header("x-amz-content-sha256").empty());
@@ -128,24 +136,30 @@ void set_routes(ss::httpd::routes& r) {
           return "";
       },
       "txt");
-    auto erroneous_put_response = new function_handler(
-      []([[maybe_unused]] const_req req, reply& reply) {
+    auto erroneous_put_response = new flexible_function_handler(
+      [](
+        [[maybe_unused]] const_req req,
+        reply& reply,
+        [[maybe_unused]] ss::sstring& type) {
           reply.set_status(reply::status_type::internal_server_error);
           return error_payload;
       },
-      "txt");
+      "xml");
     auto get_response = new function_handler(
       [](const_req req) {
           BOOST_REQUIRE(!req.get_header("x-amz-content-sha256").empty());
           return ss::sstring(expected_payload, expected_payload_size);
       },
       "txt");
-    auto erroneous_get_response = new function_handler(
-      []([[maybe_unused]] const_req req, reply& reply) {
+    auto erroneous_get_response = new flexible_function_handler(
+      [](
+        [[maybe_unused]] const_req req,
+        reply& reply,
+        [[maybe_unused]] ss::sstring& type) {
           reply.set_status(reply::status_type::internal_server_error);
           return error_payload;
       },
-      "txt");
+      "xml");
     auto empty_delete_response = new function_handler(
       [](const_req req, reply& reply) {
           BOOST_REQUIRE(!req.get_header("x-amz-content-sha256").empty());
@@ -153,17 +167,20 @@ void set_routes(ss::httpd::routes& r) {
           return "";
       },
       "txt");
-    auto erroneous_delete_response = new function_handler(
-      []([[maybe_unused]] const_req req, reply& reply) {
+    auto erroneous_delete_response = new flexible_function_handler(
+      [](
+        [[maybe_unused]] const_req req,
+        reply& reply,
+        [[maybe_unused]] ss::sstring& type) {
           reply.set_status(reply::status_type::internal_server_error);
           return error_payload;
       },
-      "txt");
-    auto list_objects_response = new function_handler(
-      [](const_req req, reply& reply) {
+      "xml");
+    auto list_objects_response = new flexible_function_handler(
+      [](const_req req, reply& reply, [[maybe_unused]] ss::sstring& type) {
           BOOST_REQUIRE(!req.get_header("x-amz-content-sha256").empty());
           BOOST_REQUIRE_EQUAL(req.get_query_param("list-type"), "2");
-          auto prefix = req.get_header("prefix");
+          auto prefix = req.get_query_param("prefix");
           if (prefix == "test") {
               // normal response
               return list_objects_payload;
@@ -172,30 +189,37 @@ void set_routes(ss::httpd::routes& r) {
               reply.set_status(reply::status_type::internal_server_error);
               return error_payload;
           } else if (prefix == "test-cont") {
-              BOOST_REQUIRE_EQUAL(req.get_header("continuation-token"), "ctok");
+              BOOST_REQUIRE_EQUAL(
+                req.get_query_param("continuation-token"), "ctok");
               return list_objects_payload;
           }
-          return "";
+          return "<root>none</root>";
       },
-      "txt");
+      "xml");
     auto unexpected_error_response = new function_handler(
       []([[maybe_unused]] const_req req, reply& reply) {
           reply.set_status(reply::status_type::internal_server_error);
           return "unexpected!";
       },
       "txt");
-    auto key_not_found_response = new function_handler(
-      []([[maybe_unused]] const_req req, reply& reply) {
+    auto key_not_found_response = new flexible_function_handler(
+      [](
+        [[maybe_unused]] const_req req,
+        reply& reply,
+        [[maybe_unused]] ss::sstring& type) {
           reply.set_status(reply::status_type::not_found);
           return no_such_key_payload;
       },
-      "txt");
-    auto bucket_not_found_response = new function_handler(
-      []([[maybe_unused]] const_req req, reply& reply) {
+      "xml");
+    auto bucket_not_found_response = new flexible_function_handler(
+      [](
+        [[maybe_unused]] const_req req,
+        reply& reply,
+        [[maybe_unused]] ss::sstring& type) {
           reply.set_status(reply::status_type::not_found);
           return no_such_bucket_payload;
       },
-      "txt");
+      "xml");
     auto delete_objects_response = new function_handler(
       [](const_req req, reply& reply) -> std::string {
           if (!req.query_parameters.contains("delete")) {
@@ -241,7 +265,7 @@ void set_routes(ss::httpd::routes& r) {
 
               // partially validate the request xml and construct the response
               // with the provided keys
-              for (auto const& [tag, value] : req_root.get_child("Delete")) {
+              for (const auto& [tag, value] : req_root.get_child("Delete")) {
                   if (tag == "Quiet") {
                       continue;
                   }
@@ -271,6 +295,21 @@ void set_routes(ss::httpd::routes& r) {
           return "unexpected";
       },
       "txt");
+    auto put_response_no_content = new function_handler(
+      []([[maybe_unused]] const_req req, reply& reply) {
+          reply.set_status(reply::status_type::no_content);
+          return "";
+      },
+      "txt");
+    auto no_such_config = new flexible_function_handler(
+      [](
+        [[maybe_unused]] const_req req,
+        reply& reply,
+        [[maybe_unused]] ss::sstring& type) {
+          reply.set_status(reply::status_type::not_found);
+          return no_such_config_payload;
+      },
+      "xml");
     r.add(operation_type::PUT, url("/test"), empty_put_response);
     r.add(operation_type::PUT, url("/test-error"), erroneous_put_response);
     r.add(operation_type::GET, url("/test"), get_response);
@@ -290,6 +329,11 @@ void set_routes(ss::httpd::routes& r) {
       url("/test-bucket-not-found"),
       bucket_not_found_response);
     r.add(operation_type::POST, url("/"), delete_objects_response);
+    r.add(
+      operation_type::PUT,
+      url("/test-put-no-content"),
+      put_response_no_content);
+    r.add(operation_type::GET, url("/no-config"), no_such_config);
 }
 
 /// Http server and client
@@ -399,12 +443,12 @@ SEASTAR_TEST_CASE(test_get_object_success) {
                                   "test-bucket"),
                                 cloud_storage_clients::object_key("test"),
                                 100ms)
-                              .get0();
+                              .get();
 
         BOOST_REQUIRE(result);
 
         auto input_stream = result.value()->as_input_stream();
-        ss::copy(input_stream, payload_stream).get0();
+        ss::copy(input_stream, payload_stream).get();
         iobuf_parser p(std::move(payload));
         auto actual_payload = p.read_string(p.bytes_left());
         BOOST_REQUIRE_EQUAL(actual_payload, expected_payload);
@@ -422,7 +466,7 @@ SEASTAR_TEST_CASE(test_get_object_failure) {
                                   "test-bucket"),
                                 cloud_storage_clients::object_key("test-error"),
                                 100ms)
-                              .get0();
+                              .get();
         BOOST_REQUIRE(!result);
         BOOST_REQUIRE_EQUAL(
           result.error(), cloud_storage_clients::error_outcome::retry);
@@ -440,7 +484,7 @@ SEASTAR_TEST_CASE(test_delete_object_success) {
                                   "test-bucket"),
                                 cloud_storage_clients::object_key("test"),
                                 100ms)
-                              .get0();
+                              .get();
 
         BOOST_REQUIRE(result);
         server->stop().get();
@@ -458,7 +502,7 @@ SEASTAR_TEST_CASE(test_delete_object_failure) {
                                   "test-bucket"),
                                 cloud_storage_clients::object_key("test-error"),
                                 100ms)
-                              .get0();
+                              .get();
 
         BOOST_REQUIRE(!result);
         BOOST_REQUIRE_EQUAL(
@@ -484,7 +528,7 @@ SEASTAR_TEST_CASE(test_delete_object_not_found) {
                 cloud_storage_clients::bucket_name("test-bucket"),
                 cloud_storage_clients::object_key("test-key-not-found"),
                 100ms)
-              .get0();
+              .get();
 
         BOOST_REQUIRE(result);
         server->stop().get();
@@ -502,7 +546,7 @@ SEASTAR_TEST_CASE(test_delete_bucket_not_found) {
                 cloud_storage_clients::bucket_name("test-bucket"),
                 cloud_storage_clients::object_key("test-bucket-not-found"),
                 100ms)
-              .get0();
+              .get();
 
         BOOST_REQUIRE(!result);
         BOOST_REQUIRE(
@@ -521,7 +565,7 @@ SEASTAR_TEST_CASE(test_unexpected_error_message) {
                 cloud_storage_clients::bucket_name("test-bucket"),
                 cloud_storage_clients::object_key("test-unexpected"),
                 100ms)
-              .get0();
+              .get();
         BOOST_REQUIRE(!result);
         server->stop().get();
     });
@@ -546,7 +590,7 @@ SEASTAR_TEST_CASE(test_list_objects_success) {
                                 cloud_storage_clients::bucket_name(
                                   "test-bucket"),
                                 cloud_storage_clients::object_key("test"))
-                              .get0();
+                              .get();
 
         BOOST_REQUIRE(result);
         const auto& lst = result.value();
@@ -593,7 +637,7 @@ SEASTAR_TEST_CASE(test_list_objects_with_filter) {
                 http::default_connect_timeout,
                 std::nullopt,
                 [](const auto& item) { return item.key == "test-key2"; })
-              .get0();
+              .get();
 
         BOOST_REQUIRE(result);
         const auto& lst = result.value();
@@ -623,7 +667,7 @@ SEASTAR_TEST_CASE(test_list_objects_failure) {
                                 cloud_storage_clients::bucket_name(
                                   "test-bucket"),
                                 cloud_storage_clients::object_key("test-error"))
-                              .get0();
+                              .get();
 
         BOOST_REQUIRE(!result);
         BOOST_REQUIRE_EQUAL(
@@ -644,7 +688,7 @@ SEASTAR_TEST_CASE(test_list_objects_with_continuation) {
                                 {},
                                 {},
                                 "ctok")
-                              .get0();
+                              .get();
         BOOST_REQUIRE(result);
         server->stop().get();
     });
@@ -661,7 +705,7 @@ SEASTAR_TEST_CASE(test_delete_objects_success) {
                            cloud_storage_clients::object_key{"key2"},
                            cloud_storage_clients::object_key{"key3"}},
                           http::default_connect_timeout)
-                        .get0();
+                        .get();
         BOOST_REQUIRE(result);
         BOOST_REQUIRE(result.value().undeleted_keys.empty());
         server->stop().get();
@@ -682,14 +726,14 @@ SEASTAR_TEST_CASE(test_delete_objects_errors) {
                           cloud_storage_clients::bucket_name{"okerror"},
                           {keys.begin(), keys.end()},
                           http::default_connect_timeout)
-                        .get0();
+                        .get();
         auto u_keys = std::vector<cloud_storage_clients::object_key>{};
         BOOST_REQUIRE(result);
         std::transform(
           result.value().undeleted_keys.begin(),
           result.value().undeleted_keys.end(),
           std::back_inserter(u_keys),
-          [](auto const& kr) { return kr.key; });
+          [](const auto& kr) { return kr.key; });
         std::sort(u_keys.begin(), u_keys.end());
         BOOST_REQUIRE(
           std::equal(keys.begin(), keys.end(), u_keys.begin(), u_keys.end()));
@@ -716,6 +760,72 @@ SEASTAR_TEST_CASE(test_delete_object_retry) {
     });
 }
 
+ss::future<> do_test_put_object_no_response(bool acceptable) {
+    return ss::async([acceptable] {
+        auto conf = transport_configuration();
+        auto [server, client] = started_client_and_server(conf);
+        iobuf payload;
+        payload.append(expected_payload, expected_payload_size);
+        auto payload_stream = make_iobuf_input_stream(std::move(payload));
+        const auto response
+          = client
+              ->put_object(
+                cloud_storage_clients::bucket_name("test-bucket"),
+                cloud_storage_clients::object_key("test-put-no-content"),
+                expected_payload_size,
+                std::move(payload_stream),
+                100ms,
+                acceptable)
+              .get();
+        if (acceptable) {
+            BOOST_REQUIRE(response);
+        } else {
+            BOOST_REQUIRE(!response);
+        }
+        client->shutdown();
+        server->stop().get();
+    });
+}
+
+SEASTAR_TEST_CASE(test_put_object_no_response_acceptable) {
+    return do_test_put_object_no_response(true);
+}
+
+SEASTAR_TEST_CASE(test_put_object_no_response_not_acceptable) {
+    return do_test_put_object_no_response(false);
+}
+
+ss::future<> do_test_no_such_configuration(bool acceptable) {
+    return ss::async([acceptable] {
+        auto conf = transport_configuration();
+        auto [server, client] = started_client_and_server(conf);
+        const auto result = client
+                              ->get_object(
+                                cloud_storage_clients::bucket_name(
+                                  "test-bucket"),
+                                cloud_storage_clients::object_key("no-config"),
+                                100ms,
+                                acceptable)
+                              .get();
+        // acceptable only affects the log level, the end response is always 404
+        BOOST_REQUIRE(!result);
+        BOOST_REQUIRE_EQUAL(
+          result.error(), cloud_storage_clients::error_outcome::key_not_found);
+        BOOST_REQUIRE_EQUAL(
+          result.error(), cloud_storage_clients::error_outcome::key_not_found);
+        client->shutdown();
+        server->stop().get();
+    });
+}
+
+SEASTAR_TEST_CASE(test_no_configuration_mapped_to_404) {
+    return do_test_no_such_configuration(true);
+}
+
+SEASTAR_TEST_CASE(test_no_configuration_not_mapped_404) {
+    return do_test_no_such_configuration(false);
+}
+
 class client_pool_fixture {
 public:
     client_pool_fixture()
@@ -738,7 +848,7 @@ public:
 
         server->start().get();
         server->set_routes(set_routes).get();
-        auto resolved = net::resolve_dns(s3_conf.server_addr).get0();
+        auto resolved = net::resolve_dns(s3_conf.server_addr).get();
         server->listen(resolved).get();
     }
 
@@ -753,7 +863,7 @@ public:
 };
 
 static ss::future<> test_client_pool_payload(
-  ss::shared_ptr<ss::httpd::http_server_control> server,
+  ss::shared_ptr<ss::httpd::http_server_control>,
   cloud_storage_clients::client_pool::client_lease lease) {
     auto client = lease.client;
     iobuf payload;
@@ -784,12 +894,12 @@ FIXTURE_TEST(test_client_pool_wait_strategy, client_pool_fixture) {
               });
         fut.emplace_back(std::move(f));
     }
-    ss::when_all_succeed(fut.begin(), fut.end()).get0();
+    ss::when_all_succeed(fut.begin(), fut.end()).get();
     BOOST_REQUIRE(pool.local().size() == 2);
 }
 
 static ss::future<bool> test_client_pool_reconnect_helper(
-  ss::shared_ptr<ss::httpd::http_server_control> server,
+  ss::shared_ptr<ss::httpd::http_server_control>,
   cloud_storage_clients::client_pool::client_lease lease) {
     auto client = lease.client;
     co_await ss::sleep(100ms);
@@ -829,7 +939,7 @@ FIXTURE_TEST(test_client_pool_reconnect, client_pool_fixture) {
                      });
         fut.emplace_back(std::move(f));
     }
-    auto result = ss::when_all_succeed(fut.begin(), fut.end()).get0();
+    auto result = ss::when_all_succeed(fut.begin(), fut.end()).get();
     auto count = std::count(result.begin(), result.end(), true);
     BOOST_REQUIRE(count == 20);
 }

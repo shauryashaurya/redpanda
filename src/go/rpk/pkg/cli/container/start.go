@@ -87,8 +87,9 @@ func newStartCommand(fs afero.Fs, p *config.Params) *cobra.Command {
 		Short: "Start a local container cluster",
 		Long: `Start a local container cluster.
 
-This command utilizes Docker to initiate a local container cluster. Use the
-'--nodes'/'-n' flag to specify the number of brokers.
+This command uses Docker to initiate a local Redpanda container cluster,
+including Redpanda Console. Use the '--nodes'/'-n' flag to specify the number of
+brokers.
 
 The initial broker starts on default ports, with subsequent brokers' ports
 offset by 1000. You can use the listeners flag to specify ports:
@@ -98,27 +99,31 @@ offset by 1000. You can use the listeners flag to specify ports:
   * --rpc-ports
   * --schema-registry-ports
   * --proxy-ports
+  * --console-port
 
 Each flag accepts a comma-separated list of ports for your listeners. Use the
-'--any-port' flag to let rpk select random available ports on the host machine.
+'--any-port' flag to let rpk select random available ports for every listener on
+the host machine.
 
-Optionally, specify a container image; the default image is
-redpandadata/redpanda:latest.
+By default, this command uses the redpandadata/redpanda:latest and 
+redpandadata/console:latest container images. You can specify a container image 
+by using the '--image' flag.
 
 In case of IP address pool conflict, you may specify a custom subnet and gateway
 using the '--subnet' and '--gateway' flags respectively.
 `,
 		Example: `
-Start a 3-broker cluster:
+Start a three-broker cluster:
   rpk container start -n 3
 
-Start a 1-broker cluster, selecting random ports for every listener:
+Start a single-broker cluster, selecting random ports for every listener:
   rpk container start --any-port
 
-Start a 3-broker cluster, selecting the seed kafka and console port only:
+Start a three-broker cluster, selecting the seed Kafka and Redpanda Console 
+ports only:
   rpk container start --kafka-ports 9092 --console-port 8080
 
-Start a 3-broker cluster, selecting every admin API port:
+Start a three-broker cluster, selecting the Admin API port for each broker:
   rpk container start --admin-ports 9644,9645,9646
 `,
 		FParseErrWhitelist: cobra.FParseErrWhitelist{
@@ -127,6 +132,7 @@ Start a 3-broker cluster, selecting every admin API port:
 			// (POSIX standard)
 			UnknownFlags: true,
 		},
+		Args: cobra.NoArgs,
 		Run: func(cmd *cobra.Command, _ []string) {
 			if nodes < 1 {
 				out.Die("--nodes should be 1 or greater")
@@ -144,7 +150,7 @@ Start a 3-broker cluster, selecting every admin API port:
 			configKvs := collectFlags(os.Args, "--set")
 			isRestarted, err := startCluster(c, nodes, checkBrokers, retries, image, consoleImage, pull, cPorts, configKvs, subnet, gateway)
 			if err != nil {
-				if errors.As(err, &portInUseErr{}) {
+				if errors.As(err, &portInUseError{}) {
 					out.Die("unable to start cluster: %v\nYou may select different ports to start the cluster using our listener flags. Check '--help' text for more information", err)
 				}
 				out.Die("unable to start cluster: %v", common.WrapIfConnErr(err))
@@ -182,16 +188,17 @@ You can retry profile creation by running:
 		},
 	}
 
-	command.Flags().UintVarP(&nodes, "nodes", "n", 1, "The number of nodes to start")
+	command.Flags().UintVarP(&nodes, "nodes", "n", 1, "The number of brokers (nodes) to start")
 	command.Flags().UintVar(&retries, "retries", 10, "The amount of times to check for the cluster before considering it unstable and exiting")
-	command.Flags().StringVar(&image, "image", common.DefaultRedpandaImage(), "An arbitrary container Redpanda image to use")
-	command.Flags().StringVar(&consoleImage, "console-image", common.DefaultConsoleImage(), "An arbitrary container Redpanda Console image to use")
+	command.Flags().StringVar(&image, "image", common.DefaultRedpandaImage(), "An arbitrary Redpanda container image to use")
+	command.Flags().StringVar(&consoleImage, "console-image", common.DefaultConsoleImage(), "An arbitrary Redpanda Console container image to use")
 	command.Flags().BoolVar(&pull, "pull", false, "Force pull the container image used")
 	command.Flags().BoolVar(&noProfile, "no-profile", false, "If true, rpk will not create an rpk profile after creating a cluster")
+	command.Flags().String("set", "", "Redpanda configuration property to set upon start. Follows 'rpk redpanda config set' format")
 	command.Flags().StringSliceVar(&kPorts, flagKafkaPorts, nil, "Kafka protocol ports to listen on; check help text for more information")
 	command.Flags().StringSliceVar(&aPorts, flagAdminPorts, nil, "Redpanda Admin API ports to listen on; check help text for more information")
-	command.Flags().StringSliceVar(&srPorts, flagSRPorts, nil, "Schema registry ports to listen on; check help text for more information")
-	command.Flags().StringSliceVar(&pPorts, flagProxyPorts, nil, "Pandaproxy ports to listen on; check help text for more information")
+	command.Flags().StringSliceVar(&srPorts, flagSRPorts, nil, "Schema Registry ports to listen on; check help text for more information")
+	command.Flags().StringSliceVar(&pPorts, flagProxyPorts, nil, "HTTP Proxy ports to listen on; check help text for more information")
 	command.Flags().StringSliceVar(&rPorts, flagRPCPorts, nil, "RPC ports to listen on; check help text for more information")
 	command.Flags().StringVar(&consolePort, flagConsolePort, "8080", "Redpanda console ports to listen on; check help text for more information")
 	// opt-in for 'any' in all listeners
@@ -316,9 +323,9 @@ func startCluster(
 		seedID,
 		nodeAddr(seedKafkaPort),
 	}
-	kafkaAddr := []string{fmt.Sprintf("%v:%d", seedState.ContainerIP, seedKafkaPort)}
-	srAddr := []string{fmt.Sprintf("http://rp-node-%d:%d", seedID, seedSchemaRegPort)}
-	adminAddr := []string{fmt.Sprintf("http://rp-node-%d:%d", seedID, seedAdminPort)}
+	kafkaAddr := []string{fmt.Sprintf("%v:%d", seedState.ContainerIP, config.DefaultKafkaPort)}
+	srAddr := []string{fmt.Sprintf("http://rp-node-%d:%d", seedID, config.DefaultSchemaRegPort)}
+	adminAddr := []string{fmt.Sprintf("http://rp-node-%d:%d", seedID, config.DefaultAdminPort)}
 
 	nodes := []node{seedNode}
 
@@ -368,9 +375,9 @@ func startCluster(
 				id:   id,
 				addr: nodeAddr(state.HostKafkaPort),
 			})
-			kafkaAddr = append(kafkaAddr, fmt.Sprintf("%v:%d", state.ContainerIP, kafkaPort))
-			srAddr = append(srAddr, fmt.Sprintf("http://rp-node-%d:%d", id, schemaRegPort))
-			adminAddr = append(adminAddr, fmt.Sprintf("http://rp-node-%d:%d", id, adminPort))
+			kafkaAddr = append(kafkaAddr, fmt.Sprintf("%v:%d", state.ContainerIP, config.DefaultKafkaPort))
+			srAddr = append(srAddr, fmt.Sprintf("http://rp-node-%d:%d", id, config.DefaultSchemaRegPort))
+			adminAddr = append(adminAddr, fmt.Sprintf("http://rp-node-%d:%d", id, config.DefaultAdminPort))
 			mu.Unlock()
 			return nil
 		})
@@ -383,15 +390,30 @@ func startCluster(
 	fmt.Println("Waiting for the cluster to be ready...")
 	err = waitForCluster(check(nodes), retries)
 	if err != nil {
-		state, sErr := common.GetState(c, nodes[0].id, false)
-		if sErr != nil {
-			return false, fmt.Errorf("%v\nunable to get Docker container logs: %v", err, sErr)
+		var failedNodeState *common.NodeState
+		for _, n := range nodes {
+			state, sErr := common.GetState(c, n.id, false)
+			if sErr != nil {
+				return false, fmt.Errorf("%v\nunable to get Docker container (%v) logs: %v", n.id, err, sErr)
+			}
+			if !state.Running {
+				failedNodeState = state
+			}
 		}
-		errStr, cErr := getContainerErr(state, c)
+		// Sanity check: If the cluster didn't start but all the containers are
+		// running. Maybe the cluster is not ready yet and the user needs to
+		// increase the retries.
+		if failedNodeState == nil {
+			return false, fmt.Errorf("unable to start the cluster on time: %v; you may run 'rpk container purge' and start again increasing the number of retries with the '--retries' flag", err)
+		}
+
+		errStr, cErr := getContainerErr(failedNodeState, c)
 		if cErr != nil {
 			return false, fmt.Errorf("%v\nunable to get Docker container logs: %v", err, cErr)
 		}
-		return false, fmt.Errorf("%v\n\nErrors reported from the Docker container:\n\n%v", err, errStr)
+		// Docker usually truncates the container ID to 12 characters.
+		shortID := fmt.Sprintf("%.*s", 12, failedNodeState.ContainerID)
+		return false, fmt.Errorf("%v\n\nErrors reported from the Docker container with ID %v:\n\n%v", err, shortID, errStr)
 	}
 	fmt.Println("Cluster ready!")
 
@@ -435,6 +457,10 @@ func restartCluster(
 	// If there isn't an existing cluster, there's nothing to restart.
 	if len(states) == 0 {
 		return nil, nil
+	}
+	// If we only have one stranded Console container, the user must purge it.
+	if len(states) == 1 && states[0].Console {
+		return nil, fmt.Errorf("stranded Redpanda Console container detected; please run 'rpk container purge' and try again")
 	}
 	grp, _ := errgroup.WithContext(context.Background())
 	mu := sync.Mutex{}
@@ -489,7 +515,7 @@ func restartCluster(
 		return nil, fmt.Errorf("%v\n\nErrors reported from the Docker container:\n%v", err, errStr)
 	}
 
-	if !consoleState.Running {
+	if consoleState != nil && !consoleState.Running {
 		ctx, _ := common.DefaultCtx()
 		err = c.ContainerStart(ctx, consoleState.ContainerID, container.StartOptions{})
 		if err != nil {
@@ -503,11 +529,14 @@ func restartCluster(
 	}
 	err = waitForCluster(checkConsole(consoleNode), retries)
 	if err != nil {
-		errStr, cErr := getContainerErr(consoleState, c)
-		if cErr != nil {
-			return nil, fmt.Errorf("%v\nunable to get Docker container logs: %v", err, cErr)
+		if consoleState != nil {
+			errStr, cErr := getContainerErr(consoleState, c)
+			if cErr != nil {
+				return nil, fmt.Errorf("%v\nunable to get Docker container logs: %v", err, cErr)
+			}
+			return nil, fmt.Errorf("%v\n\nErrors reported from the Docker container:\n%v", err, errStr)
 		}
-		return nil, fmt.Errorf("%v\n\nErrors reported from the Docker container:\n%v", err, errStr)
+		return nil, fmt.Errorf("error restarting the console cluster: %v; you may run 'rpk container purge' and start again", err)
 	}
 	return rpNodes, nil
 }
@@ -796,7 +825,7 @@ func verifyPortsInUse(cPorts clusterPorts) error {
 			server, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", p))
 			// if it fails then the port might be in use
 			if err != nil {
-				return portInUseErr{p, listener}
+				return portInUseError{p, listener}
 			}
 			server.Close()
 		}
@@ -820,12 +849,12 @@ func verifyPortsInUse(cPorts clusterPorts) error {
 	return check([]uint{cPorts.consolePort}, "console")
 }
 
-type portInUseErr struct {
+type portInUseError struct {
 	port     uint
 	listener string
 }
 
-func (p portInUseErr) Error() string {
+func (p portInUseError) Error() string {
 	return fmt.Sprintf("%v port %v already in use", p.listener, p.port)
 }
 

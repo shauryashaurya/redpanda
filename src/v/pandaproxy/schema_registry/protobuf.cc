@@ -12,17 +12,25 @@
 #include "pandaproxy/schema_registry/protobuf.h"
 
 #include "base/vlog.h"
+#include "bytes/streambuf.h"
 #include "kafka/protocol/errors.h"
 #include "pandaproxy/logger.h"
+#include "pandaproxy/schema_registry/compatibility.h"
 #include "pandaproxy/schema_registry/errors.h"
 #include "pandaproxy/schema_registry/sharded_store.h"
+#include "pandaproxy/schema_registry/types.h"
 #include "ssx/sformat.h"
 #include "utils/base64.h"
 
 #include <seastar/core/coroutine.hh>
+#include <seastar/core/sstring.hh>
+#include <seastar/util/variant_utils.hh>
 
 #include <absl/container/flat_hash_set.h>
+#include <absl/strings/ascii.h>
+#include <absl/strings/escaping.h>
 #include <boost/algorithm/string/trim.hpp>
+#include <boost/range/combine.hpp>
 #include <confluent/meta.pb.h>
 #include <confluent/types/decimal.pb.h>
 #include <fmt/core.h>
@@ -32,6 +40,7 @@
 #include <google/protobuf/compiler/parser.h>
 #include <google/protobuf/descriptor.h>
 #include <google/protobuf/descriptor.pb.h>
+#include <google/protobuf/descriptor_database.h>
 #include <google/protobuf/duration.pb.h>
 #include <google/protobuf/empty.pb.h>
 #include <google/protobuf/field_mask.pb.h>
@@ -41,7 +50,6 @@
 #include <google/protobuf/struct.pb.h>
 #include <google/protobuf/timestamp.pb.h>
 #include <google/protobuf/type.pb.h>
-#include <google/protobuf/util/type_resolver.h>
 #include <google/protobuf/wrappers.pb.h>
 #include <google/type/calendar_period.pb.h>
 #include <google/type/color.pb.h>
@@ -61,8 +69,20 @@
 #include <google/type/quaternion.pb.h>
 #include <google/type/timeofday.pb.h>
 
+#include <algorithm>
+#include <cstdint>
+#include <functional>
+#include <optional>
+#include <ranges>
 #include <string_view>
 #include <unordered_set>
+
+namespace {
+
+constexpr auto not_map = std::views::filter(
+  [](const auto& m) { return !m.options().has_map_entry(); });
+
+} // namespace
 
 namespace pandaproxy::schema_registry {
 
@@ -141,11 +161,13 @@ class io_error_collector final : public pb::io::ErrorCollector {
     };
 
 public:
-    void AddError(int line, int column, const std::string& message) final {
-        _errors.emplace_back(err{level::error, line, column, message});
+    void RecordError(int line, int column, std::string_view message) final {
+        _errors.emplace_back(
+          err{level::error, line, column, ss::sstring{message}});
     }
-    void AddWarning(int line, int column, const std::string& message) final {
-        _errors.emplace_back(err{level::warn, line, column, message});
+    void RecordWarning(int line, int column, std::string_view message) final {
+        _errors.emplace_back(
+          err{level::warn, line, column, ss::sstring{message}});
     }
 
     error_info error() const;
@@ -158,26 +180,37 @@ private:
 
 class dp_error_collector final : public pb::DescriptorPool::ErrorCollector {
 public:
-    void AddError(
-      const std::string& filename,
-      const std::string& element_name,
+    void RecordError(
+      std::string_view filename,
+      std::string_view element_name,
       const pb::Message* descriptor,
       ErrorLocation location,
-      const std::string& message) final {
+      std::string_view message) final {
         _errors.emplace_back(err{
-          level::error, filename, element_name, descriptor, location, message});
-    }
-    void AddWarning(
-      const std::string& filename,
-      const std::string& element_name,
-      const pb::Message* descriptor,
-      ErrorLocation location,
-      const std::string& message) final {
-        _errors.emplace_back(err{
-          level::warn, filename, element_name, descriptor, location, message});
+          level::error,
+          ss::sstring{filename},
+          ss::sstring{element_name},
+          descriptor,
+          location,
+          ss::sstring{message}});
     }
 
-    error_info error() const;
+    void RecordWarning(
+      std::string_view filename,
+      std::string_view element_name,
+      const pb::Message* descriptor,
+      ErrorLocation location,
+      std::string_view message) final {
+        _errors.emplace_back(err{
+          level::warn,
+          ss::sstring{filename},
+          ss::sstring{element_name},
+          descriptor,
+          location,
+          ss::sstring{message}});
+    }
+
+    error_info error(std::string_view sub) const;
 
 private:
     enum class level {
@@ -186,11 +219,11 @@ private:
     };
     struct err {
         level lvl;
-        std::string filename;
-        std::string element_name;
+        ss::sstring filename;
+        ss::sstring element_name;
         const pb::Message* descriptor;
         ErrorLocation location;
-        std::string message;
+        ss::sstring message;
     };
     friend struct fmt::formatter<err>;
 
@@ -200,9 +233,9 @@ private:
 ///\brief Implements ZeroCopyInputStream with a copy of the definition
 class schema_def_input_stream : public pb::io::ZeroCopyInputStream {
 public:
-    explicit schema_def_input_stream(const canonical_schema_definition& def)
-      : _str(def.raw())
-      , _impl{_str().data(), static_cast<int>(_str().size())} {}
+    explicit schema_def_input_stream(const schema_definition& def)
+      : _is{def.shared_raw()}
+      , _impl{&_is.istream()} {}
 
     bool Next(const void** data, int* size) override {
         return _impl.Next(data, size);
@@ -212,8 +245,8 @@ public:
     int64_t ByteCount() const override { return _impl.ByteCount(); }
 
 private:
-    canonical_schema_definition::raw_string _str;
-    pb::io::ArrayInputStream _impl;
+    iobuf_istream _is;
+    pb::io::IstreamInputStream _impl;
 };
 
 class parser {
@@ -222,7 +255,7 @@ public:
       : _parser{}
       , _fdp{} {}
 
-    const pb::FileDescriptorProto& parse(const canonical_schema& schema) {
+    const pb::FileDescriptorProto& parse(const subject_schema& schema) {
         schema_def_input_stream is{schema.def()};
         io_error_collector error_collector;
         pb::io::Tokenizer t{&is, &error_collector};
@@ -230,18 +263,19 @@ public:
 
         // Attempt parse a .proto file
         if (!_parser.Parse(&t, &_fdp)) {
-            // base64 decode the schema
-            std::string_view b64_def{
-              schema.def().raw()().data(), schema.def().raw()().size()};
-            auto bytes_def = base64_to_bytes(b64_def);
-
-            // Attempt parse as an encoded FileDescriptorProto.pb
-            if (!_fdp.ParseFromArray(
-                  bytes_def.data(), static_cast<int>(bytes_def.size()))) {
+            try {
+                // base64 decode the schema
+                iobuf_istream is{base64_to_iobuf(schema.def().raw()())};
+                // Attempt parse as an encoded FileDescriptorProto.pb
+                if (!_fdp.ParseFromIstream(&is.istream())) {
+                    throw as_exception(error_collector.error());
+                }
+            } catch (const base64_decoder_exception&) {
                 throw as_exception(error_collector.error());
             }
         }
-        _fdp.set_name(schema.sub()());
+        const auto& sub = schema.sub()();
+        _fdp.set_name(std::string_view(sub));
         return _fdp;
     }
 
@@ -249,6 +283,125 @@ private:
     pb::compiler::Parser _parser;
     pb::FileDescriptorProto _fdp;
 };
+
+template<typename T, typename Proj = std::identity>
+void sort(pb::RepeatedPtrField<T>* range, Proj proj = Proj{}) {
+    if (range) {
+        std::ranges::sort(*range, std::ranges::less{}, proj);
+    }
+}
+
+void normalize_proto(
+  pb::RepeatedPtrField<pb::FieldDescriptorProto>* raw_extensions) {
+    sort(raw_extensions, [](const auto& extension) {
+        return std::make_pair(extension.extendee(), extension.number());
+    });
+}
+
+// Normalize an enum
+void normalize_proto(pb::EnumDescriptorProto& enum_proto) {
+    sort(
+      enum_proto.mutable_reserved_range(),
+      &pb::EnumDescriptorProto_EnumReservedRange::start);
+
+    sort(enum_proto.mutable_reserved_name());
+
+    sort(enum_proto.mutable_value(), [](const auto& v) {
+        // In proto3, enums are open and open enums need to
+        // have the first field being equal to zero. By casting
+        // to an unsigned integer for sorting, all the negative
+        // fields will be at the end, after all the positives.
+        return std::pair<uint32_t, std::string_view>{
+          static_cast<uint32_t>(v.number()), v.name()};
+    });
+}
+
+// Normalize a message, including nested messages
+void normalize_proto(pb::DescriptorProto& message) {
+    sort(
+      message.mutable_reserved_range(),
+      &pb::DescriptorProto_ReservedRange::start);
+
+    sort(message.mutable_reserved_name());
+
+    // Oneof fields should stay next to each other in the field array.
+    // To ensure this, we sort all the one_of together at the end of the range
+    // grouped by their oneof index.
+    const auto tag_oneofs = [](const pb::FieldDescriptorProto& dp) {
+        const auto is_oneof = [&dp]() {
+            return dp.has_oneof_index() && !dp.proto3_optional();
+        };
+        return std::make_pair(is_oneof() ? dp.oneof_index() : -1, dp.number());
+    };
+    sort(message.mutable_field(), tag_oneofs);
+
+    normalize_proto(message.mutable_extension());
+
+    sort(
+      message.mutable_extension_range(),
+      &pb::DescriptorProto_ExtensionRange::start);
+
+    // Normalize nested types
+    for (auto& nested : *message.mutable_nested_type() | not_map) {
+        normalize_proto(nested);
+    }
+
+    // Normalize nested enums
+    for (auto& nested : *message.mutable_enum_type()) {
+        normalize_proto(nested);
+    }
+}
+
+void normalize_imports(pb::FileDescriptorProto& fdp, normalize norm) {
+    struct dependency {
+        enum { private_, weak, public_ } type;
+        std::string name;
+        auto operator<=>(const dependency&) const = default;
+    };
+
+    auto deps_view = std::views::transform(
+      fdp.dependency(),
+      [](const auto& dep) { return dependency{dependency::private_, dep}; });
+    std::vector<dependency> deps{deps_view.begin(), deps_view.end()};
+    for (auto i : fdp.public_dependency()) {
+        deps[i].type = dependency::public_;
+    }
+    for (auto i : fdp.weak_dependency()) {
+        deps[i].type = dependency::weak;
+    }
+
+    if (norm) {
+        std::ranges::sort(deps);
+    } else {
+        std::ranges::stable_sort(deps, std::less{}, &dependency::type);
+    }
+    fdp.clear_dependency();
+    fdp.clear_public_dependency();
+    fdp.clear_weak_dependency();
+
+    for (auto dep : deps) {
+        fdp.add_dependency(std::move(dep.name));
+        if (dep.type == dependency::public_) {
+            fdp.add_public_dependency(fdp.dependency_size() - 1);
+        } else if (dep.type == dependency::weak) {
+            fdp.add_weak_dependency(fdp.dependency_size() - 1);
+        }
+    }
+}
+
+void normalize_proto_file(pb::FileDescriptorProto& fdp) {
+    // Normalize messages
+    for (auto& message : *fdp.mutable_message_type() | not_map) {
+        normalize_proto(message);
+    }
+
+    // Normalize enums
+    for (auto& enum_proto : *fdp.mutable_enum_type()) {
+        normalize_proto(enum_proto);
+    }
+
+    normalize_proto(fdp.mutable_extension());
+}
 
 ///\brief Build a FileDescriptor using the DescriptorPool.
 ///
@@ -268,38 +421,71 @@ build_file(pb::DescriptorPool& dp, const pb::FileDescriptorProto& fdp) {
     if (auto fd = dp.BuildFileCollectingErrors(fdp, &dp_ec); fd) {
         return fd;
     }
-    throw as_exception(dp_ec.error());
+    throw as_exception(dp_ec.error(fdp.name()));
 }
 
 ///\brief Build a FileDescriptor and import references from the store.
 ///
-/// Recursively import references into the DescriptorPool, building the files
-/// on stack unwind.
-ss::future<const pb::FileDescriptor*> build_file_with_refs(
-  pb::DescriptorPool& dp, sharded_store& store, canonical_schema schema) {
+/// Recursively import references into the DescriptorPool, building the
+/// files on stack unwind.
+ss::future<pb::FileDescriptorProto> build_file_with_refs(
+  pb::DescriptorPool& dp,
+  schema_getter& store,
+  subject_schema schema,
+  normalize norm) {
     for (const auto& ref : schema.def().refs()) {
         if (dp.FindFileByName(ref.name)) {
             continue;
         }
-        auto dep = co_await store.get_subject_schema(
-          ref.sub, ref.version, include_deleted::no);
-        co_await build_file_with_refs(
-          dp,
-          store,
-          canonical_schema{subject{ref.name}, std::move(dep.schema).def()});
+        try {
+            auto dep = co_await store.get_subject_schema(
+              ref.sub, ref.version, include_deleted::yes);
+            co_await build_file_with_refs(
+              dp,
+              store,
+              subject_schema{subject{ref.name}, std::move(dep.schema).def()},
+              normalize::no);
+        } catch (const exception& e) {
+            if (failed_subject_schema_lookup(e.code())) {
+                throw as_exception(
+                  no_reference_found_for(schema, ref.sub, ref.version));
+            }
+            throw;
+        }
     }
 
     parser p;
-    co_return build_file(dp, p.parse(schema));
+    auto new_fdp = p.parse(schema);
+    normalize_imports(new_fdp, norm);
+    if (norm) {
+        normalize_proto_file(new_fdp);
+    }
+    build_file(dp, new_fdp);
+    co_return new_fdp;
 }
 
-///\brief Import a schema in the DescriptorPool and return the FileDescriptor.
-ss::future<const pb::FileDescriptor*> import_schema(
-  pb::DescriptorPool& dp, sharded_store& store, canonical_schema schema) {
+///\brief Import a schema in the DescriptorPool and return the
+/// FileDescriptor.
+ss::future<pb::FileDescriptorProto> import_schema(
+  pb::DescriptorPool& dp,
+  schema_getter& store,
+  subject_schema schema,
+  normalize norm) {
     try {
-        co_return co_await build_file_with_refs(dp, store, schema);
+        co_return co_await build_file_with_refs(
+          dp, store, schema.share(), norm);
     } catch (const exception& e) {
-        vlog(plog.warn, "Failed to decode schema: {}", e.what());
+        // Rethrow if the schema is missing references
+        if (e.code() == error_code::schema_missing_reference) {
+            throw;
+        }
+        // Otherwise log the error details and throw an appropriate error for
+        // the response
+        vlog(
+          srlog.warn,
+          "Failed to decode schema {}: {:?}",
+          schema.sub(),
+          e.what());
         throw as_exception(invalid_schema(schema));
     }
 }
@@ -307,6 +493,7 @@ ss::future<const pb::FileDescriptor*> import_schema(
 struct protobuf_schema_definition::impl {
     pb::DescriptorPool _dp;
     const pb::FileDescriptor* fd{};
+    pb::FileDescriptorProto fdp{};
 
     /**
      * debug_string swaps the order of the import and package lines that
@@ -326,6 +513,7 @@ struct protobuf_schema_definition::impl {
      * messages
      */
     ss::sstring debug_string() const {
+        // TODO BP: Prevent this linearization
         auto s = fd->DebugString();
 
         // reordering not required if no package or no dependencies
@@ -353,30 +541,67 @@ struct protobuf_schema_definition::impl {
         auto imports = trim(sv.substr(imports_pos, imports_len));
         auto footer = trim(sv.substr(package_pos + package.length()));
 
+        // TODO BP: Prevent this linearization
         return ssx::sformat(
           "{}\n{}\n\n{}\n\n{}\n", header, package, imports, footer);
     }
+
+    schema_definition::raw_string raw() const {
+        return schema_definition::raw_string{debug_string()};
+    }
 };
 
-canonical_schema_definition::raw_string
-protobuf_schema_definition::raw() const {
-    return canonical_schema_definition::raw_string{_impl->debug_string()};
+schema_definition::raw_string protobuf_schema_definition::raw() const {
+    return _impl->raw();
 }
 
 ::result<ss::sstring, kafka::error_code>
-protobuf_schema_definition::name(std::vector<int> const& fields) const {
+protobuf_schema_definition::name(const std::vector<int>& fields) const {
+    auto d = descriptor(*this, fields);
+    if (d.has_error()) {
+        return d.error();
+    }
+    return d.value().get().full_name();
+}
+
+::result<
+  std::reference_wrapper<const google::protobuf::Descriptor>,
+  kafka::error_code>
+descriptor(
+  const protobuf_schema_definition& def, const std::vector<int>& fields) {
     if (fields.empty()) {
         return kafka::error_code::invalid_record;
     }
     auto f = fields.begin();
-    auto d = _impl->fd->message_type(*f++);
+    if (def().fd->message_type_count() <= *f) {
+        return kafka::error_code::invalid_record;
+    }
+    auto d = def().fd->message_type(*f++);
     while (fields.end() != f && d) {
+        if (d->nested_type_count() <= *f) {
+            return kafka::error_code::invalid_record;
+        }
         d = d->nested_type(*f++);
     }
     if (!d) {
         return kafka::error_code::invalid_record;
     }
-    return d->full_name();
+    return *d;
+}
+
+::result<
+  std::reference_wrapper<const google::protobuf::Descriptor>,
+  kafka::error_code>
+descriptor(const protobuf_schema_definition& def, std::string_view full_name) {
+    if (full_name.empty()) {
+        return kafka::error_code::invalid_record;
+    }
+    const google::protobuf::Descriptor* d = def()._dp.FindMessageTypeByName(
+      full_name);
+    if (!d) {
+        return kafka::error_code::invalid_record;
+    }
+    return *d;
 }
 
 bool operator==(
@@ -392,33 +617,35 @@ operator<<(std::ostream& os, const protobuf_schema_definition& def) {
     return os;
 }
 
-ss::future<protobuf_schema_definition>
-make_protobuf_schema_definition(sharded_store& store, canonical_schema schema) {
-    auto impl = ss::make_shared<protobuf_schema_definition::impl>();
+ss::future<protobuf_schema_definition> make_protobuf_schema_definition(
+  schema_getter& store, subject_schema schema, normalize norm) {
     auto refs = schema.def().refs();
-    impl->fd = co_await import_schema(impl->_dp, store, std::move(schema));
+    auto impl = ss::make_shared<protobuf_schema_definition::impl>();
+    impl->fdp = co_await import_schema(
+      impl->_dp, store, std::move(schema), normalize(norm));
+
+    if (norm) {
+        std::sort(refs.begin(), refs.end());
+        auto uniq = std::ranges::unique(refs);
+        refs.erase(uniq.begin(), uniq.end());
+    }
+    impl->fd = impl->_dp.FindFileByName(impl->fdp.name());
     co_return protobuf_schema_definition{std::move(impl), std::move(refs)};
 }
 
-ss::future<canonical_schema_definition>
-validate_protobuf_schema(sharded_store& store, canonical_schema schema) {
+ss::future<schema_definition> validate_protobuf_schema(
+  sharded_store& store, subject_schema schema, normalize norm) {
     auto res = co_await make_protobuf_schema_definition(
-      store, std::move(schema));
-    co_return canonical_schema_definition{std::move(res)};
+      store, std::move(schema), norm);
+    co_return schema_definition{std::move(res)};
 }
 
-ss::future<canonical_schema>
-make_canonical_protobuf_schema(sharded_store& store, unparsed_schema schema) {
-    // NOLINTBEGIN(bugprone-use-after-move)
-    canonical_schema temp{
-      std::move(schema).sub(),
-      {canonical_schema_definition::raw_string{schema.def().raw()()},
-       schema.def().type(),
-       schema.def().refs()}};
-
-    auto validated = co_await validate_protobuf_schema(store, temp);
-    co_return canonical_schema{std::move(temp).sub(), std::move(validated)};
-    // NOLINTEND(bugprone-use-after-move)
+ss::future<subject_schema> make_canonical_protobuf_schema(
+  sharded_store& store, subject_schema schema, normalize norm) {
+    subject sub = schema.sub();
+    co_return subject_schema{
+      std::move(sub),
+      co_await validate_protobuf_schema(store, std::move(schema), norm)};
 }
 
 namespace {
@@ -466,42 +693,149 @@ encoding get_encoding(pb::FieldDescriptor::Type type) {
     __builtin_unreachable();
 }
 
-struct compatibility_checker {
-    bool check_compatible() { return check_compatible(_writer.fd); }
+using proto_compatibility_result = raw_compatibility_result;
 
-    bool check_compatible(const pb::FileDescriptor* writer) {
-        // There must be a compatible reader message for every writer message
+struct compatibility_checker {
+    proto_compatibility_result check_compatible(std::filesystem::path p) {
+        return check_compatible(_writer.fd, std::move(p));
+    }
+
+    proto_compatibility_result check_compatible(
+      const pb::FileDescriptor* writer, std::filesystem::path p) {
+        // There must be a compatible reader message for every writer
+        // message
+        proto_compatibility_result compat_result;
         for (int i = 0; i < writer->message_type_count(); ++i) {
             auto w = writer->message_type(i);
             auto r = _reader._dp.FindMessageTypeByName(w->full_name());
-            if (!r || !check_compatible(r, w)) {
-                return false;
+
+            if (!r) {
+                compat_result.emplace<proto_incompatibility>(
+                  p / w->name(), proto_incompatibility::Type::message_removed);
+            } else {
+                compat_result.merge(check_compatible(r, w, p / w->name()));
             }
         }
-        return true;
+        return compat_result;
     }
 
-    bool check_compatible(
-      const pb::Descriptor* reader, const pb::Descriptor* writer) {
+    proto_compatibility_result check_compatible(
+      const pb::Descriptor* reader,
+      const pb::Descriptor* writer,
+      std::filesystem::path p) {
+        proto_compatibility_result compat_result;
         if (!_seen_descriptors.insert(reader).second) {
-            return true;
+            return compat_result;
         }
+
+        for (int i = 0; i < writer->nested_type_count(); ++i) {
+            auto w = writer->nested_type(i);
+            auto r = reader->FindNestedTypeByName(w->name());
+            if (!r) {
+                compat_result.emplace<proto_incompatibility>(
+                  p / w->name(), proto_incompatibility::Type::message_removed);
+            } else {
+                compat_result.merge(check_compatible(r, w, p / w->name()));
+            }
+        }
+
+        for (int i = 0; i < writer->real_oneof_decl_count(); ++i) {
+            auto w = writer->oneof_decl(i);
+            compat_result.merge(check_compatible(reader, w, p / w->name()));
+        }
+
+        for (int i = 0; i < reader->real_oneof_decl_count(); ++i) {
+            auto r = reader->oneof_decl(i);
+            compat_result.merge(check_compatible(r, writer, p / r->name()));
+        }
+
+        // check writer fields
         for (int i = 0; i < writer->field_count(); ++i) {
-            if (reader->IsReservedNumber(i) || writer->IsReservedNumber(i)) {
-                continue;
-            }
-            int number = writer->field(i)->number();
+            auto w = writer->field(i);
+            int number = w->number();
             auto r = reader->FindFieldByNumber(number);
-            // A reader may ignore a writer field
-            if (r && !check_compatible(r, writer->field(i))) {
-                return false;
+            // A reader may ignore a writer field iff it is not `required`
+            if (!r && w->is_required()) {
+                compat_result.emplace<proto_incompatibility>(
+                  p / std::to_string(w->number()),
+                  proto_incompatibility::Type::required_field_removed);
+            } else if (r) {
+                auto oneof = r->containing_oneof();
+                compat_result.merge(check_compatible(
+                  r,
+                  w,
+                  p / (oneof ? oneof->name() : "")
+                    / std::to_string(w->number())));
             }
         }
-        return true;
+
+        // check reader required fields
+        for (int i = 0; i < reader->field_count(); ++i) {
+            auto r = reader->field(i);
+            int number = r->number();
+            auto w = writer->FindFieldByNumber(number);
+            // A writer may ignore a reader field iff it is not `required`
+            if ((!w || !w->is_required()) && r->is_required()) {
+                compat_result.emplace<proto_incompatibility>(
+                  p / std::to_string(number),
+                  proto_incompatibility::Type::required_field_added);
+            }
+        }
+        return compat_result;
     }
 
-    bool check_compatible(
-      const pb::FieldDescriptor* reader, const pb::FieldDescriptor* writer) {
+    proto_compatibility_result check_compatible(
+      const pb::Descriptor* reader,
+      const pb::OneofDescriptor* writer,
+      std::filesystem::path p) {
+        proto_compatibility_result compat_result;
+
+        // If the oneof in question doesn't appear in the reader descriptor,
+        // then we don't need to account for any difference in fields.
+        if (!reader->FindOneofByName(writer->name())) {
+            return compat_result;
+        }
+
+        for (int i = 0; i < writer->field_count(); ++i) {
+            auto w = writer->field(i);
+            auto r = reader->FindFieldByNumber(w->number());
+
+            if (!r || !r->real_containing_oneof()) {
+                compat_result.emplace<proto_incompatibility>(
+                  p / std::to_string(w->number()),
+                  proto_incompatibility::Type::oneof_field_removed);
+            }
+        }
+        return compat_result;
+    }
+
+    proto_compatibility_result check_compatible(
+      const pb::OneofDescriptor* reader,
+      const pb::Descriptor* writer,
+      std::filesystem::path p) {
+        proto_compatibility_result compat_result;
+
+        size_t count = 0;
+        for (int i = 0; i < reader->field_count(); ++i) {
+            auto r = reader->field(i);
+            auto w = writer->FindFieldByNumber(r->number());
+            if (w && !w->real_containing_oneof()) {
+                ++count;
+            }
+        }
+        if (count > 1) {
+            compat_result.emplace<proto_incompatibility>(
+              std::move(p),
+              proto_incompatibility::Type::multiple_fields_moved_to_oneof);
+        }
+        return compat_result;
+    }
+
+    proto_compatibility_result check_compatible(
+      const pb::FieldDescriptor* reader,
+      const pb::FieldDescriptor* writer,
+      std::filesystem::path p) {
+        proto_compatibility_result compat_result;
         switch (writer->type()) {
         case pb::FieldDescriptor::Type::TYPE_MESSAGE:
         case pb::FieldDescriptor::Type::TYPE_GROUP: {
@@ -509,9 +843,23 @@ struct compatibility_checker {
                                     == pb::FieldDescriptor::Type::TYPE_MESSAGE
                                   || reader->type()
                                        == pb::FieldDescriptor::Type::TYPE_GROUP;
-            return type_is_compat
-                   && check_compatible(
-                     reader->message_type(), writer->message_type());
+            if (!type_is_compat) {
+                compat_result.emplace<proto_incompatibility>(
+                  std::move(p),
+                  proto_incompatibility::Type::field_kind_changed);
+            } else if (
+              reader->message_type()->name()
+              != writer->message_type()->name()) {
+                compat_result.emplace<proto_incompatibility>(
+                  std::move(p),
+                  proto_incompatibility::Type::field_named_type_changed);
+            } else {
+                compat_result.merge(check_compatible(
+                  reader->message_type(),
+                  writer->message_type(),
+                  std::move(p)));
+            }
+            break;
         }
         case pb::FieldDescriptor::Type::TYPE_FLOAT:
         case pb::FieldDescriptor::Type::TYPE_DOUBLE:
@@ -529,14 +877,27 @@ struct compatibility_checker {
         case pb::FieldDescriptor::Type::TYPE_SFIXED32:
         case pb::FieldDescriptor::Type::TYPE_FIXED64:
         case pb::FieldDescriptor::Type::TYPE_SFIXED64:
-            return check_compatible(
-              get_encoding(reader->type()), get_encoding(writer->type()));
+            compat_result.merge(check_compatible(
+              get_encoding(reader->type()),
+              get_encoding(writer->type()),
+              std::move(p)));
         }
-        __builtin_unreachable();
+        return compat_result;
     }
 
-    bool check_compatible(encoding reader, encoding writer) {
-        return reader == writer && reader != encoding::struct_;
+    proto_compatibility_result check_compatible(
+      encoding reader, encoding writer, std::filesystem::path p) {
+        proto_compatibility_result compat_result;
+        // we know writer has scalar encoding because of the switch stmt above
+        if (reader == encoding::struct_) {
+            compat_result.emplace<proto_incompatibility>(
+              std::move(p), proto_incompatibility::Type::field_kind_changed);
+        } else if (reader != writer) {
+            compat_result.emplace<proto_incompatibility>(
+              std::move(p),
+              proto_incompatibility::Type::field_scalar_kind_changed);
+        }
+        return compat_result;
     }
 
     const protobuf_schema_definition::impl& _reader;
@@ -546,11 +907,12 @@ struct compatibility_checker {
 
 } // namespace
 
-bool check_compatible(
+compatibility_result check_compatible(
   const protobuf_schema_definition& reader,
-  const protobuf_schema_definition& writer) {
+  const protobuf_schema_definition& writer,
+  verbose is_verbose) {
     compatibility_checker checker{reader(), writer()};
-    return checker.check_compatible();
+    return checker.check_compatible("#/")(is_verbose);
 }
 
 } // namespace pandaproxy::schema_registry
@@ -601,9 +963,10 @@ error_info io_error_collector::error() const {
       error_code::schema_invalid, fmt::format("{}", fmt::join(_errors, "; "))};
 }
 
-error_info dp_error_collector::error() const {
+error_info dp_error_collector::error(std::string_view sub) const {
     return error_info{
-      error_code::schema_invalid, fmt::format("{}", fmt::join(_errors, "; "))};
+      error_code::schema_invalid,
+      fmt::format("{}:{}", sub, fmt::join(_errors, "; "))};
 }
 
 } // namespace pandaproxy::schema_registry

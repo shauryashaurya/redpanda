@@ -7,13 +7,13 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0
 
-#include "bytes/random.h"
-#include "cluster/simple_batch_builder.h"
 #include "model/fundamental.h"
 #include "model/record.h"
 #include "random/generators.h"
 #include "storage/batch_cache.h"
+#include "storage/record_batch_builder.h"
 #include "test_utils/fixture.h"
+#include "test_utils/random_bytes.h"
 
 #include <seastar/core/sharded.hh>
 #include <seastar/testing/thread_test_case.hh>
@@ -32,17 +32,17 @@ using is_dirty_entry = storage::batch_cache::is_dirty_entry;
 
 static model::record_batch
 make_batch(size_t size = 10, model::offset offset = model::offset(0)) {
-    cluster::simple_batch_builder b(model::record_batch_type(1), offset);
+    storage::record_batch_builder b(model::record_batch_type(1), offset);
     for (size_t i = 0; i < size; i++) {
-        b.add_kv("key", "value");
+        b.add_raw_kv(iobuf::from("key"), iobuf::from("value"));
     }
     return std::move(b).build();
 }
 
 static model::record_batch make_random_batch(
   size_t max_size = 10, model::offset offset = model::offset(0)) {
-    cluster::simple_batch_builder b(model::record_batch_type(1), offset);
-    b.add_kv(iobuf{}, bytes_to_iobuf(random_generators::get_bytes(max_size)));
+    storage::record_batch_builder b(model::record_batch_type(1), offset);
+    b.add_raw_kv(iobuf{}, bytes_to_iobuf(tests::random_bytes(max_size)));
 
     return std::move(b).build();
 }

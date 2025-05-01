@@ -9,16 +9,12 @@
  */
 
 #include "base/seastarx.h"
-#include "model/fundamental.h"
 #include "random/generators.h"
 #include "utils/delta_for.h"
 
 #include <seastar/testing/perf_tests.hh>
-#include <seastar/util/defer.hh>
 
-#include <absl/container/btree_map.h>
-
-#include <ranges>
+#include <map>
 #include <vector>
 
 using namespace cloud_storage;

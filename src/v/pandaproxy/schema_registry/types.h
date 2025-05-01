@@ -13,6 +13,7 @@
 
 #include "base/outcome.h"
 #include "base/seastarx.h"
+#include "json/iobuf_writer.h"
 #include "kafka/protocol/errors.h"
 #include "model/metadata.h"
 #include "strings/string_switch.h"
@@ -28,15 +29,40 @@
 
 namespace pandaproxy::schema_registry {
 
+using is_mutable = ss::bool_class<struct is_mutable_tag>;
 using permanent_delete = ss::bool_class<struct delete_tag>;
 using include_deleted = ss::bool_class<struct include_deleted_tag>;
 using is_deleted = ss::bool_class<struct is_deleted_tag>;
 using default_to_global = ss::bool_class<struct default_to_global_tag>;
 using force = ss::bool_class<struct force_tag>;
+using normalize = ss::bool_class<struct normalize_tag>;
+using verbose = ss::bool_class<struct verbose_tag>;
 
 template<typename E>
 std::enable_if_t<std::is_enum_v<E>, std::optional<E>>
   from_string_view(std::string_view);
+
+enum class mode { import = 0, read_only, read_write };
+
+constexpr std::string_view to_string_view(mode e) {
+    switch (e) {
+    case mode::import:
+        return "IMPORT";
+    case mode::read_only:
+        return "READONLY";
+    case mode::read_write:
+        return "READWRITE";
+    }
+    return "{invalid}";
+}
+template<>
+constexpr std::optional<mode> from_string_view<mode>(std::string_view sv) {
+    return string_switch<std::optional<mode>>(sv)
+      .match(to_string_view(mode::import), mode::import)
+      .match(to_string_view(mode::read_only), mode::read_only)
+      .match(to_string_view(mode::read_write), mode::read_write)
+      .default_match(std::nullopt);
+}
 
 enum class schema_type { avro = 0, json, protobuf };
 
@@ -84,45 +110,75 @@ struct schema_reference {
     friend std::ostream&
     operator<<(std::ostream& os, const schema_reference& ref);
 
+    friend bool
+    operator<(const schema_reference& lhs, const schema_reference& rhs);
+
     ss::sstring name;
     subject sub{invalid_subject};
     schema_version version{invalid_schema_version};
 };
 
 ///\brief Definition of a schema and its type.
-template<typename Tag>
-class typed_schema_definition {
+class schema_definition {
+    using schema_definition_iobuf
+      = named_type<iobuf, struct schema_definition_tag>;
+
 public:
-    using tag = Tag;
-    using raw_string = named_type<ss::sstring, tag>;
+    struct raw_string : schema_definition_iobuf {
+        raw_string() = default;
+        explicit raw_string(iobuf&& buf) noexcept
+          : schema_definition_iobuf{std::move(buf)} {}
+        explicit raw_string(std::string_view sv)
+          : schema_definition_iobuf{iobuf::from(sv)} {}
+    };
     using references = std::vector<schema_reference>;
 
+    schema_definition() = default;
+    schema_definition(schema_definition&&) noexcept = default;
+    schema_definition(const schema_definition&) = delete;
+    schema_definition& operator=(schema_definition&&) noexcept = default;
+    schema_definition& operator=(const schema_definition& other) = delete;
+    ~schema_definition() noexcept = default;
+
     template<typename T>
-    typed_schema_definition(T&& def, schema_type type)
-      : _def{ss::sstring{std::forward<T>(def)}}
+    schema_definition(T&& def, schema_type type)
+      : _def{std::forward<T>(def)}
       , _type{type}
       , _refs{} {}
 
     template<typename T>
-    typed_schema_definition(T&& def, schema_type type, references refs)
-      : _def{ss::sstring{std::forward<T>(def)}}
+    schema_definition(T&& def, schema_type type, references refs)
+      : _def{std::forward<T>(def)}
       , _type{type}
       , _refs{std::move(refs)} {}
 
-    friend bool operator==(
-      const typed_schema_definition& lhs, const typed_schema_definition& rhs)
+    friend bool
+    operator==(const schema_definition& lhs, const schema_definition& rhs)
       = default;
 
-    friend std::ostream&
-    operator<<(std::ostream& os, const typed_schema_definition&);
+    friend std::ostream& operator<<(std::ostream& os, const schema_definition&);
 
     schema_type type() const { return _type; }
 
     const raw_string& raw() const& { return _def; }
     raw_string raw() && { return std::move(_def); }
+    raw_string shared_raw() const {
+        auto& buf = const_cast<iobuf&>(_def());
+        return raw_string{buf.share(0, buf.size_bytes())};
+    }
 
     const references& refs() const& { return _refs; }
     references refs() && { return std::move(_refs); }
+
+    schema_definition share() const { return {shared_raw(), type(), refs()}; }
+
+    schema_definition copy() const {
+        return {raw_string{_def().copy()}, type(), refs()};
+    }
+
+    auto destructure() && {
+        return make_tuple(std::move(_def), _type, std::move(_refs));
+    }
 
 private:
     raw_string _def;
@@ -130,32 +186,14 @@ private:
     references _refs;
 };
 
-///\brief An unvalidated definition of the schema and its type.
-///
-/// This comes from the user and should be considered as potentially
-/// ill-formed.
-using unparsed_schema_definition
-  = typed_schema_definition<struct unparsed_schema_defnition_tag>;
-
-///\brief A canonical definition of the schema and its type.
-///
-/// This form is stored on the topic and returned to the user.
-using canonical_schema_definition
-  = typed_schema_definition<struct canonical_schema_definition_tag>;
-
-static const unparsed_schema_definition invalid_schema_definition{
-  "", schema_type::avro};
-
 ///\brief The definition of an avro schema.
 class avro_schema_definition {
 public:
     explicit avro_schema_definition(
-      avro::ValidSchema vs, canonical_schema_definition::references refs);
+      avro::ValidSchema vs, schema_definition::references refs);
 
-    canonical_schema_definition::raw_string raw() const;
-    canonical_schema_definition::references const& refs() const {
-        return _refs;
-    };
+    schema_definition::raw_string raw() const;
+    const schema_definition::references& refs() const { return _refs; };
 
     const avro::ValidSchema& operator()() const;
 
@@ -167,15 +205,15 @@ public:
 
     constexpr schema_type type() const { return schema_type::avro; }
 
-    explicit operator canonical_schema_definition() const {
-        return {raw(), type()};
+    explicit operator schema_definition() const {
+        return {raw(), type(), refs()};
     }
 
     ss::sstring name() const;
 
 private:
     avro::ValidSchema _impl;
-    canonical_schema_definition::references _refs;
+    schema_definition::references _refs;
 };
 
 class protobuf_schema_definition {
@@ -184,14 +222,12 @@ public:
     using pimpl = ss::shared_ptr<const impl>;
 
     explicit protobuf_schema_definition(
-      pimpl p, canonical_schema_definition::references refs)
+      pimpl p, schema_definition::references refs)
       : _impl{std::move(p)}
       , _refs(std::move(refs)) {}
 
-    canonical_schema_definition::raw_string raw() const;
-    canonical_schema_definition::references const& refs() const {
-        return _refs;
-    };
+    schema_definition::raw_string raw() const;
+    const schema_definition::references& refs() const { return _refs; };
 
     const impl& operator()() const { return *_impl; }
 
@@ -204,22 +240,58 @@ public:
 
     constexpr schema_type type() const { return schema_type::protobuf; }
 
-    explicit operator canonical_schema_definition() const {
+    explicit operator schema_definition() const {
         return {raw(), type(), refs()};
     }
 
     ::result<ss::sstring, kafka::error_code>
-    name(std::vector<int> const& fields) const;
+    name(const std::vector<int>& fields) const;
 
 private:
     pimpl _impl;
-    canonical_schema_definition::references _refs;
+    schema_definition::references _refs;
+};
+
+class json_schema_definition {
+public:
+    struct impl;
+    using pimpl = ss::shared_ptr<const impl>;
+
+    explicit json_schema_definition(pimpl p)
+      : _impl{std::move(p)} {}
+
+    schema_definition::raw_string raw() const;
+    const schema_definition::references& refs() const;
+
+    const impl& operator()() const { return *_impl; }
+
+    friend bool operator==(
+      const json_schema_definition& lhs, const json_schema_definition& rhs);
+
+    friend std::ostream&
+    operator<<(std::ostream& os, const json_schema_definition& rhs);
+
+    constexpr schema_type type() const { return schema_type::json; }
+
+    explicit operator schema_definition() const {
+        return {raw(), type(), refs()};
+    }
+
+    ss::sstring name() const;
+
+    // retrieve "title" property from the schema, used to form the record name
+    std::optional<ss::sstring> title() const;
+
+private:
+    pimpl _impl;
 };
 
 ///\brief A schema that has been validated.
 class valid_schema {
-    using impl
-      = std::variant<avro_schema_definition, protobuf_schema_definition>;
+    using impl = std::variant<
+      avro_schema_definition,
+      protobuf_schema_definition,
+      json_schema_definition>;
 
     template<typename T>
     using disable_if_valid_schema = std::
@@ -254,16 +326,15 @@ public:
         return visit([](const auto& def) { return def.type(); });
     }
 
-    unparsed_schema_definition::raw_string raw() const& {
+    schema_definition::raw_string raw() const& {
         return visit([](auto&& def) {
-            return unparsed_schema_definition::raw_string{def.raw()()};
+            return schema_definition::raw_string{def.raw()()};
         });
     }
 
-    unparsed_schema_definition::raw_string raw() && {
+    schema_definition::raw_string raw() && {
         return visit([](auto def) {
-            return unparsed_schema_definition::raw_string{
-              std::move(def).raw()()};
+            return schema_definition::raw_string{std::move(def).raw()()};
         });
     }
 
@@ -289,22 +360,28 @@ struct subject_version {
 };
 
 // Very similar to topic_key_type, separate to avoid intermingling storage code
-enum class seq_marker_key_type { invalid = 0, schema, delete_subject, config };
+enum class seq_marker_key_type {
+    invalid = 0,
+    schema,
+    delete_subject,
+    config,
+    mode
+};
 
 constexpr std::string_view to_string_view(seq_marker_key_type v) {
     switch (v) {
     case seq_marker_key_type::schema:
         return "schema";
-        break;
     case seq_marker_key_type::delete_subject:
         return "delete_subject";
-        break;
     case seq_marker_key_type::config:
         return "config";
+    case seq_marker_key_type::mode:
+        return "mode";
+    case seq_marker_key_type::invalid:
         break;
-    default:
-        return "invalid";
     }
+    return "invalid";
 }
 
 // Record the sequence+node where updates were made to a subject,
@@ -325,22 +402,19 @@ struct seq_marker {
 };
 
 ///\brief A schema with its subject
-template<typename Tag>
-class typed_schema {
+class subject_schema {
 public:
-    using tag = Tag;
-    using schema_definition = typed_schema_definition<tag>;
+    subject_schema() = default;
 
-    typed_schema() = default;
-
-    typed_schema(subject sub, schema_definition def)
+    subject_schema(subject sub, schema_definition def)
       : _sub{std::move(sub)}
       , _def{std::move(def)} {}
 
-    friend bool operator==(const typed_schema& lhs, const typed_schema& rhs)
+    friend bool operator==(const subject_schema& lhs, const subject_schema& rhs)
       = default;
 
-    friend std::ostream& operator<<(std::ostream& os, const typed_schema& ref);
+    friend std::ostream&
+    operator<<(std::ostream& os, const subject_schema& schema);
 
     const subject& sub() const& { return _sub; }
     subject sub() && { return std::move(_sub); }
@@ -350,20 +424,28 @@ public:
     const schema_definition& def() const& { return _def; }
     schema_definition def() && { return std::move(_def); }
 
+    subject_schema share() const { return {sub(), def().share()}; }
+    subject_schema copy() const { return {sub(), def().copy()}; }
+
+    auto destructure() && {
+        return make_tuple(std::move(_sub), std::move(_def));
+    }
+
 private:
     subject _sub{invalid_subject};
     schema_definition _def{"", schema_type::avro};
 };
 
-using unparsed_schema = typed_schema<unparsed_schema_definition::tag>;
-using canonical_schema = typed_schema<canonical_schema_definition::tag>;
-
-///\brief Complete description of a subject and schema for a version.
-struct subject_schema {
-    canonical_schema schema;
+///\brief Complete description of a subject and schema for a version, as stored
+/// in store
+struct stored_schema {
+    subject_schema schema;
     schema_version version{invalid_schema_version};
     schema_id id{invalid_schema_id};
     is_deleted deleted{false};
+    stored_schema share() const {
+        return {schema.share(), version, id, deleted};
+    }
 };
 
 enum class compatibility_level {
@@ -421,4 +503,66 @@ from_string_view<compatibility_level>(std::string_view sv) {
       .default_match(std::nullopt);
 }
 
+struct compatibility_result {
+    friend bool
+    operator==(const compatibility_result&, const compatibility_result&)
+      = default;
+    friend std::ostream& operator<<(std::ostream&, const compatibility_result&);
+
+    bool is_compat;
+    std::vector<ss::sstring> messages;
+};
+
 } // namespace pandaproxy::schema_registry
+
+template<>
+struct fmt::formatter<pandaproxy::schema_registry::schema_reference> {
+    constexpr auto
+    parse(fmt::format_parse_context& ctx) -> decltype(ctx.begin()) {
+        auto it = ctx.begin();
+        auto end = ctx.end();
+        if (it != end && (*it == 'l' || *it == 'e')) {
+            presentation = *it++;
+        }
+        if (it != end && *it != '}') {
+            throw fmt::format_error("invalid format");
+        }
+        return it;
+    }
+
+    template<typename FormatContext>
+    auto format(
+      const pandaproxy::schema_registry::schema_reference& s,
+      FormatContext& ctx) const -> decltype(ctx.out()) {
+        if (presentation == 'l') {
+            return fmt::format_to(
+              ctx.out(),
+              "name: {}, subject: {}, version: {}",
+              s.name,
+              s.sub,
+              s.version);
+        } else {
+            return fmt::format_to(
+              ctx.out(),
+              "name='{}', subject='{}', version={}",
+              s.name,
+              s.sub,
+              s.version);
+        }
+    }
+
+    // l : format for logging
+    // e : format for error_reporting
+    char presentation{'l'};
+};
+
+namespace json {
+
+template<typename Buffer>
+void rjson_serialize(
+  json::iobuf_writer<Buffer>& w,
+  const pandaproxy::schema_registry::schema_definition::raw_string& def) {
+    w.String(def());
+}
+
+} // namespace json

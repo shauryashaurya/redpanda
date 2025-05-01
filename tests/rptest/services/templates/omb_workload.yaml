@@ -1,7 +1,13 @@
 name: {{name}}
 
+{% if existing_topic_list is defined %}
+existingTopicList: {{existing_topic_list}}
+{% endif %}
 topics: {{topics}}
 partitionsPerTopic: {{partitions_per_topic}}
+{% if key_distributor is defined %}
+keyDistributor: {{key_distributor}}
+{% endif %}
 {% if message_size is defined %}
 messageSize: {{message_size}}
 {% if use_randomized_payloads is defined %}

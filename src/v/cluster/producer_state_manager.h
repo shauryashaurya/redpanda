@@ -19,13 +19,13 @@
 
 #include <seastar/core/sharded.hh>
 
-namespace cluster {
+namespace cluster::tx {
 class producer_state_manager {
 public:
     explicit producer_state_manager(
 
       config::binding<uint64_t> max_producer_ids,
-      std::chrono::milliseconds producer_expiration_ms,
+      config::binding<std::chrono::milliseconds> producer_expiration_ms,
       config::binding<size_t> virtual_cluster_min_producer_ids);
 
     ss::future<> start();
@@ -45,8 +45,10 @@ public:
      */
     void touch(producer_state&, std::optional<model::vcluster_id>);
 
+    void rearm_eviction_timer_for_testing(std::chrono::milliseconds);
+
 private:
-    static constexpr std::chrono::seconds period{5};
+    std::chrono::milliseconds _reaper_period{5000};
     /**
      *  Constant to be used when a partition has no vcluster_id assigned.
      */
@@ -75,7 +77,7 @@ private:
     void evict_excess_producers();
     size_t _eviction_counter = 0;
     // if a producer is inactive for this long, it will be gc-ed
-    std::chrono::milliseconds _producer_expiration_ms;
+    config::binding<std::chrono::milliseconds> _producer_expiration_ms;
     // maximum number of active producers allowed on this shard across
     // all partitions. When exceeded, producers are evicted on an
     // LRU basis.
@@ -83,10 +85,10 @@ private:
     config::binding<size_t> _virtual_cluster_min_producer_ids;
     // cache of all producers on this shard
     cache_t _cache;
-    ss::timer<ss::steady_clock_type> _reaper;
+    ss::timer<ss::lowres_clock> _reaper;
     ss::gate _gate;
     metrics::internal_metric_groups _metrics;
 
     friend struct ::test_fixture;
 };
-} // namespace cluster
+} // namespace cluster::tx

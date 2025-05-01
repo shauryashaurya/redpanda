@@ -15,6 +15,8 @@
 #include "model/record_batch_types.h"
 #include "model/record_utils.h"
 #include "random/generators.h"
+#include "storage/compacted_index.h"
+#include "storage/compaction.h"
 #include "storage/index_state.h"
 #include "storage/logger.h"
 #include "storage/parser_utils.h"
@@ -22,6 +24,7 @@
 #include "storage/segment_utils.h"
 
 #include <seastar/core/future.hh>
+#include <seastar/core/loop.hh>
 
 #include <absl/algorithm/container.h>
 #include <boost/range/irange.hpp>
@@ -49,8 +52,8 @@ compaction_key_reducer::operator()(compacted_index::entry&& e) {
         }
     } else {
         // not found - insert
-        auto const key_size = e.key.size();
-        auto const expected_size = [this, key_size] {
+        const auto key_size = e.key.size();
+        const auto expected_size = [this, key_size] {
             return idx_mem_usage() + _keys_mem_usage + key_size;
         };
 
@@ -158,12 +161,14 @@ copy_data_segment_reducer::filter(model::record_batch batch) {
     int32_t records_seen = 0;
     co_await batch.for_each_record_async(
       [this, &batch, &offset_deltas, &records_seen](const model::record& r) {
-          records_seen++;
+          ++records_seen;
           return maybe_keep_offset(
             batch, r, batch.record_count() == records_seen, offset_deltas);
       });
 
-    if (batch.last_offset() == _segment_last_offset && offset_deltas.empty()) {
+    if (
+      _compaction_placeholder_enabled
+      && batch.last_offset() == _segment_last_offset && offset_deltas.empty()) {
         // last batch in the segment has been compacted away.
         // This is most likely caused by aborted data batches getting compacted
         // away during self compaction of the segment if they are the last batch
@@ -171,7 +176,7 @@ copy_data_segment_reducer::filter(model::record_batch batch) {
         // contiguousness of the offset space.
         auto placeholder = make_placeholder_batch(batch.header());
         vlog(
-          stlog.debug,
+          gclog.debug,
           "installing a placeholder {} for compacted batch: {}",
           placeholder,
           batch);
@@ -276,12 +281,22 @@ copy_data_segment_reducer::filter(model::record_batch batch) {
 
 ss::future<ss::stop_iteration> copy_data_segment_reducer::filter_and_append(
   model::compression original, model::record_batch b) {
+    ++_stats.batches_processed;
     using stop_t = ss::stop_iteration;
+    const auto record_count_before = b.record_count();
     auto to_copy = co_await filter(std::move(b));
     if (to_copy == std::nullopt) {
+        ++_stats.batches_discarded;
+        _stats.records_discarded += record_count_before;
         co_return stop_t::no;
     }
+    const auto records_to_remove = record_count_before
+                                   - to_copy->record_count();
+    _stats.records_discarded += records_to_remove;
     bool compactible_batch = is_compactible(to_copy.value());
+    if (!compactible_batch) {
+        ++_stats.non_compactible_batches;
+    }
     if (_compacted_idx && compactible_batch) {
         co_await model::for_each_record(
           to_copy.value(),
@@ -296,8 +311,8 @@ ss::future<ss::stop_iteration> copy_data_segment_reducer::filter_and_append(
           });
     }
     auto batch = co_await compress_batch(original, std::move(to_copy.value()));
-    auto const start_pos = _appender->file_byte_offset();
-    auto const header_size = batch.header().size_bytes;
+    const auto start_pos = _appender->file_byte_offset();
+    const auto header_size = batch.header().size_bytes;
     _acc += header_size;
     // do not set broker_timestamp in this index, leave the operation to the
     // caller who has more context
@@ -329,6 +344,9 @@ ss::future<ss::stop_iteration>
 copy_data_segment_reducer::operator()(model::record_batch b) {
     if (_inject_failure) {
         throw std::runtime_error("injected error");
+    }
+    if (_as) {
+        _as->check();
     }
     const auto comp = b.header().attrs.compression();
     if (!b.compressed()) {
@@ -367,108 +385,118 @@ ss::future<> index_rebuilder_reducer::do_index(model::record_batch&& b) {
     });
 }
 
-void tx_reducer::consume_aborted_txs(model::offset upto) {
+void tx_reducer::refresh_ongoing_aborted_txs(const model::record_batch& b) {
+    // refresh the running list of aborted transactions
+    auto upto = b.last_offset();
     while (!_aborted_txs.empty() && _aborted_txs.top().first <= upto) {
         const auto& top = _aborted_txs.top();
         _ongoing_aborted_txs[top.pid] = top;
         _aborted_txs.pop();
     }
-}
-
-void tx_reducer::handle_tx_control_batch(const model::record_batch& b) {
-    auto batch_type = _stm_mgr->parse_tx_control_batch(b);
-    auto pid = model::producer_identity(
-      b.header().producer_id, b.header().producer_epoch);
-    switch (batch_type) {
-    case model::control_record_type::unknown: // unlikely
-    case model::control_record_type::tx_commit: {
-        break;
-    }
-    case model::control_record_type::tx_abort: {
-        if (!_ongoing_aborted_txs.erase(pid)) {
-            // This highly likely points to a bug with incorrect aborted tx
-            // range considered for this segment compaction. We likely retained
-            // aborted data batches for this pid with offsets close to
-            // base_offset().
-            // A corner case where this is not a problem is when the abort
-            // marker is the first entry in the segment.
-            vlog(
-              stlog.warn,
-              "No ongoing aborted tx found for pid {}, batch {}",
-              pid,
-              b.header());
+    // discard any inflight aborted transactions if we encounter an
+    // abort batch.
+    auto is_tx = b.header().attrs.is_transactional();
+    auto is_control = b.header().attrs.is_control();
+    if (is_tx && is_control) {
+        auto batch_type = _stm_mgr->parse_tx_control_batch(b);
+        auto pid = model::producer_identity(
+          b.header().producer_id, b.header().producer_epoch);
+        if (batch_type == model::control_record_type::tx_abort) {
+            _ongoing_aborted_txs.erase(pid);
         }
-        break;
-    }
     }
 }
 
-bool tx_reducer::handle_tx_data_batch(const model::record_batch& b) {
+bool tx_reducer::can_discard_tx_data_batch(const model::record_batch& b) {
+    if (_transactional_stm_type != stm_type::user_topic_transactional) {
+        return false;
+    }
+    auto is_tx = b.header().attrs.is_transactional();
+    auto is_data = b.header().type == model::record_batch_type::raft_data;
+    auto is_control = b.header().attrs.is_control();
     auto pid = model::producer_identity(
       b.header().producer_id, b.header().producer_epoch);
-    auto discard = _ongoing_aborted_txs.contains(pid);
-    if (discard) {
-        _stats._tx_data_batches_discarded++;
-    }
-    return discard;
+    return is_tx && is_data && !is_control
+           && _ongoing_aborted_txs.contains(pid);
 }
 
-bool tx_reducer::handle_non_tx_control_batch(const model::record_batch& b) {
-    auto type = b.header().type;
-    vassert(
-      type == model::record_batch_type::tx_prepare
-        || type == model::record_batch_type::tx_fence,
-      "{} unknown type encountered",
-      type);
-    // Fence batches cannot be discarded because they contain epoch information
-    // from pids that are tracked in the state machine. We key the records with
-    // pid, so the combination of batch_type + pid should always retain the
-    // latest epoch in the indexer_reducer. OTOH prepare batches can be
-    // discarded.
-    bool discard = type == model::record_batch_type::tx_prepare;
-    if (discard) {
-        _stats._non_tx_control_batches_discarded++;
+bool tx_reducer::can_discard_consumer_offsets_batch(
+  const model::record_batch& b) {
+    if (_transactional_stm_type != stm_type::consumer_offsets_transactional) {
+        return false;
     }
-    return discard;
+    // Remove all transaction related batches (including data) because the
+    // committed data has already been rewritten as separate raft_data batches,
+    // so no need to retain originally written group_prepare_tx batches while
+    // the transaction is in progress.
+    return is_compactible_control_batch(b.header().type);
 }
 
 ss::future<ss::stop_iteration> tx_reducer::operator()(model::record_batch&& b) {
-    if (unlikely(_non_transactional)) {
-        co_return co_await _delegate(std::move(b));
-    }
-
-    _stats._all_batches++;
-    consume_aborted_txs(b.last_offset());
-
-    auto is_tx = b.header().attrs.is_transactional();
-    auto is_control = b.header().attrs.is_control();
-    auto is_data = b.header().type == model::record_batch_type::raft_data;
-
-    bool discard_batch = false;
-    if (is_tx) {
-        if (is_control) {
-            // tx_commit / tx_abort / unknown
-
-            handle_tx_control_batch(b);
-        } else if (is_data) {
-            // User produced data batches in tx scope..
-            discard_batch = handle_tx_data_batch(b);
+    if (_transactional_stm_type) {
+        _stats.batches_processed++;
+        refresh_ongoing_aborted_txs(b);
+        if (
+          can_discard_tx_data_batch(b)
+          || can_discard_consumer_offsets_batch(b)) {
+            vlog(
+              gclog.trace, "discarded batch during compaction: {}", b.header());
+            _stats.batches_discarded++;
+            co_return ss::stop_iteration::no;
         }
-    } else {
-        if (is_control && !is_data) {
-            // tx_prepare / tx_fence
-            discard_batch = handle_non_tx_control_batch(b);
-        }
-        // else includes data batches from non tx producers which
-        // cannot be discarded.
-    }
-
-    if (discard_batch) {
-        vlog(stlog.trace, "discarded batch during compaction: {}", b.header());
-        _stats._all_batches_discarded++;
-        co_return ss::stop_iteration::no;
     }
     co_return co_await _delegate(std::move(b));
+}
+
+ss::future<ss::stop_iteration> map_building_reducer::maybe_index_record_in_map(
+  const model::record& r,
+  model::offset base_offset,
+  model::record_batch_type type,
+  bool is_control,
+  bool& fully_indexed_batch) {
+    auto offset = base_offset + model::offset_delta(r.offset_delta());
+    if (offset < _start_offset) {
+        co_return ss::stop_iteration::no;
+    }
+
+    auto key_view = iobuf_to_bytes(r.key());
+    auto key = enhance_key(type, is_control, key_view);
+    bool success = co_await _map->put(key, offset);
+
+    if (success) {
+        co_return ss::stop_iteration::no;
+    }
+
+    fully_indexed_batch = false;
+    co_return ss::stop_iteration::yes;
+}
+
+ss::future<ss::stop_iteration>
+map_building_reducer::operator()(model::record_batch batch) {
+    bool fully_indexed_batch = true;
+    // There is no point to indexing records in uncompactible batches, since
+    // their inclusion in the segment post compaction is irrespective of the map
+    // state (see copy_data_segment_reducer::filter()).
+    if (!is_compactible(batch)) {
+        co_return ss::stop_iteration::no;
+    }
+    auto b = co_await decompress_batch(std::move(batch));
+    co_await b.for_each_record_async(
+      [this,
+       &fully_indexed_batch,
+       base_offset = b.base_offset(),
+       type = b.header().type,
+       is_control = b.header().attrs.is_control()](
+        const model::record& r) -> ss::future<ss::stop_iteration> {
+          return maybe_index_record_in_map(
+            r, base_offset, type, is_control, fully_indexed_batch);
+      });
+
+    if (fully_indexed_batch) {
+        co_return ss::stop_iteration::no;
+    }
+    _fully_indexed_segment = false;
+    co_return ss::stop_iteration::yes;
 }
 
 } // namespace storage::internal

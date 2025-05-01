@@ -32,12 +32,12 @@
 #include <vector>
 namespace storage {
 
-inline static ss::sstring random_dir() {
+static inline ss::sstring random_dir() {
     return ssx::sformat(
       "test.dir_{}", random_generators::gen_alphanum_string(7));
 }
 
-inline static log_config log_builder_config() {
+inline log_config log_builder_config() {
     return log_config(
       random_dir(),
       100_MiB,
@@ -45,21 +45,21 @@ inline static log_config log_builder_config() {
       storage::make_sanitized_file_config());
 }
 
-inline static log_reader_config reader_config() {
+inline log_reader_config reader_config() {
     return log_reader_config{
       model::offset(0),
       model::model_limits<model::offset>::max(),
       ss::default_priority_class()};
 }
 
-inline static log_append_config append_config() {
+inline log_append_config append_config() {
     return log_append_config{
       .should_fsync = storage::log_append_config::fsync::yes,
       .io_priority = ss::default_priority_class(),
       .timeout = model::no_timeout};
 }
 
-inline static model::ntp log_builder_ntp() {
+inline model::ntp log_builder_ntp() {
     return model::ntp(
       model::ns("test.log_builder"),
       model::topic(random_generators::gen_alphanum_string(8)),
@@ -304,15 +304,22 @@ public:
     ss::future<> truncate(model::offset);
     ss::future<> gc(
       model::timestamp collection_upper_bound,
-      std::optional<size_t> max_partition_retention_size);
+      std::optional<size_t> max_partition_retention_size,
+      std::optional<std::chrono::milliseconds> tombstone_retention_ms
+      = std::nullopt);
     ss::future<usage_report> disk_usage(
       model::timestamp collection_upper_bound,
       std::optional<size_t> max_partition_retention_size);
     ss::future<std::optional<model::offset>> apply_retention(gc_config cfg);
-    ss::future<> apply_compaction(
+    ss::future<> apply_adjacent_merge_compaction(
+      compaction_config cfg,
+      std::optional<model::offset> new_start_offset = std::nullopt);
+    ss::future<bool> apply_sliding_window_compaction(
       compaction_config cfg,
       std::optional<model::offset> new_start_offset = std::nullopt);
     ss::future<bool> update_start_offset(model::offset start_offset);
+    void add_dirty_segment_bytes(ssize_t bytes);
+    void add_closed_segment_bytes(ssize_t bytes);
     ss::future<> add_batch(
       model::record_batch batch,
       log_append_config config = append_config(),
@@ -363,7 +370,7 @@ public:
 
     ss::future<> update_configuration(ntp_config::default_overrides o) {
         if (_log) {
-            return _log->update_configuration(o);
+            _log->set_overrides(o);
         }
 
         return ss::make_ready_future<>();

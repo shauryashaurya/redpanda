@@ -18,6 +18,8 @@
 #include <absl/container/btree_map.h>
 #include <boost/range/irange.hpp>
 
+#include <map>
+
 template<typename MapT, size_t KeySetSize, size_t FillPercent>
 class MapBenchTest {
     using key_t = typename MapT::key_type;
@@ -29,7 +31,7 @@ class MapBenchTest {
         std::vector<key_t> keys;
         keys.reserve(int(KeySetSize * (FillPercent / 100.0)));
         for (auto i : boost::irange<key_t>(0, KeySetSize)) {
-            if (random_generators::get_int(0, 100) <= FillPercent) {
+            if (random_generators::get_int<size_t>(0, 100) <= FillPercent) {
                 keys.push_back(i);
             }
         }

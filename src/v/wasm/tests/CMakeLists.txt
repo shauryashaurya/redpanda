@@ -9,6 +9,8 @@ v_cc_library(
     Seastar::seastar
     v::model_test_utils
     v::gtest_main
+    v::schema_test_fixture
+    v::test_random_bytes
 )
 
 set(TESTDATA_DIR "${CMAKE_BINARY_DIR}/src/transform-sdk/go/transform/internal/testdata")
@@ -22,6 +24,9 @@ rp_test(
   SOURCES
     wasm_transform_test.cc
     wasi_test.cc
+    wasm_sr_test.cc
+    wasm_lifecycle_test.cc
+    wasm_resources_test.cc
   LIBRARIES 
     v::gtest_main
     v::wasm_test_fixture
@@ -55,6 +60,7 @@ rp_test(
   LIBRARIES 
     v::gtest_main
     v::wasm
+    v::test_random_bytes
   ARGS "-- -c 1"
   LABELS wasm
 )
@@ -69,6 +75,7 @@ rp_test(
     v::gtest_main
     v::model_test_utils
     v::wasm
+    v::test_random_bytes
   ARGS "-- -c 4"
   LABELS wasm
 )
@@ -108,6 +115,7 @@ rp_test(
     v::seastar_testing_main
     v::wasm 
     v::model_test_utils
+    v::runfiles
   BUILD_DEPENDENCIES
     wasm_testdata_identity
   INPUT_FILES

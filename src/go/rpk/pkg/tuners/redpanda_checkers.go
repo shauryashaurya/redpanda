@@ -7,7 +7,7 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0
 
-//go:build !windows
+//go:build linux
 
 package tuners
 
@@ -259,11 +259,11 @@ func RedpandaCheckers(
 		BallastFileChecker:            {NewBallastFileChecker(fs, y)},
 	}
 
-	v, err := cloud.AvailableVendor()
+	v, err := cloud.AvailableProviders()
 	// NOTE: important workaround for very high flush latency in
 	//       GCP when using local SSD's
-	gcpVendor := gcp.GcpVendor{}
-	if err == nil && v.Name() == gcpVendor.Name() {
+	gcpProvider := gcp.GcpProvider{}
+	if err == nil && v.Name() == gcpProvider.Name() {
 		checkers[WriteCachePolicyChecker] = []Checker{NewDirectoryWriteCacheChecker(y.Redpanda.Directory, deviceFeatures, blockDevices)}
 	}
 

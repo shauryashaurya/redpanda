@@ -11,7 +11,6 @@
 #pragma once
 #include "bytes/iobuf.h"
 #include "cloud_storage/base_manifest.h"
-#include "cloud_storage/tests/s3_imposter.h"
 #include "cloud_storage/types.h"
 #include "model/fundamental.h"
 #include "model/namespace.h"
@@ -21,7 +20,7 @@
 #include "storage/record_batch_utils.h"
 #include "storage/tests/utils/disk_log_builder.h"
 
-#include <boost/test/tools/interface.hpp>
+#include <boost/numeric/conversion/cast.hpp>
 
 namespace cloud_storage {
 static const auto manifest_namespace = model::kafka_namespace;  // NOLINT
@@ -32,7 +31,7 @@ static const auto manifest_ntp = model::ntp(                    // NOLINT
   manifest_topic,
   manifest_partition);
 static const auto manifest_revision = model::initial_revision_id(0); // NOLINT
-static const auto archiver_term = model::term_id{123};
+inline const auto archiver_term = model::term_id{123};
 static const ss::sstring manifest_url = ssx::sformat( // NOLINT
   "10000000/meta/{}_{}/manifest.json",
   manifest_ntp.path(),
@@ -56,7 +55,8 @@ inline iobuf iobuf_deep_copy(const iobuf& i) {
 };
 
 inline iobuf generate_segment(model::offset base_offset, int count) {
-    auto buff = model::test::make_random_batches(base_offset, count, false);
+    auto buff
+      = model::test::make_random_batches(base_offset, count, false).get();
     iobuf result;
     for (auto&& batch : buff) {
         auto hdr = storage::batch_header_to_disk_iobuf(batch.header());
@@ -91,7 +91,8 @@ make_random_batches(model::offset o, const std::vector<batch_t>& batches) {
           batch.num_records,
           false,
           batch.type,
-          batch.record_sizes.size() != batch.num_records
+          batch.record_sizes.size()
+              != boost::numeric_cast<size_t>(batch.num_records)
             ? std::nullopt
             : std::make_optional(batch.record_sizes),
           batch.timestamp);

@@ -11,12 +11,14 @@
 
 #pragma once
 
-#include "archival/fwd.h"
 #include "base/seastarx.h"
 #include "cloud_storage/fwd.h"
 #include "cloud_storage_clients/client_pool.h"
+#include "cloud_topics/app.h"
+#include "cluster/archival/fwd.h"
 #include "cluster/config_manager.h"
 #include "cluster/fwd.h"
+#include "cluster/inventory_service.h"
 #include "cluster/migrations/tx_manager_migrator.h"
 #include "cluster/node/local_monitor.h"
 #include "cluster/node_status_backend.h"
@@ -25,14 +27,19 @@
 #include "cluster/self_test_frontend.h"
 #include "cluster/tx_coordinator_mapper.h"
 #include "config/node_config.h"
+#include "crash_tracker/service.h"
 #include "crypto/ossl_context_service.h"
+#include "datalake/fwd.h"
+#include "debug_bundle/fwd.h"
 #include "features/fwd.h"
 #include "finjector/stress_fiber.h"
 #include "kafka/client/configuration.h"
 #include "kafka/client/fwd.h"
+#include "kafka/server/app.h"
 #include "kafka/server/fwd.h"
 #include "kafka/server/snc_quota_manager.h"
 #include "metrics/aggregate_metrics_watcher.h"
+#include "metrics/host_metrics_watcher.h"
 #include "metrics/metrics.h"
 #include "net/conn_quota.h"
 #include "net/fwd.h"
@@ -42,17 +49,18 @@
 #include "pandaproxy/schema_registry/configuration.h"
 #include "pandaproxy/schema_registry/fwd.h"
 #include "raft/fwd.h"
-#include "redpanda/monitor_unsafe_log_flag.h"
+#include "redpanda/monitor_unsafe.h"
 #include "resource_mgmt/cpu_profiler.h"
 #include "resource_mgmt/cpu_scheduling.h"
 #include "resource_mgmt/memory_groups.h"
 #include "resource_mgmt/memory_sampling.h"
 #include "resource_mgmt/scheduling_groups_probe.h"
 #include "resource_mgmt/smp_groups.h"
+#include "resource_mgmt/storage.h"
 #include "rpc/fwd.h"
 #include "rpc/rpc_server.h"
 #include "security/fwd.h"
-#include "ssx/fwd.h"
+#include "ssx/watchdog.h"
 #include "storage/api.h"
 #include "storage/fwd.h"
 #include "transform/fwd.h"
@@ -63,6 +71,8 @@
 #include <seastar/core/metrics_registration.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/util/defer.hh>
+
+#include <memory>
 
 namespace po = boost::program_options; // NOLINT
 
@@ -91,7 +101,7 @@ public:
     void wire_up_and_start(::stop_signal&, bool test_mode = false);
     void post_start_tasks();
 
-    void check_for_crash_loop();
+    void init_crashtracker(::stop_signal& app_signal);
     void schedule_crash_tracker_file_cleanup();
 
     explicit application(ss::sstring = "main");
@@ -111,6 +121,7 @@ public:
     ss::sharded<cloud_storage::partition_recovery_manager>
       partition_recovery_manager;
     ss::sharded<cloud_storage_clients::client_pool> cloud_storage_clients;
+    ss::sharded<cloud_io::remote> cloud_io;
     ss::sharded<cloud_storage::remote> cloud_storage_api;
     ss::sharded<archival::upload_housekeeping_service>
       archival_upload_housekeeping;
@@ -118,6 +129,7 @@ public:
     ss::sharded<cluster::topic_recovery_status_frontend>
       topic_recovery_status_frontend;
     ss::sharded<cloud_storage::topic_recovery_service> topic_recovery_service;
+    ss::sharded<cluster::inventory_service> inventory_service;
 
     ss::sharded<cluster::tx_coordinator_mapper> tx_coordinator_ntp_mapper;
     ss::sharded<cluster::id_allocator_frontend> id_allocator_frontend;
@@ -127,12 +139,11 @@ public:
     ss::sharded<cluster::node_status_backend> node_status_backend;
     ss::sharded<cluster::node_status_table> node_status_table;
     ss::sharded<cluster::partition_manager> partition_manager;
-    ss::sharded<cluster::producer_state_manager> producer_manager;
+    ss::sharded<cluster::tx::producer_state_manager> producer_manager;
     ss::sharded<cluster::rm_partition_frontend> rm_partition_frontend;
     ss::sharded<cluster::self_test_backend> self_test_backend;
     ss::sharded<cluster::self_test_frontend> self_test_frontend;
     ss::sharded<cluster::shard_table> shard_table;
-    ss::sharded<cluster::tm_stm_cache_manager> tm_stm_cache_manager;
     // only one instance on core 0
     ss::sharded<cluster::tx_topic_manager> tx_topic_manager;
     ss::sharded<cluster::tx_gateway_frontend> tx_gateway_frontend;
@@ -179,9 +190,14 @@ public:
     std::unique_ptr<ssx::singleton_thread_worker> thread_worker;
 
     ss::sharded<crypto::ossl_context_service> ossl_context_service;
-    ss::sharded<kafka::server> _kafka_server;
+    ss::sharded<kafka::datalake_throttle_manager> datalake_throttle_manager;
+
+    ss::sharded<kafka::consumer_group_lag_metrics_frontend>
+      _consumer_group_lag_metrics_frontend;
+    kafka::server_app _kafka_server;
     ss::sharded<rpc::connection_cache> _connection_cache;
     ss::sharded<kafka::group_manager> _group_manager;
+    ss::sharded<experimental::cloud_topics::app> _reconciler;
 
     const std::unique_ptr<pandaproxy::schema_registry::api>& schema_registry() {
         return _schema_registry;
@@ -191,19 +207,19 @@ public:
         return _transform_rpc_client;
     }
 
+    ss::sharded<datalake::coordinator::frontend>&
+    datalake_coordinator_frontend() {
+        return _datalake_coordinator_fe;
+    }
+
 private:
+    // First warning timeout
+    static constexpr auto short_shutdown_warning_timeout = 15s;
+    // Time after which we will print the warning about the service shutdown
+    // taking too long.
+    static constexpr auto long_shutdown_warning_timeout = 120s;
     using deferred_actions
       = std::deque<ss::deferred_action<std::function<void()>>>;
-
-    struct crash_tracker_metadata
-      : serde::envelope<
-          crash_tracker_metadata,
-          serde::version<0>,
-          serde::compat_version<0>> {
-        uint32_t _crash_count{0};
-        uint64_t _config_checksum{0};
-        model::timestamp _last_start_ts;
-    };
 
     // Constructs and starts the services required to provide cryptographic
     // algorithm support to Redpanda
@@ -219,7 +235,10 @@ private:
     void
     wire_up_runtime_services(model::node_id node_id, ::stop_signal& app_signal);
     void configure_admin_server();
-    void wire_up_redpanda_services(model::node_id, ::stop_signal& app_signal);
+    void wire_up_redpanda_services(
+      model::node_id,
+      ::stop_signal& app_signal,
+      std::optional<cloud_storage_clients::bucket_name>& bucket_name);
 
     void load_feature_table_snapshot();
 
@@ -235,9 +254,58 @@ private:
     void validate_arguments(const po::variables_map&);
     void hydrate_config(const po::variables_map&);
 
+    bool requires_cloud_io();
+
     bool archival_storage_enabled();
 
     bool wasm_data_transforms_enabled();
+
+    bool datalake_enabled();
+
+    // Stop the service.
+    // The method should be invoked in the ss::thread context.
+    template<class Service>
+    void stop_service(
+      Service& s,
+      ss::sstring name,
+      std::optional<ss::sstring> next_to_stop = std::nullopt) {
+        // This watchdog is triggered after short period of time (30s). It
+        // adds message to the log that service is taking a long time to
+        // shutdown on INFO level.
+        ssx::watchdog short_wd(short_shutdown_warning_timeout, [this, name] {
+            vlog(
+              _log.info,
+              "Service {} is taking more than {} seconds to shut down.",
+              name,
+              std::chrono::duration_cast<std::chrono::seconds>(
+                short_shutdown_warning_timeout)
+                .count());
+        });
+        // This watchdog is triggered after long period of time. This indicates
+        // a bug (most likely).
+        ssx::watchdog long_wd(long_shutdown_warning_timeout, [this, name] {
+            vlog(
+              _log.info,
+              "Service {} is taking more than {} seconds to shut down!",
+              name,
+              std::chrono::duration_cast<std::chrono::seconds>(
+                long_shutdown_warning_timeout)
+                .count());
+        });
+        if (next_to_stop.has_value()) {
+            vlog(
+              _log.info,
+              "Stopping {}, ..next to shutdown is {}",
+              name,
+              *next_to_stop);
+        } else {
+            vlog(_log.info, "Stopping {}", name);
+        }
+        s.stop().get();
+        if (!next_to_stop.has_value()) {
+            vlog(_log.info, "Stopped {}", name);
+        }
+    }
 
     /**
      * @brief Construct service boilerplate.
@@ -252,25 +320,37 @@ private:
      */
     template<typename Service, typename... Args>
     ss::future<> construct_service(ss::sharded<Service>& s, Args&&... args) {
-        auto f = s.start(std::forward<Args>(args)...);
-        _deferred.emplace_back([&s] { s.stop().get(); });
-        return f;
+        auto name = ss::pretty_type_name(typeid(Service));
+        _deferred.emplace_back(
+          [this, &s, name, next_to_stop = _last_constructed_service_name] {
+              stop_service(s, name, next_to_stop);
+          });
+        _last_constructed_service_name = ss::sstring(name);
+        return s.start(std::forward<Args>(args)...);
     }
 
     template<typename Service, typename... Args>
     void construct_single_service(std::unique_ptr<Service>& s, Args&&... args) {
+        auto name = ss::pretty_type_name(typeid(Service));
         s = std::make_unique<Service>(std::forward<Args>(args)...);
-        _deferred.emplace_back([&s] {
-            s->stop().get();
-            s.reset();
-        });
+        _deferred.emplace_back(
+          [this, &s, name, next_to_stop = _last_constructed_service_name] {
+              stop_service(*s, name, next_to_stop);
+              s.reset();
+          });
+        _last_constructed_service_name = name;
     }
 
     template<typename Service, typename... Args>
     ss::future<>
     construct_single_service_sharded(ss::sharded<Service>& s, Args&&... args) {
+        auto name = ss::pretty_type_name(typeid(Service));
         auto f = s.start_single(std::forward<Args>(args)...);
-        _deferred.emplace_back([&s] { s.stop().get(); });
+        _deferred.emplace_back(
+          [this, &s, name, next_to_stop = _last_constructed_service_name] {
+              stop_service(s, name, next_to_stop);
+          });
+        _last_constructed_service_name = name;
         return f;
     }
 
@@ -310,7 +390,7 @@ private:
     std::unique_ptr<pandaproxy::schema_registry::api> _schema_registry;
     ss::sharded<storage::compaction_controller> _compaction_controller;
     ss::sharded<archival::upload_controller> _archival_upload_controller;
-    std::unique_ptr<monitor_unsafe_log_flag> _monitor_unsafe_log_flag;
+    std::unique_ptr<monitor_unsafe> _monitor_unsafe;
     ss::sharded<archival::purger> _archival_purger;
 
     std::unique_ptr<wasm::caching_runtime> _wasm_runtime;
@@ -323,19 +403,32 @@ private:
     std::unique_ptr<kafka::rm_group_proxy_impl> _rm_group_proxy;
 
     ss::sharded<resources::cpu_profiler> _cpu_profiler;
+    ss::sharded<debug_bundle::service> _debug_bundle_service;
 
     std::unique_ptr<cluster::node_isolation_watcher> _node_isolation_watcher;
 
     // Small helpers to execute one-time upgrade actions
     std::vector<std::unique_ptr<features::feature_migrator>> _migrators;
 
+    ss::sharded<datalake::coordinator::coordinator_manager>
+      _datalake_coordinator_mgr;
+    ss::sharded<datalake::coordinator::frontend> _datalake_coordinator_fe;
+    ss::sharded<datalake::datalake_manager> _datalake_manager;
+
     // run these first on destruction
     deferred_actions _deferred;
+    std::optional<ss::sstring> _last_constructed_service_name;
 
     ss::sharded<aggregate_metrics_watcher> _aggregate_metrics_watcher;
 
     // instantiated only in recovery mode
     std::unique_ptr<cluster::tx_manager_migrator> _tx_manager_migrator;
+
+    config::node_override_store _node_overrides{};
+
+    std::unique_ptr<crash_tracker::service> _crash_tracker_service;
+
+    std::unique_ptr<metrics::host_metrics_watcher> _host_metrics_watcher;
 
     ss::sharded<ss::abort_source> _as;
 };

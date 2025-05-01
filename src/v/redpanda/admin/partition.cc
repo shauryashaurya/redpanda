@@ -19,6 +19,7 @@
 #include "cluster/topics_frontend.h"
 #include "container/fragmented_vector.h"
 #include "container/lw_shared_container.h"
+#include "model/record.h"
 #include "redpanda/admin/api-doc/debug.json.hh"
 #include "redpanda/admin/api-doc/partition.json.hh"
 #include "redpanda/admin/server.h"
@@ -29,6 +30,7 @@
 #include <boost/algorithm/string/predicate.hpp>
 #include <boost/algorithm/string/split.hpp>
 #include <boost/algorithm/string/trim.hpp>
+#include <boost/lexical_cast.hpp>
 
 using admin::apply_validator;
 
@@ -64,7 +66,7 @@ admin_server::get_transactions_inner_handler(
     auto partition = pm.get(ntp);
     if (!partition) {
         throw ss::httpd::server_error_exception(
-          fmt_with_ctx(fmt::format, "Can not find partition {}", partition));
+          fmt_with_ctx(fmt::format, "Can not find partition {}", ntp));
     }
 
     auto rm_stm_ptr = partition->rm_stm();
@@ -130,29 +132,26 @@ admin_server::mark_transaction_expired_handler(
     const model::ntp ntp = parse_ntp_from_request(req->param);
 
     model::producer_identity pid;
-    auto node = req->get_query_param("id");
+    auto param = req->get_query_param("id");
     try {
-        pid.id = std::stoi(node);
+        pid.id = boost::lexical_cast<model::producer_id>(param);
     } catch (...) {
-        throw ss::httpd::bad_param_exception(fmt_with_ctx(
-          fmt::format, "Transaction id must be an integer: {}", node));
+        throw ss::httpd::bad_param_exception(
+          fmt_with_ctx(fmt::format, "Invalid producer id: {}", param));
     }
-    node = req->get_query_param("epoch");
+    param = req->get_query_param("epoch");
     try {
-        int64_t epoch = std::stoi(node);
-        if (
-          epoch < std::numeric_limits<int16_t>::min()
-          || epoch > std::numeric_limits<int16_t>::max()) {
-            throw ss::httpd::bad_param_exception(
-              fmt_with_ctx(fmt::format, "Invalid transaction epoch {}", epoch));
-        }
-        pid.epoch = epoch;
+        pid.epoch = boost::lexical_cast<model::producer_epoch>(param);
     } catch (...) {
-        throw ss::httpd::bad_param_exception(fmt_with_ctx(
-          fmt::format, "Transaction epoch must be an integer: {}", node));
+        throw ss::httpd::bad_param_exception(
+          fmt_with_ctx(fmt::format, "Invalid producer epoch: {}", param));
     }
 
-    vlog(adminlog.info, "Mark transaction expired for pid:{}", pid);
+    vlog(
+      adminlog.info,
+      "Mark transaction expired for partition: {}, pid:{}",
+      ntp,
+      pid);
 
     if (need_redirect_to_leader(ntp, _metadata_cache)) {
         throw co_await redirect_to_leader(*req, ntp);
@@ -175,8 +174,8 @@ admin_server::mark_transaction_expired_handler(
           auto partition = pm.get(ntp);
           if (!partition) {
               return ss::make_exception_future<ss::json::json_return_type>(
-                ss::httpd::server_error_exception(fmt_with_ctx(
-                  fmt::format, "Can not find partition {}", partition)));
+                ss::httpd::server_error_exception(
+                  fmt_with_ctx(fmt::format, "Can not find partition {}", ntp)));
           }
 
           auto rm_stm_ptr = partition->rm_stm();
@@ -191,7 +190,7 @@ admin_server::mark_transaction_expired_handler(
 
           return rm_stm_ptr->mark_expired(pid).then(
             [this, ntp, req = std::move(req)](auto res) {
-                return throw_on_error(*req, res, ntp).then([] {
+                return throw_on_error(*req, std::error_code{res}, ntp).then([] {
                     return ss::json::json_return_type(ss::json::json_void());
                 });
             });
@@ -205,14 +204,14 @@ admin_server::get_reconfigurations_handler(std::unique_ptr<ss::http::request>) {
     auto& in_progress
       = _controller->get_topics_state().local().updates_in_progress();
 
-    std::vector<model::ntp> ntps;
+    chunked_vector<model::ntp> ntps;
     ntps.reserve(in_progress.size());
 
     for (auto& [ntp, status] : in_progress) {
         ntps.push_back(ntp);
     }
 
-    auto const deadline = model::timeout_clock::now() + 5s;
+    const auto deadline = model::timeout_clock::now() + 5s;
 
     auto [reconfiguration_states, reconciliations]
       = co_await ss::when_all_succeed(
@@ -239,9 +238,13 @@ admin_server::get_reconfigurations_handler(std::unique_ptr<ss::http::request>) {
     auto reconciliations_ptr
       = ss::make_lw_shared<cluster::global_reconciliation_state>(
         std::move(reconciliations));
+    auto reconfiguration_states_value = std::move(
+      reconfiguration_states.value());
+
     co_return ss::json::json_return_type(ss::json::stream_range_as_array(
-      std::move(reconfiguration_states.value()),
-      [reconciliations = std::move(reconciliations_ptr)](auto& s) {
+      lw_shared_container(std::move(reconfiguration_states_value)),
+      [reconciliations = std::move(reconciliations_ptr)](
+        const cluster::partition_reconfiguration_state& s) -> reconfiguration {
           reconfiguration r;
           r.ns = s.ntp.ns;
           r.topic = s.ntp.tp.topic;
@@ -263,9 +266,9 @@ admin_server::get_reconfigurations_handler(std::unique_ptr<ss::http::request>) {
 
           size_t left_to_move = 0;
           size_t already_moved = 0;
-          for (auto replica_status : s.already_transferred_bytes) {
-              left_to_move += (s.current_partition_size - replica_status.bytes);
-              already_moved += replica_status.bytes;
+          for (auto replica_status : s.replicas) {
+              left_to_move += replica_status.bytes_left;
+              already_moved += replica_status.bytes_transferred;
           }
           r.bytes_left_to_move = left_to_move;
           r.bytes_moved = already_moved;
@@ -401,19 +404,32 @@ ss::future<std::vector<model::broker_shard>> validate_set_replicas(
               "`node_id` and `core` must be integers");
         }
         const auto node_id = model::node_id(r["node_id"].GetInt());
-        const auto shard = static_cast<uint32_t>(r["core"].GetInt());
-
-        // Validate node ID and shard - subsequent code assumes
-        // they exist and may assert if not.
-        bool is_valid = co_await topic_fe.validate_shard(node_id, shard);
-        if (!is_valid) {
-            throw ss::httpd::bad_request_exception(fmt::format(
-              "Replica set refers to non-existent node/shard (node "
-              "{} "
-              "shard {})",
-              node_id,
-              shard));
+        uint32_t shard = 0;
+        if (topic_fe.node_local_core_assignment_enabled()) {
+            bool is_valid = co_await topic_fe.validate_shard(node_id, 0);
+            if (!is_valid) {
+                throw ss::httpd::bad_request_exception(fmt::format(
+                  "Replica set refers to non-existent node {}", node_id));
+            }
+#ifndef NDEBUG
+            // set invalid shard in debug mode so that we can spot places
+            // where we are still using it.
+            shard = 32132132;
+#endif
+        } else {
+            shard = static_cast<uint32_t>(r["core"].GetInt());
+            // Validate node ID and shard - subsequent code assumes
+            // they exist and may assert if not.
+            bool is_valid = co_await topic_fe.validate_shard(node_id, shard);
+            if (!is_valid) {
+                throw ss::httpd::bad_request_exception(fmt::format(
+                  "Replica set refers to non-existent node/shard "
+                  "(node {} shard {})",
+                  node_id,
+                  shard));
+            }
         }
+
         auto contains_already = std::find_if(
                                   replicas.begin(),
                                   replicas.end(),
@@ -521,6 +537,31 @@ admin_server::force_set_partition_replicas_handler(
 }
 
 ss::future<ss::json::json_return_type>
+admin_server::toggle_append_entries_error_injection(
+  std::unique_ptr<ss::http::request> req, bool inject) {
+    auto ntp = parse_ntp_from_request(req->param);
+    auto shard = _shard_table.local().shard_for(ntp);
+    if (!shard) {
+        throw ss::httpd::bad_request_exception(fmt_with_ctx(
+          fmt::format, "Partition {} not found on this node", ntp));
+    }
+
+    co_return co_await _partition_manager.invoke_on(
+      *shard,
+      [ntp = std::move(ntp), inject](cluster::partition_manager& pm) mutable
+      -> ss::future<ss::json::json_return_type> {
+          auto partition = pm.get(ntp);
+          if (!partition) {
+              return ss::make_exception_future<ss::json::json_return_type>(
+                ss::httpd::bad_request_exception(fmt_with_ctx(
+                  fmt::format, "Partition {} not found on this node", ntp)));
+          }
+          partition->raft()->toggle_append_entries_error_injection(inject);
+          return ssx::now<ss::json::json_return_type>(ss::json::json_void());
+      });
+}
+
+ss::future<ss::json::json_return_type>
 admin_server::set_partition_replicas_handler(
   std::unique_ptr<ss::http::request> req) {
     auto ntp = parse_ntp_from_request(req->param);
@@ -574,6 +615,72 @@ admin_server::set_partition_replicas_handler(
     co_return ss::json::json_void();
 }
 
+namespace {
+json::validator make_set_replica_core_validator() {
+    const std::string schema = R"(
+{
+    "type": "object",
+    "properties": {
+        "core": {
+            "type": "number"
+        }
+    },
+    "required": [
+        "core"
+    ],
+    "additionalProperties": false
+}
+)";
+    return json::validator(schema);
+}
+
+uint32_t parse_replica_core_from_json(const json::Document& doc) {
+    static thread_local json::validator json_validator(
+      make_set_replica_core_validator());
+    apply_validator(json_validator, doc);
+
+    if (!doc.IsObject()) {
+        throw ss::httpd::bad_request_exception("Expected array");
+    }
+    const auto& core_field = doc["core"];
+    if (!core_field.IsInt()) {
+        throw ss::httpd::bad_request_exception("`core` must be integer");
+    }
+    return uint32_t(core_field.GetInt());
+}
+
+} // namespace
+
+ss::future<ss::json::json_return_type>
+admin_server::set_partition_replica_core_handler(
+  std::unique_ptr<ss::http::request> req) {
+    auto ntp = parse_ntp_from_request(req->param);
+
+    auto node_str = req->param.get_decoded_param("node");
+    model::node_id node_id;
+    try {
+        node_id = model::node_id(std::stoi(node_str));
+    } catch (...) {
+        throw ss::httpd::bad_param_exception(
+          fmt::format("node parameter must be an integer: `{}'", node_str));
+    }
+
+    auto doc = co_await parse_json_body(req.get());
+    uint32_t core = parse_replica_core_from_json(doc);
+
+    if (ntp == model::controller_ntp) {
+        throw ss::httpd::bad_request_exception(
+          fmt::format("Can't modify controller partition core"));
+    }
+
+    auto ec = co_await _controller->get_topics_frontend()
+                .local()
+                .set_partition_replica_shard(
+                  ntp, node_id, core, model::timeout_clock::now() + 5s);
+    co_await throw_on_error(*req, ec, ntp);
+    co_return ss::json::json_void();
+}
+
 void admin_server::register_partition_routes() {
     /*
      * Get a list of partition summaries.
@@ -620,7 +727,7 @@ void admin_server::register_partition_routes() {
                 return ss::json::json_return_type(
                   ss::json::stream_range_as_array(
                     lw_shared_container{std::move(partitions)},
-                    [](summary const& i) -> summary const& { return i; }));
+                    [](const summary& i) -> const summary& { return i; }));
             });
       });
 
@@ -645,7 +752,7 @@ void admin_server::register_partition_routes() {
                       if (it.second->get_leader_id() == std::nullopt) {
                           s.leaderless += 1;
                       }
-                      if (it.second->get_under_replicated() == std::nullopt) {
+                      if (it.second->get_under_replicated() > 0) {
                           s.under_replicated += 1;
                       }
                   }
@@ -722,9 +829,27 @@ void admin_server::register_partition_routes() {
       });
 
     register_route<superuser>(
+      ss::httpd::debug_json::enable_append_entries_error_injection,
+      [this](std::unique_ptr<ss::http::request> req) {
+          return toggle_append_entries_error_injection(std::move(req), true);
+      });
+
+    register_route<superuser>(
+      ss::httpd::debug_json::disable_append_entries_error_injection,
+      [this](std::unique_ptr<ss::http::request> req) {
+          return toggle_append_entries_error_injection(std::move(req), false);
+      });
+
+    register_route<superuser>(
       ss::httpd::partition_json::trigger_partitions_rebalance,
       [this](std::unique_ptr<ss::http::request> req) {
           return trigger_on_demand_rebalance_handler(std::move(req));
+      });
+
+    register_route<superuser>(
+      ss::httpd::partition_json::trigger_partitions_shard_rebalance,
+      [this](std::unique_ptr<ss::http::request> req) {
+          return trigger_shard_rebalance_handler(std::move(req));
       });
 
     register_route<user>(
@@ -743,6 +868,12 @@ void admin_server::register_partition_routes() {
       ss::httpd::partition_json::force_recover_from_nodes,
       [this](std::unique_ptr<ss::http::request> req) {
           return force_recover_partitions_from_nodes(std::move(req));
+      });
+
+    register_route<superuser>(
+      ss::httpd::partition_json::set_partition_replica_core,
+      [this](std::unique_ptr<ss::http::request> req) {
+          return set_partition_replica_core_handler(std::move(req));
       });
 }
 namespace {
@@ -840,7 +971,8 @@ ss::future<ss::json::json_return_type>
 admin_server::get_topic_partitions_handler(
   std::unique_ptr<ss::http::request> req) {
     model::topic_namespace tp_ns(
-      model::ns(req->param["namespace"]), model::topic(req->param["topic"]));
+      model::ns(req->get_path_param("namespace")),
+      model::topic(req->get_path_param("topic")));
     const bool is_controller_topic = tp_ns.ns == model::controller_ntp.ns
                                      && tp_ns.tp
                                           == model::controller_ntp.tp.topic;
@@ -866,7 +998,7 @@ admin_server::get_topic_partitions_handler(
       = _controller->get_topics_state().local().get_topic_disabled_set(tp_ns);
 
     // Normal topic
-    for (const auto& p_as : assignments) {
+    for (const auto& [_, p_as] : assignments) {
         partition_t p;
         p.ns = tp_ns.ns;
         p.topic = tp_ns.tp;
@@ -993,7 +1125,6 @@ admin_server::get_majority_lost_partitions(
 }
 
 namespace {
-
 json::validator make_node_id_array_validator() {
     const std::string schema = R"(
     {
@@ -1235,5 +1366,16 @@ admin_server::trigger_on_demand_rebalance_handler(
       });
 
     co_await throw_on_error(*req, ec, model::controller_ntp);
+    co_return ss::json::json_return_type(ss::json::json_void());
+}
+
+ss::future<ss::json::json_return_type>
+admin_server::trigger_shard_rebalance_handler(
+  std::unique_ptr<ss::http::request> req) {
+    auto ec = co_await _controller->get_topics_frontend()
+                .local()
+                .trigger_local_partition_shard_rebalance();
+
+    co_await throw_on_error(*req, ec, model::ntp{});
     co_return ss::json::json_return_type(ss::json::json_void());
 }

@@ -29,6 +29,13 @@
               "schema": {"type": "integer"},
               "required": false,
               "description": "If nonzero, do not apply any changes (but still do validation and return 400 on errors)"
+            },
+            {
+              "in": "body",
+              "required": true,
+              "schema": {
+                "$ref": "#/definitions/patch_cluster_config_request"
+              }
             }
           ],
           "responses": {
@@ -49,6 +56,14 @@
           "nickname": "get_cluster_config",
           "produces": ["application/json"],
           "parameters": [
+            {
+              "name": "key",
+              "in": "query",
+              "schema": {"type": "string"},
+              "required": false,
+              "allowMultiple": false,
+             "description": "The name of the (sole) property to read from the config. Respects property aliases."
+            },
             {
               "name": "include_defaults",
               "in": "query",

@@ -9,10 +9,10 @@
  * by the Apache License, Version 2.0
  */
 
+#include "cloud_io/tests/s3_imposter.h"
 #include "cloud_storage/async_manifest_view.h"
 #include "cloud_storage/download_exception.h"
 #include "cloud_storage/tests/cloud_storage_fixture.h"
-#include "cloud_storage/tests/s3_imposter.h"
 #include "cloud_storage/tests/util.h"
 #include "model/record_batch_types.h"
 
@@ -23,6 +23,8 @@
 #include <random>
 
 using namespace cloud_storage;
+
+static const remote_path_provider path_provider(std::nullopt, std::nullopt);
 
 inline ss::logger test_log("test"); // NOLINT
 
@@ -36,7 +38,6 @@ scan_remote_partition_incrementally_with_reuploads(
   size_t maybe_max_readers = 0) {
     ss::lowres_clock::update();
     auto conf = fixt.get_configuration();
-    static auto bucket = cloud_storage_clients::bucket_name("bucket");
     if (maybe_max_segments) {
         config::shard_local_cfg()
           .cloud_storage_max_materialized_segments_per_shard.set_value(
@@ -50,12 +51,16 @@ scan_remote_partition_incrementally_with_reuploads(
     auto m = ss::make_lw_shared<cloud_storage::partition_manifest>(
       manifest_ntp, manifest_revision);
 
-    auto manifest = hydrate_manifest(fixt.api.local(), bucket);
+    auto manifest = hydrate_manifest(fixt.api.local(), fixt.bucket_name);
     partition_probe probe(manifest.get_ntp());
     auto manifest_view = ss::make_shared<async_manifest_view>(
-      fixt.api, fixt.cache, manifest, bucket);
+      fixt.api, fixt.cache, manifest, fixt.bucket_name, path_provider);
     auto partition = ss::make_shared<remote_partition>(
-      manifest_view, fixt.api.local(), fixt.cache.local(), bucket, probe);
+      manifest_view,
+      fixt.api.local(),
+      fixt.cache.local(),
+      fixt.bucket_name,
+      probe);
     auto partition_stop = ss::defer([&partition] { partition->stop().get(); });
 
     partition->start().get();
@@ -357,7 +362,7 @@ FIXTURE_TEST(
     try {
         auto headers_read
           = scan_remote_partition_incrementally_with_closest_lso(
-            *this, base, max, 5, 5);
+            *this, base, max, 5, 25);
         vlog(test_log.debug, "{} record batches consumed", headers_read.size());
         model::offset expected_offset{0};
         size_t ix_header = 0;
@@ -457,14 +462,12 @@ FIXTURE_TEST(test_scan_while_shutting_down, cloud_storage_fixture) {
     auto m = ss::make_lw_shared<cloud_storage::partition_manifest>(
       manifest_ntp, manifest_revision);
 
-    static auto bucket = cloud_storage_clients::bucket_name("bucket");
-
-    auto manifest = hydrate_manifest(api.local(), bucket);
+    auto manifest = hydrate_manifest(api.local(), bucket_name);
     partition_probe probe(manifest.get_ntp());
     auto manifest_view = ss::make_shared<async_manifest_view>(
-      api, cache, manifest, bucket);
+      api, cache, manifest, bucket_name, path_provider);
     auto partition = ss::make_shared<remote_partition>(
-      manifest_view, api.local(), this->cache.local(), bucket, probe);
+      manifest_view, api.local(), this->cache.local(), bucket_name, probe);
     partition->start().get();
     auto partition_stop = ss::defer([&partition] { partition->stop().get(); });
 

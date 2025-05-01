@@ -31,8 +31,7 @@ class TieredStorageReaderStressTest(RedpandaTest):
     cache_max_throughput = 10 * expect_throughput
     cache_size = SISettings.cache_size_for_throughput(cache_max_throughput)
 
-    # This is the same as the default at time of writing (v23.2)
-    readers_per_shard = 1000
+    readers_per_shard = 10000
 
     # To help reduce runtime by requiring less data to get a given segment count
     segment_size = 16 * 1024 * 1024
@@ -297,9 +296,6 @@ class TieredStorageReaderStressTest(RedpandaTest):
             # The stats indicate saturation with tiered storage reads.
             assert stats['partition_readers_delayed'] or stats[
                 'segment_readers_delayed']
-            # There are still some segment readers cached as expected, they shouldn't
-            # all have been trimmed.
-            assert stats['segment_readers']
 
         def is_metric_zero(fn, label):
             for node, stats in self._get_stats().items():

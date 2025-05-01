@@ -10,6 +10,7 @@
 from collections import defaultdict
 from enum import Enum
 import random
+import re
 import threading
 import time
 import requests
@@ -20,6 +21,7 @@ from rptest.services.admin import Admin
 from rptest.services.failure_injector import FailureInjector, FailureSpec
 from rptest.services.redpanda import RedpandaService
 from rptest.services.redpanda_installer import VERSION_RE, int_tuple
+from rptest.util import wait_until_result
 
 
 class OperationType(Enum):
@@ -77,6 +79,51 @@ def generate_random_workload(available_nodes):
                 idx = random.choice(decommissioned_nodes)
                 add(idx)
                 yield NodeOperation(op, idx, random.choice([True, False]))
+
+
+def verify_offset_translator_state_consistent(redpanda: RedpandaService):
+    logger = redpanda.logger
+    last_delta_pattern = re.compile('^\\{.*, last delta: (?P<delta>\\d+)\\}$')
+    admin = Admin(redpanda)
+
+    for n in redpanda.started_nodes():
+        node_id = redpanda.node_id(n)
+        all_partitions = admin.get_partitions(node=n)
+
+        def _state_consistent(ns, topic, partition):
+
+            state = admin.get_partition_state(ns, topic, partition, node=n)
+            dirty_offset = state['replicas'][0]['dirty_offset']
+            if all(r['dirty_offset'] == dirty_offset
+                   for r in state['replicas']):
+                return True, state
+            return False, None
+
+        for p in all_partitions:
+            namespace = p['ns']
+            topic = p['topic']
+            partition = p['partition_id']
+            partition_name = f"{namespace}/{topic}/{partition}"
+            state = wait_until_result(
+                lambda: _state_consistent(namespace, topic, partition),
+                timeout_sec=180,
+                backoff_sec=1,
+                err_msg="Error waiting for offsets to be consistent")
+
+            logger.debug(
+                f"debug state of {partition_name} replica on node {node_id}: {state}"
+            )
+            last_deltas = set()
+            for r_state in state['replicas']:
+                ot_state = r_state['raft_state']['offset_translator_state']
+                if "empty" in ot_state:
+                    continue
+                m = last_delta_pattern.match(ot_state)
+                assert m, f"offset translator state {ot_state} does not match expected pattern"
+                last_deltas.add(m['delta'])
+            assert len(
+                last_deltas
+            ) <= 1, f"partition {p} has inconsistent offset translation. Last deltas: {last_deltas}"
 
 
 class NodeDecommissionWaiter():
@@ -221,6 +268,7 @@ class NodeOpsExecutor():
         self.timeout = 360
         self.lock = lock
         self.progress_timeout = progress_timeout
+        self.override_config_params: None | dict = None
 
     def node_id(self, idx):
         return self.redpanda.node_id(self.redpanda.get_node(idx),
@@ -373,10 +421,12 @@ class NodeOpsExecutor():
 
         node = self.redpanda.get_node(idx)
 
-        self.redpanda.start_node(node,
-                                 timeout=self.timeout,
-                                 auto_assign_node_id=True,
-                                 omit_seeds_on_idx_one=False)
+        self.redpanda.start_node(
+            node,
+            timeout=self.timeout,
+            auto_assign_node_id=True,
+            omit_seeds_on_idx_one=False,
+            override_cfg_params=self.override_config_params)
 
         self.logger.info(
             f"added node: {idx} with new node id: {self.node_id(idx)}")
@@ -441,39 +491,49 @@ class NodeOpsExecutor():
 
 
 class FailureInjectorBackgroundThread():
-    def __init__(self, redpanda: RedpandaService, logger,
-                 lock: threading.Lock):
+    def __init__(self,
+                 redpanda: RedpandaService,
+                 logger,
+                 lock: threading.Lock = threading.Lock(),
+                 max_suspend_duration_seconds: int = 10,
+                 min_inter_failure_time: int = 30,
+                 max_inter_failure_time: int = 60,
+                 failure_specs: list = FailureSpec.FAILURE_TYPES):
         self.stop_ev = threading.Event()
         self.redpanda = redpanda
         self.thread = None
         self.logger = logger
-        self.max_suspend_duration_seconds = 10
-        self.min_inter_failure_time = 30
-        self.max_inter_failure_time = 60
-        self.node_start_stop_mutexes = {}
+        self.max_suspend_duration_seconds = max_suspend_duration_seconds
+        self.min_inter_failure_time = min_inter_failure_time
+        self.max_inter_failure_time = max_inter_failure_time
+        self.allowed_failures = failure_specs
         self.lock = lock
         self.error = None
 
     def start(self):
+        assert self.thread is None, "failure injector thread already started"
         self.logger.info(
             f"Starting failure injector thread with: (max suspend duration {self.max_suspend_duration_seconds},"
             f"min inter failure time: {self.min_inter_failure_time}, max inter failure time: {self.max_inter_failure_time})"
         )
+        self.redpanda.tolerate_not_running += 1
         self.thread = threading.Thread(target=lambda: self._worker(), args=())
         self.thread.daemon = True
         self.thread.start()
 
     def stop(self):
-        self.logger.info(f"Stopping failure injector thread")
+        assert self.thread is not None, "failure injector thread not started"
+        self.logger.info("Stopping failure injector thread")
         self.stop_ev.set()
         self.thread.join()
+        self.redpanda.tolerate_not_running -= 1
         assert self.error is None, f"failure injector error, most likely node failed to stop: {self.error}"
 
     def _worker(self):
         with FailureInjector(self.redpanda) as f_injector:
             while not self.stop_ev.is_set():
 
-                f_type = random.choice(FailureSpec.FAILURE_TYPES)
+                f_type = random.choice(self.allowed_failures)
                 # failure injector uses only started nodes, this way
                 # we guarantee that failures will not interfere with
                 # nodes start checks

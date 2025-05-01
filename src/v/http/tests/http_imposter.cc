@@ -11,9 +11,8 @@
 #include "http/tests/http_imposter.h"
 
 #include "base/vlog.h"
+#include "http/tests/utils.h"
 #include "utils/uuid.h"
-
-#include <seastar/http/function_handlers.hh>
 
 #include <utility>
 
@@ -21,7 +20,7 @@ static ss::logger http_imposter_log("http_imposter"); // NOLINT
 
 http_imposter_fixture::http_imposter_fixture(uint16_t port)
   : _port(port)
-  , _server_addr{ss::ipv4_addr{httpd_host_name.data(), httpd_port_number()}}
+  , _server_addr{ss::ipv4_addr{httpd_host_ip.data(), httpd_port_number()}}
   , _address{
       {httpd_host_name.data(), httpd_host_name.size()}, httpd_port_number()} {
     _id = fmt::format("{}", uuid_t::create());
@@ -43,6 +42,18 @@ http_imposter_fixture::get_requests() const {
     return _requests;
 }
 
+std::vector<http_test_utils::request_info> http_imposter_fixture::get_requests(
+  http_imposter_fixture::req_pred_t predicate) const {
+    std::vector<http_test_utils::request_info> matching_requests;
+    matching_requests.reserve(_requests.size());
+    std::copy_if(
+      _requests.cbegin(),
+      _requests.cend(),
+      std::back_inserter(matching_requests),
+      std::move(predicate));
+    return matching_requests;
+}
+
 static ss::sstring remove_query_params(std::string_view url) {
     return ss::sstring{url.substr(0, url.find('?'))};
 }
@@ -51,7 +62,7 @@ std::optional<std::reference_wrapper<const http_test_utils::request_info>>
 http_imposter_fixture::get_latest_request(
   const ss::sstring& url, bool ignore_url_params) const {
     auto i = std::ranges::upper_bound(
-      _targets, url, std::less<>{}, [=](auto const& url_ri) {
+      _targets, url, std::less<>{}, [=](const auto& url_ri) {
           return ignore_url_params ? remove_query_params(url_ri.first)
                                    : url_ri.first;
       });
@@ -82,8 +93,9 @@ void http_imposter_fixture::listen() {
 
 void http_imposter_fixture::set_routes(ss::httpd::routes& r) {
     using namespace ss::httpd;
-    _handler = std::make_unique<function_handler>(
-      [this](const_req req, ss::http::reply& repl) -> ss::sstring {
+    _handler = std::make_unique<http::test_utils::flexible_function_handler>(
+      [this](const_req req, ss::http::reply& repl, ss::sstring& content_type)
+        -> ss::sstring {
           if (_masking_active) {
               if (
                 ss::lowres_clock::now() - _masking_active->started
@@ -141,6 +153,7 @@ void http_imposter_fixture::set_routes(ss::httpd::routes& r) {
           } else if (
             req._method == "POST" && req.query_parameters.contains("delete")) {
               // Delete objects
+              content_type = "xml";
               return R"xml(<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></DeleteResult>)xml";
           } else {
               auto lookup_r = ri;
@@ -150,12 +163,14 @@ void http_imposter_fixture::set_routes(ss::httpd::routes& r) {
               repl.set_status(response.status);
               for (const auto& [k, v] : response.headers) {
                   repl.add_header(k, v);
+                  if (k == "Content-Type" && v == "application/xml") {
+                      content_type = "xml";
+                  }
               }
 
               return response.body;
           }
-      },
-      "txt");
+      });
     r.add_default_handler(_handler.get());
 }
 
@@ -163,7 +178,7 @@ bool http_imposter_fixture::has_call(
   std::string_view url, bool ignore_params) const {
     return std::ranges::find_if(
              _requests,
-             [&](http_test_utils::request_info const& ri) {
+             [&](const http_test_utils::request_info& ri) {
                  return url
                         == (ignore_params ? remove_query_params(ri.url) : ri.url);
              })

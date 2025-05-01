@@ -62,7 +62,7 @@ raft::reply_result random_reply_status() {
     return random_generators::random_choice(std::vector<raft::reply_result>{
       raft::reply_result::success,
       raft::reply_result::failure,
-      raft::reply_result::timeout,
+      raft::reply_result::follower_busy,
       raft::reply_result::group_unavailable});
 }
 
@@ -162,7 +162,7 @@ SEASTAR_THREAD_TEST_CASE(heartbeat_reply_for_each) {
           actual.emplace_back(g, result);
       });
     BOOST_REQUIRE_EQUAL(expected.size(), actual.size());
-    for (auto i = 0; i < expected.size(); ++i) {
+    for (size_t i = 0; i < expected.size(); ++i) {
         BOOST_REQUIRE_EQUAL(expected[i].first, actual[i].first);
         BOOST_REQUIRE_EQUAL(int(expected[i].second), (int)actual[i].second);
     }

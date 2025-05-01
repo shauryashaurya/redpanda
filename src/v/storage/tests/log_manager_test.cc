@@ -7,7 +7,6 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0
 
-#include "bytes/random.h"
 #include "model/fundamental.h"
 #include "model/record_utils.h"
 #include "model/tests/random_batch.h"
@@ -20,6 +19,7 @@
 #include "storage/segment.h"
 #include "storage/segment_appender.h"
 #include "storage/segment_reader.h"
+#include "test_utils/random_bytes.h"
 
 #include <seastar/core/thread.hh>
 #include <seastar/testing/thread_test_case.hh>
@@ -29,7 +29,7 @@ using namespace std::chrono_literals; // NOLINT
 using namespace storage;              // NOLINT
 
 void write_garbage(segment_appender& ptr) {
-    auto b = random_generators::get_bytes(100);
+    auto b = tests::random_bytes(100);
     // NOLINTNEXTLINE
     ptr.append(reinterpret_cast<const char*>(b.data()), b.size()).get();
     ptr.flush().get();
@@ -37,10 +37,11 @@ void write_garbage(segment_appender& ptr) {
 
 void write_batches(ss::lw_shared_ptr<segment> seg) {
     auto batches = model::test::make_random_batches(
-      seg->offsets().get_base_offset() + model::offset(1), 1);
+                     seg->offsets().get_base_offset() + model::offset(1), 1)
+                     .get();
     for (auto& b : batches) {
         b.header().header_crc = model::internal_header_only_crc(b.header());
-        (void)seg->append(std::move(b)).get0();
+        (void)seg->append(std::move(b)).get();
     }
     seg->flush().get();
 }
@@ -100,8 +101,9 @@ SEASTAR_THREAD_TEST_CASE(test_can_load_logs) {
                   model::term_id(1),
                   ss::default_priority_class(),
                   default_segment_readahead_size,
-                  default_segment_readahead_count)
-                 .get0();
+                  default_segment_readahead_count,
+                  0)
+                 .get();
     seg->close().get();
 
     // auto ntp2 = empty
@@ -112,8 +114,9 @@ SEASTAR_THREAD_TEST_CASE(test_can_load_logs) {
                    model::term_id(1),
                    ss::default_priority_class(),
                    default_segment_readahead_size,
-                   default_segment_readahead_count)
-                  .get0();
+                   default_segment_readahead_count,
+                   1_MiB)
+                  .get();
     write_batches(seg3);
     seg3->close().get();
 
@@ -123,8 +126,9 @@ SEASTAR_THREAD_TEST_CASE(test_can_load_logs) {
                    model::term_id(1),
                    ss::default_priority_class(),
                    default_segment_readahead_size,
-                   default_segment_readahead_count)
-                  .get0();
+                   default_segment_readahead_count,
+                   1_MiB)
+                  .get();
     write_garbage(seg4->appender());
     seg4->close().get();
 
@@ -137,9 +141,9 @@ SEASTAR_THREAD_TEST_CASE(test_can_load_logs) {
     BOOST_CHECK_EQUAL(m.get(ntps[1].ntp())->segment_count(), 0);
     BOOST_CHECK_EQUAL(m.get(ntps[2].ntp())->segment_count(), 1);
     BOOST_CHECK_EQUAL(m.get(ntps[3].ntp())->segment_count(), 0);
-    BOOST_CHECK(!file_exists(seg->reader().filename()).get0());
-    BOOST_CHECK(file_exists(seg3->reader().filename()).get0());
-    BOOST_CHECK(!file_exists(seg4->reader().filename()).get0());
+    BOOST_CHECK(!file_exists(seg->reader().filename()).get());
+    BOOST_CHECK(file_exists(seg3->reader().filename()).get());
+    BOOST_CHECK(!file_exists(seg4->reader().filename()).get());
     BOOST_CHECK(
-      file_exists(seg4->reader().filename() + ".cannotrecover").get0());
+      file_exists(seg4->reader().filename() + ".cannotrecover").get());
 }

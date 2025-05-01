@@ -10,11 +10,11 @@
  */
 #pragma once
 #include "cluster/rm_stm.h"
+#include "container/fragmented_vector.h"
 #include "container/intrusive_list_helpers.h"
 #include "kafka/protocol/fetch.h"
 #include "kafka/server/handlers/fetch/replica_selector.h"
 #include "kafka/server/handlers/handler.h"
-#include "kafka/types.h"
 #include "model/fundamental.h"
 #include "model/ktp.h"
 #include "model/metadata.h"
@@ -27,7 +27,15 @@
 
 namespace kafka {
 
-using fetch_handler = single_stage_handler<fetch_api, 4, 11>;
+std::optional<ss::scheduling_group>
+fetch_scheduling_group_provider(const connection_context&);
+
+using fetch_handler = single_stage_handler<
+  fetch_api,
+  4,
+  11,
+  default_estimate_adaptor,
+  fetch_scheduling_group_provider>;
 
 /*
  * Fetch operation context
@@ -191,7 +199,7 @@ struct fetch_config {
           cfg.abort_source.has_value()
             ? cfg.abort_source.value().get().abort_requested()
             : false,
-          cfg.client_address.value_or(model::client_address_t{"unknown"}));
+          cfg.client_address.value_or(model::client_address_t{}));
         return o;
     }
 };
@@ -250,13 +258,20 @@ struct read_result {
     };
 
     explicit read_result(error_code e)
-      : error(e) {}
+      : start_offset(-1)
+      , high_watermark(-1)
+      , last_stable_offset(-1)
+      , error(e) {}
 
     // special case for offset_out_of_range_error
     read_result(
-      error_code e, model::offset start_offset, model::offset high_watermark)
+      error_code e,
+      model::offset start_offset,
+      model::offset hw,
+      model::offset lso)
       : start_offset(start_offset)
-      , high_watermark(high_watermark)
+      , high_watermark(hw)
+      , last_stable_offset(lso)
       , error(e) {}
 
     read_result(
@@ -264,11 +279,13 @@ struct read_result {
       model::offset start_offset,
       model::offset hw,
       model::offset lso,
-      std::vector<cluster::rm_stm::tx_range> aborted_transactions)
+      std::optional<std::chrono::milliseconds> delta,
+      std::vector<cluster::tx::tx_range> aborted_transactions)
       : data(std::move(data))
       , start_offset(start_offset)
       , high_watermark(hw)
       , last_stable_offset(lso)
+      , delta_from_tip_ms(delta)
       , error(error_code::none)
       , aborted_transactions(std::move(aborted_transactions)) {}
 
@@ -311,26 +328,28 @@ struct read_result {
         return ss::visit(
           data,
           [](data_t& d) { return std::move(*d); },
-          [](foreign_data_t& d) {
-              auto ret = d->copy();
-              d.reset();
-              return ret;
-          });
+          [](foreign_data_t& d) { return std::move(*d); });
     }
 
     variant_t data;
     model::offset start_offset;
     model::offset high_watermark;
     model::offset last_stable_offset;
+    std::optional<std::chrono::milliseconds> delta_from_tip_ms;
     std::optional<model::node_id> preferred_replica;
     error_code error;
     model::partition_id partition;
-    std::vector<cluster::rm_stm::tx_range> aborted_transactions;
+    std::vector<cluster::tx::tx_range> aborted_transactions;
     memory_units_t memory_units;
 };
 // struct aggregating fetch requests and corresponding response iterators for
 // the same shard
 struct shard_fetch {
+    explicit shard_fetch(
+      ss::shard_id shard_id, op_context::latency_point start_time)
+      : shard(shard_id)
+      , start_time{start_time} {}
+
     void push_back(
       ntp_fetch_config config, op_context::response_placeholder_ptr r_ph) {
         requests.push_back(std::move(config));
@@ -344,8 +363,9 @@ struct shard_fetch {
     }
 
     ss::shard_id shard;
-    std::vector<ntp_fetch_config> requests;
-    std::vector<op_context::response_placeholder_ptr> responses;
+    chunked_vector<ntp_fetch_config> requests;
+    chunked_vector<op_context::response_placeholder_ptr> responses;
+    op_context::latency_point start_time;
 
     friend std::ostream& operator<<(std::ostream& o, const shard_fetch& sf) {
         fmt::print(o, "{}", sf.requests);
@@ -354,10 +374,13 @@ struct shard_fetch {
 };
 
 struct fetch_plan {
-    explicit fetch_plan(size_t shards)
-      : fetches_per_shard(shards, shard_fetch()) {
-        for (size_t i = 0; i < fetches_per_shard.size(); i++) {
-            fetches_per_shard[i].shard = i;
+    explicit fetch_plan(
+      size_t shards,
+      op_context::latency_point start_time = op_context::latency_clock::now())
+      : fetches_per_shard() {
+        fetches_per_shard.reserve(shards);
+        for (size_t i = 0; i < shards; i++) {
+            fetches_per_shard.emplace_back(i, start_time);
         }
     }
 
@@ -418,6 +441,8 @@ read_result::memory_units_t reserve_memory_units(
   ssx::semaphore& memory_fetch_sem,
   const size_t max_bytes,
   const bool obligatory_batch_read);
+
+ss::future<> do_fetch(op_context& octx);
 
 } // namespace testing
 } // namespace kafka

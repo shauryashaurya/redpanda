@@ -16,6 +16,8 @@
 #include "bytes/streambuf.h"
 #include "cloud_storage/base_manifest.h"
 #include "cloud_storage/logger.h"
+#include "cloud_storage/partition_path_utils.h"
+#include "cloud_storage/remote_path_provider.h"
 #include "cloud_storage/segment_meta_cstore.h"
 #include "cloud_storage/types.h"
 #include "hashing/xx.h"
@@ -26,9 +28,13 @@
 #include "model/fundamental.h"
 #include "model/timestamp.h"
 #include "reflection/to_tuple.h"
-#include "serde/envelope.h"
-#include "serde/envelope_for_each_field.h"
-#include "serde/serde.h"
+#include "reflection/type_traits.h"
+#include "serde/rw/envelope.h"
+#include "serde/rw/iobuf.h"
+#include "serde/rw/optional.h"
+#include "serde/rw/rw.h"
+#include "serde/rw/scalar.h"
+#include "serde/rw/vector.h"
 #include "ssx/sformat.h"
 #include "storage/fs_utils.h"
 #include "utils/to_string.h"
@@ -64,7 +70,7 @@ struct fmt::formatter<cloud_storage::partition_manifest::segment_meta> {
     }
 
     template<typename FormatContext>
-    auto format(segment_meta const& m, FormatContext& ctx) {
+    auto format(const segment_meta& m, FormatContext& ctx) {
         return fmt::format_to(
           ctx.out(),
           "{{o={}-{} t={}-{}}}",
@@ -84,75 +90,6 @@ operator<<(std::ostream& s, const partition_manifest_path_components& c) {
     return s;
 }
 
-static bool parse_partition_and_revision(
-  std::string_view s, partition_manifest_path_components& comp) {
-    auto pos = s.find('_');
-    if (pos == std::string_view::npos) {
-        // Invalid segment file name
-        return false;
-    }
-    uint64_t res = 0;
-    // parse first component
-    auto sv = s.substr(0, pos);
-    auto e = std::from_chars(sv.data(), sv.data() + sv.size(), res);
-    if (e.ec != std::errc()) {
-        return false;
-    }
-    comp._part = model::partition_id(res);
-    // parse second component
-    sv = s.substr(pos + 1);
-    e = std::from_chars(sv.data(), sv.data() + sv.size(), res);
-    if (e.ec != std::errc()) {
-        return false;
-    }
-    comp._rev = model::initial_revision_id(res);
-    return true;
-}
-
-std::optional<partition_manifest_path_components>
-get_partition_manifest_path_components(const std::filesystem::path& path) {
-    // example: b0000000/meta/kafka/redpanda-test/4_2/manifest.json
-    enum {
-        ix_prefix,
-        ix_meta,
-        ix_namespace,
-        ix_topic,
-        ix_part_rev,
-        ix_file_name,
-        total_components
-    };
-    partition_manifest_path_components res;
-    res._origin = path;
-    int ix = 0;
-    for (const auto& c : path) {
-        ss::sstring p = c.string();
-        switch (ix++) {
-        case ix_prefix:
-            break;
-        case ix_namespace:
-            res._ns = model::ns(std::move(p));
-            break;
-        case ix_topic:
-            res._topic = model::topic(std::move(p));
-            break;
-        case ix_part_rev:
-            if (!parse_partition_and_revision(p, res)) {
-                return std::nullopt;
-            }
-            break;
-        case ix_file_name:
-            if (!(p == "manifest.json" || p == "manifest.bin")) {
-                return std::nullopt;
-            }
-            break;
-        }
-    }
-    if (ix == total_components) {
-        return res;
-    }
-    return std::nullopt;
-}
-
 std::optional<segment_name_components>
 parse_segment_name(const segment_name& name) {
     auto parsed = storage::segment_path::parse_segment_filename(name);
@@ -163,27 +100,6 @@ parse_segment_name(const segment_name& name) {
       .base_offset = parsed->base_offset,
       .term = parsed->term,
     };
-}
-
-remote_segment_path generate_remote_segment_path(
-  const model::ntp& ntp,
-  model::initial_revision_id rev_id,
-  const segment_name& name,
-  model::term_id archiver_term) {
-    vassert(
-      rev_id != model::initial_revision_id(),
-      "ntp {}: ntp revision must be known for segment {}",
-      ntp,
-      name);
-
-    auto path = ssx::sformat("{}_{}/{}", ntp.path(), rev_id(), name());
-    uint32_t hash = xxhash_32(path.data(), path.size());
-    if (archiver_term != model::term_id{}) {
-        return remote_segment_path(
-          fmt::format("{:08x}/{}.{}", hash, path, archiver_term()));
-    } else {
-        return remote_segment_path(fmt::format("{:08x}/{}", hash, path));
-    }
 }
 
 segment_name generate_local_segment_name(model::offset o, model::term_id t) {
@@ -246,53 +162,15 @@ partition_manifest::partition_manifest(
   , _segments()
   , _last_offset(0) {}
 
-// NOTE: the methods that generate remote paths use the xxhash function
-// to randomize the prefix. S3 groups the objects into chunks based on
-// these prefixes. It also applies rate limit to chunks so if all segments
-// and manifests will have the same prefix we will be able to do around
-// 3000-5000 req/sec. AWS doc mentions that having only two prefix
-// characters should be enough for most workloads
-// (https://aws.amazon.com/blogs/aws/amazon-s3-performance-tips-tricks-seattle-hiring-event/)
-// We're using eight because it's free and because AWS S3 is not the only
-// backend and other S3 API implementations might benefit from that.
-
-remote_manifest_path generate_partition_manifest_path(
-  const model::ntp& ntp,
-  model::initial_revision_id rev,
-  manifest_format format) {
-    // NOTE: the idea here is to split all possible hash values into
-    // 16 bins. Every bin should have lowest 28-bits set to 0.
-    // As result, for segment names all prefixes are possible, but
-    // for manifests, only 0x00000000, 0x10000000, ... 0xf0000000
-    // are used. This will allow us to quickly find all manifests
-    // that S3 bucket contains.
-    constexpr uint32_t bitmask = 0xF0000000;
-    auto path = ssx::sformat("{}_{}", ntp.path(), rev());
-    uint32_t hash = bitmask & xxhash_32(path.data(), path.size());
-    return remote_manifest_path(fmt::format(
-      "{:08x}/meta/{}_{}/manifest.{}", hash, ntp.path(), rev(), [&] {
-          switch (format) {
-          case manifest_format::json:
-              return "json";
-          case manifest_format::serde:
-              return "bin";
-          }
-      }()));
+remote_manifest_path partition_manifest::get_manifest_path(
+  const remote_path_provider& path_provider) const {
+    return remote_manifest_path{path_provider.partition_manifest_path(*this)};
 }
 
-std::pair<manifest_format, remote_manifest_path>
-partition_manifest::get_manifest_format_and_path() const {
-    return {
-      manifest_format::serde,
-      generate_partition_manifest_path(_ntp, _rev, manifest_format::serde)};
+ss::sstring partition_manifest::display_name() const {
+    return fmt::format("{}_{}", get_ntp().path(), _rev());
 }
 
-std::pair<manifest_format, remote_manifest_path>
-partition_manifest::get_legacy_manifest_format_and_path() const {
-    return {
-      manifest_format::json,
-      generate_partition_manifest_path(_ntp, _rev, manifest_format::json)};
-}
 const model::ntp& partition_manifest::get_ntp() const { return _ntp; }
 
 model::offset partition_manifest::get_last_offset() const {
@@ -347,7 +225,8 @@ partition_manifest::full_log_start_kafka_offset() const {
         // the manifest start offset.
         vassert(
           _archive_start_offset <= _start_offset,
-          "Archive start offset {} is greater than the start offset {}",
+          "[{}] Archive start offset {} is greater than the start offset {}",
+          display_name(),
           _archive_start_offset,
           _start_offset);
         return _archive_start_offset - _archive_start_offset_delta;
@@ -408,7 +287,11 @@ partition_manifest::compute_start_kafka_offset_local() const {
 
 partition_manifest::const_iterator
 partition_manifest::segment_containing(kafka::offset o) const {
-    vlog(cst_log.debug, "Metadata lookup using kafka offset {}", o);
+    vlog(
+      cst_log.debug,
+      "{} Metadata lookup using kafka offset {}",
+      display_name(),
+      o);
     if (_segments.empty()) {
         return end();
     }
@@ -465,16 +348,15 @@ model::initial_revision_id partition_manifest::get_revision_id() const {
     return _rev;
 }
 
-remote_segment_path
-partition_manifest::generate_segment_path(const segment_meta& meta) const {
-    auto name = generate_remote_segment_name(meta);
-    return cloud_storage::generate_remote_segment_path(
-      _ntp, meta.ntp_revision, name, meta.archiver_term);
+remote_segment_path partition_manifest::generate_segment_path(
+  const segment_meta& meta, const remote_path_provider& path_provider) const {
+    return remote_segment_path{path_provider.segment_path(*this, meta)};
 }
 
-remote_segment_path
-partition_manifest::generate_segment_path(const lw_segment_meta& meta) const {
-    return generate_segment_path(lw_segment_meta::convert(meta));
+remote_segment_path partition_manifest::generate_segment_path(
+  const lw_segment_meta& meta,
+  const remote_path_provider& path_provider) const {
+    return generate_segment_path(lw_segment_meta::convert(meta), path_provider);
 }
 
 segment_name partition_manifest::generate_remote_segment_name(
@@ -495,21 +377,6 @@ segment_name partition_manifest::generate_remote_segment_name(
           val.segment_term()));
     }
     __builtin_unreachable();
-}
-
-remote_segment_path partition_manifest::generate_remote_segment_path(
-  const model::ntp& ntp, const partition_manifest::value& val) {
-    auto name = generate_remote_segment_name(val);
-    return cloud_storage::generate_remote_segment_path(
-      ntp, val.ntp_revision, name, val.archiver_term);
-}
-
-local_segment_path partition_manifest::generate_local_segment_path(
-  const model::ntp& ntp, const partition_manifest::value& val) {
-    auto name = cloud_storage::generate_local_segment_name(
-      val.base_offset, val.segment_term);
-    return local_segment_path(
-      fmt::format("{}_{}/{}", ntp.path(), val.ntp_revision, name()));
 }
 
 partition_manifest::const_iterator
@@ -542,6 +409,11 @@ size_t partition_manifest::size() const { return _segments.size(); }
 
 size_t partition_manifest::segments_metadata_bytes() const {
     return _segments.inflated_actual_size().second;
+}
+
+size_t partition_manifest::estimate_serialized_size() const {
+    constexpr auto bytes_per_segment = 10;
+    return _segments.size() * bytes_per_segment;
 }
 
 void partition_manifest::flush_write_buffer() {
@@ -579,9 +451,12 @@ void partition_manifest::subtract_from_cloud_log_size(size_t to_subtract) {
     if (to_subtract > _cloud_log_size_bytes) {
         vlog(
           cst_log.warn,
-          "Invalid attempt to subtract from cloud log size of {}. Setting it "
+          "{} Invalid attempt to subtract {} from cloud log size of {}. "
+          "Setting it "
           "to 0 to prevent underflow",
-          _ntp);
+          display_name(),
+          to_subtract,
+          _cloud_log_size_bytes);
         _cloud_log_size_bytes = 0;
     } else {
         _cloud_log_size_bytes -= to_subtract;
@@ -651,16 +526,15 @@ void partition_manifest::set_archive_start_offset(
         vlog(
           cst_log.warn,
           "{} Can't advance archive_start_offset to {} because it's smaller "
-          "than the "
-          "current value {}",
-          _ntp,
+          "than the current value {}",
+          display_name(),
           start_rp_offset,
           _archive_start_offset);
     }
     vlog(
       cst_log.info,
       "{} archive start offset moved to {} archive start delta set to {}",
-      _ntp,
+      display_name(),
       _archive_start_offset,
       _archive_start_offset_delta);
 }
@@ -673,7 +547,7 @@ void partition_manifest::set_archive_clean_offset(
           "{} Requested to advance archive_clean_offset to {} which is greater "
           "than the current archive_start_offset {}. The offset won't be "
           "changed. Archive size won't be changed by {} bytes.",
-          get_manifest_path(),
+          display_name(),
           start_rp_offset,
           _archive_start_offset,
           size_bytes);
@@ -697,7 +571,7 @@ void partition_manifest::set_archive_clean_offset(
               "{} archive clean offset moved to {} but the archive size can't "
               "be updated because current size {} is smaller than the update "
               "{}. This needs to be reported and investigated.",
-              get_manifest_path(),
+              display_name(),
               _archive_clean_offset,
               _archive_size_bytes,
               size_bytes);
@@ -707,9 +581,8 @@ void partition_manifest::set_archive_clean_offset(
         vlog(
           cst_log.warn,
           "{} Can't advance archive_clean_offset to {} because it's smaller "
-          "than the "
-          "current value {}",
-          _ntp,
+          "than the current value {}",
+          display_name(),
           start_rp_offset,
           _archive_clean_offset);
     }
@@ -732,9 +605,10 @@ void partition_manifest::set_archive_clean_offset(
         if (truncation_point) {
             vassert(
               _archive_clean_offset >= *truncation_point,
-              "Attempt to prefix truncate the spillover manifest list above "
-              "the "
-              "archive clean offest: {} > {}",
+              "[{}] Attempt to prefix truncate the spillover manifest list "
+              "above "
+              "the archive clean offest: {} > {}",
+              display_name(),
               *truncation_point,
               _archive_clean_offset);
             _spillover_manifests.prefix_truncate(*truncation_point);
@@ -745,7 +619,7 @@ void partition_manifest::set_archive_clean_offset(
       cst_log.info,
       "{} archive clean offset moved to {} archive size set to {}; count of "
       "spillover manifests {} -> {}",
-      _ntp,
+      display_name(),
       _archive_clean_offset,
       _archive_size_bytes,
       previous_spillover_manifests_size,
@@ -761,7 +635,7 @@ bool partition_manifest::advance_start_kafka_offset(
     vlog(
       cst_log.info,
       "{} start kafka offset override set to {}",
-      _ntp,
+      display_name(),
       _start_kafka_offset_override);
     return true;
 }
@@ -802,9 +676,10 @@ bool partition_manifest::advance_start_offset(model::offset new_start_offset) {
         if (previous_start_offset > advanced_start_offset) {
             vlog(
               cst_log.error,
-              "Previous start offset is greater than the new one: "
+              "{} Previous start offset is greater than the new one: "
               "previous_start_offset={}, computed_new_start_offset={}, "
               "requested_new_start_offset={}",
+              display_name(),
               previous_start_offset,
               advanced_start_offset,
               new_start_offset);
@@ -821,7 +696,7 @@ bool partition_manifest::advance_start_offset(model::offset new_start_offset) {
               cst_log.error,
               "Previous start offset is not within segment in "
               "manifest for {}: previous_start_offset={}",
-              get_manifest_path(),
+              display_name(),
               previous_start_offset);
             previous_head_segment = _segments.begin();
         }
@@ -905,7 +780,7 @@ std::optional<size_t> partition_manifest::move_aligned_offset_range(
             vlog(
               cst_log.warn,
               "{} segment is already added {}",
-              _ntp,
+              display_name(),
               replacing_segment);
             return std::nullopt;
         }
@@ -990,7 +865,7 @@ size_t partition_manifest::safe_segment_meta_to_add(
                   "[{}] New segment does not line up with last offset of empty "
                   "log: "
                   "last_offset: {}, new_segment: {}",
-                  get_manifest_path(),
+                  display_name(),
                   subst.last_offset,
                   m);
                 break;
@@ -1025,7 +900,8 @@ size_t partition_manifest::safe_segment_meta_to_add(
                 const auto last_seg = subst.last_segment;
                 vassert(
                   last_seg.has_value(),
-                  "Empty manifest, base_offset: {}",
+                  "[{}] Empty manifest, base_offset: {}",
+                  display_name(),
                   m.base_offset);
 
                 segment_meta_anomalies anomalies;
@@ -1035,7 +911,7 @@ size_t partition_manifest::safe_segment_meta_to_add(
                       cst_log.error,
                       "[{}] New segment does not line up with previous "
                       "segment: {}",
-                      get_manifest_path(),
+                      display_name(),
                       format_seg_meta_anomalies(anomalies));
                     break;
                 }
@@ -1061,7 +937,7 @@ size_t partition_manifest::safe_segment_meta_to_add(
                           "[{}] New replacement segment does not line up with "
                           "previous "
                           "segment: {}",
-                          get_manifest_path(),
+                          display_name(),
                           format_seg_meta_anomalies(anomalies));
                         break;
                     }
@@ -1076,7 +952,7 @@ size_t partition_manifest::safe_segment_meta_to_add(
                           "[{}] New replacement segment has the same size as "
                           "replaced "
                           "segment: new_segment: {}, replaced_segment: {}",
-                          get_manifest_path(),
+                          display_name(),
                           m,
                           *it);
                         break;
@@ -1106,7 +982,7 @@ size_t partition_manifest::safe_segment_meta_to_add(
                       "committed "
                       "offset of "
                       "any previous segment: new_segment: {}",
-                      get_manifest_path(),
+                      display_name(),
                       m);
                     break;
                 }
@@ -1228,14 +1104,14 @@ void partition_manifest::spillover(const segment_meta& spillover_meta) {
           cst_log.error,
           "[{}] Expected spillover metadata {} doesn't match actual spillover "
           "metadata {}",
-          get_manifest_path(),
+          display_name(),
           expected_meta,
           spillover_meta);
     } else {
         vlog(
           cst_log.debug,
           "{} Applying spillover metadata {}",
-          _ntp,
+          display_name(),
           spillover_meta);
     }
     // Update size of the archived part of the log.
@@ -1271,7 +1147,7 @@ bool partition_manifest::safe_spillover_manifest(const segment_meta& meta) {
         vlog(
           cst_log.warn,
           "{} Can't apply spillover manifest because the manifest is empty, {}",
-          _ntp,
+          display_name(),
           meta);
         return false;
     }
@@ -1281,7 +1157,7 @@ bool partition_manifest::safe_spillover_manifest(const segment_meta& meta) {
           cst_log.warn,
           "{} Can't apply spillover manifest because the start offsets are not "
           "aligned: {} vs {}, {}",
-          _ntp,
+          display_name(),
           so.value(),
           meta.base_offset,
           meta);
@@ -1296,7 +1172,7 @@ bool partition_manifest::safe_spillover_manifest(const segment_meta& meta) {
           cst_log.warn,
           "{} Can't apply spillover manifest because the end of the manifest "
           "is not aligned, {}",
-          _ntp,
+          display_name(),
           meta);
         return false;
     }
@@ -1315,7 +1191,7 @@ bool partition_manifest::safe_spillover_manifest(const segment_meta& meta) {
       "{} Can't apply spillover manifest because the end of the previous "
       "manifest {} "
       "is not aligned with the new one {}",
-      _ntp,
+      display_name(),
       _spillover_manifests.last_segment(),
       meta);
     return false;
@@ -2016,7 +1892,7 @@ void partition_manifest::update_with_json(iobuf buf) {
         throw std::runtime_error(fmt_with_ctx(
           fmt::format,
           "Failed to parse partition manifest {}: {} at offset {}",
-          get_legacy_manifest_format_and_path().second,
+          prefixed_partition_manifest_json_path(get_ntp(), get_revision_id()),
           rapidjson::GetParseError_En(e),
           o));
     }
@@ -2162,23 +2038,22 @@ struct partition_manifest::serialization_cursor {
     bool epilogue_done{false};
 };
 
-ss::future<serialized_data_stream> partition_manifest::serialize() const {
-    auto serialized = to_iobuf();
-    size_t size_bytes = serialized.size_bytes();
-    co_return serialized_data_stream{
-      .stream = make_iobuf_input_stream(std::move(serialized)),
-      .size_bytes = size_bytes};
+ss::future<iobuf> partition_manifest::serialize_buf() const {
+    return ss::make_ready_future<iobuf>(to_iobuf());
 }
 
-void partition_manifest::serialize_json(std::ostream& out) const {
+void partition_manifest::serialize_json(
+  std::ostream& out, bool include_segments) const {
     serialization_cursor_ptr c = make_cursor(out);
     serialize_begin(c);
-    while (!c->segments_done) {
-        serialize_segments(c);
-    }
-    serialize_replaced(c);
-    while (!c->spillover_done) {
-        serialize_spillover(c);
+    if (include_segments) {
+        while (!c->segments_done) {
+            serialize_segments(c);
+        }
+        serialize_replaced(c);
+        while (!c->spillover_done) {
+            serialize_spillover(c);
+        }
     }
     serialize_end(c);
 }
@@ -2605,7 +2480,8 @@ partition_manifest::timequery(model::timestamp t) const {
     // Single-offset case should have hit max_t==base_t above
     vassert(
       max_offset > base_offset,
-      "Unexpected offsets {} {} (times {} {})",
+      "[{}] Unexpected offsets {} {} (times {} {})",
+      display_name(),
       base_offset,
       max_offset,
       base_t,
@@ -2623,6 +2499,52 @@ partition_manifest::timequery(model::timestamp t) const {
         ++max_timestamp;
     }
     return *_segments.at_index(target_ix);
+}
+
+size_t partition_manifest::estimate_size_between(
+  kafka::offset begin, kafka::offset end) const {
+    if (begin > end) {
+        return 0;
+    }
+    auto stm_start_offset = get_start_kafka_offset();
+    auto stm_next_offset = get_next_kafka_offset();
+    if (!stm_start_offset.has_value() || !stm_next_offset.has_value()) {
+        // The manifest is empty, implying the cloud log is empty.
+        return 0;
+    }
+    size_t spillover_sz = 0;
+    if (begin < *stm_start_offset) {
+        // 'begin' falls below the STM manifest, meaning the range includes
+        // part of the spillover region: aggregate them.
+        for (const auto& m : _spillover_manifests) {
+            if (
+              m.base_kafka_offset() <= end && m.last_kafka_offset() >= begin) {
+                spillover_sz += m.size_bytes;
+            }
+        }
+    }
+    if (end < *stm_start_offset) {
+        // 'end' falls below the STM manifest, mening the entire range was in
+        // the spillover region and we can just return what we have.
+        return spillover_sz;
+    }
+    // At this point we know there is overlap between the input range and the
+    // the STM manifest.
+
+    size_t stm_sz = 0;
+    auto stm_end_offset = kafka::prev_offset(*stm_next_offset);
+    if (begin <= *stm_start_offset && end >= stm_end_offset) {
+        // The range covers the entire STM manifest -- no need to iterate.
+        stm_sz = stm_region_size_bytes();
+    } else {
+        for (const auto& s : _segments) {
+            if (
+              s.base_kafka_offset() <= end && s.last_kafka_offset() >= begin) {
+                stm_sz += s.size_bytes;
+            }
+        }
+    }
+    return stm_sz + spillover_sz;
 }
 
 // this class is a serde-enabled version of partition_manifest. it's needed
@@ -2656,11 +2578,34 @@ struct partition_manifest_serde
     std::optional<model::offset> _last_scrubbed_offset;
     model::producer_id _highest_producer_id;
     model::offset _applied_offset;
+
+    auto serde_fields() {
+        return std::tie(
+          _ntp,
+          _rev,
+          _segments_serialized,
+          _replaced,
+          _last_offset,
+          _start_offset,
+          _last_uploaded_compacted_offset,
+          _insync_offset,
+          _cloud_log_size_bytes,
+          _archive_start_offset,
+          _archive_start_offset_delta,
+          _archive_clean_offset,
+          _start_kafka_offset,
+          archive_size_bytes,
+          _spillover_manifests_serialized,
+          _last_partition_scrub,
+          _last_scrubbed_offset,
+          _highest_producer_id,
+          _applied_offset);
+    }
 };
 
 static_assert(
   std::tuple_size_v<
-    decltype(std::declval<partition_manifest const&>().serde_fields())>
+    decltype(std::declval<const partition_manifest&>().serde_fields())>
     == std::tuple_size_v<
       decltype(std::declval<partition_manifest&>().serde_fields())>,
   "ensure that serde_fields() and serde_fields() const capture the same "
@@ -2675,16 +2620,15 @@ static_assert(
 
 // construct partition_manifest_serde while keeping
 // std::is_aggregate<partition_manifest_serde> true
-static auto
-partition_manifest_serde_from_partition_manifest(partition_manifest const& m)
-  -> partition_manifest_serde {
+static auto partition_manifest_serde_from_partition_manifest(
+  const partition_manifest& m) -> partition_manifest_serde {
     partition_manifest_serde tmp{};
     // copy every field that is not segment_meta_cstore in
     // partition_manifest_serde, and uses to_iobuf for segment_meta_cstore
 
     []<typename DT, typename ST, size_t... Is>(
       DT dest_tuple, ST src_tuple, std::index_sequence<Is...>) {
-        (([&]<typename Src>(auto& dest, Src const& src) {
+        (([&]<typename Src>(auto& dest, const Src& src) {
              if constexpr (std::is_same_v<Src, segment_meta_cstore>) {
                  dest = src.to_iobuf();
              } else if constexpr (reflection::is_fragmented_vector<Src>) {
@@ -2759,7 +2703,7 @@ void partition_manifest::process_anomalies(
     auto& missing_spills = _detected_anomalies.missing_spillover_manifests;
 
     const auto archive_start_offset = get_archive_start_offset();
-    erase_if(
+    absl::erase_if(
       missing_spills, [this, &archive_start_offset](const auto& spill_comp) {
           // Remove the missing spill if lies below the start offset of the
           // archive or if it doesn't match with any of the entries in the
@@ -2771,16 +2715,23 @@ void partition_manifest::process_anomalies(
 
     auto first_kafka_offset = full_log_start_kafka_offset();
     auto& missing_segs = _detected_anomalies.missing_segments;
-    erase_if(missing_segs, [this, &first_kafka_offset](const auto& meta) {
-        if (meta.next_kafka_offset() <= first_kafka_offset) {
+    absl::erase_if(missing_segs, [this, first_kafka_offset](const auto& meta) {
+        // The correct kafka start offset value can't be computed without
+        // segments. But in this case it's safe to remove all missing segment
+        // anomalies because they're guaranteed to be false positives.
+        // The 'first_kafka_offset' is nullopt only if the list of segments
+        // is empty or all segments are below 'start-offset'.
+        if (
+          !first_kafka_offset.has_value()
+          || meta.next_kafka_offset() <= first_kafka_offset.value()) {
             return true;
         }
 
         if (meta.committed_offset >= get_start_offset()) {
             // The segment might have been missing because it was merged with
             // something else. If the offset range doesn't match a segment
-            // exactly, discard the anomaly. Only segments from the STM manifest
-            // may be merged/reuploaded.
+            // exactly, discard the anomaly. Only segments from the STM
+            // manifest may be merged/reuploaded.
             return !segment_with_offset_range_exists(
               meta.base_offset, meta.committed_offset);
         } else {
@@ -2791,7 +2742,7 @@ void partition_manifest::process_anomalies(
 
     auto& segment_meta_anomalies
       = _detected_anomalies.segment_metadata_anomalies;
-    erase_if(
+    absl::erase_if(
       segment_meta_anomalies,
       [this, &first_kafka_offset](const auto& anomaly_meta) {
           if (anomaly_meta.at.next_kafka_offset() <= first_kafka_offset) {
@@ -2819,10 +2770,17 @@ void partition_manifest::process_anomalies(
       cst_log.debug,
       "[{}] Anomalies processed: {{ detected: {}, last_partition_scrub: {}, "
       "last_scrubbed_offset: {} }}",
-      _ntp,
+      display_name(),
       _detected_anomalies,
       _last_partition_scrub,
       _last_scrubbed_offset);
+}
+
+std::ostream& operator<<(std::ostream& o, const partition_manifest& pm) {
+    o << "{manifest: ";
+    pm.serialize_json(o, false);
+    o << "; last segment: " << pm.last_segment() << "}";
+    return o;
 }
 
 } // namespace cloud_storage

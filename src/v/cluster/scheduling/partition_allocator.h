@@ -17,6 +17,8 @@
 #include "cluster/scheduling/allocation_strategy.h"
 #include "cluster/scheduling/types.h"
 #include "config/property.h"
+#include "features/fwd.h"
+#include "model/metadata.h"
 
 namespace cluster {
 
@@ -31,7 +33,7 @@ public:
     static constexpr ss::shard_id shard = 0;
     partition_allocator(
       ss::sharded<members_table>&,
-      config::binding<std::optional<size_t>> memory_per_partition,
+      ss::sharded<features::feature_table>&,
       config::binding<std::optional<int32_t>> fds_per_partition,
       config::binding<uint32_t> partitions_per_shard,
       config::binding<uint32_t> partitions_reserve_shard0,
@@ -40,6 +42,18 @@ public:
       config::binding<bool> enable_rack_awareness);
 
     // Replica placement APIs
+
+    /**
+     * Return an allocation_units object wrapping the result of the allocating
+     * the given allocation request, or an error if it was not possible.
+     *
+     * This overload of allocate will validate cluster limits upfront, before
+     * instantiating an allocation_request. This allows to validate very big
+     * allocation_requests, where the size of the request itself could be an
+     * issue in itself. E.g. a request for a billion partitions.
+     */
+    ss::future<result<allocation_units::pointer>>
+      allocate(simple_allocation_request);
 
     /**
      * Return an allocation_units object wrapping the result of the allocating
@@ -64,9 +78,7 @@ public:
     /// Create allocated_partition object from current replicas for use with the
     /// allocate_replica method.
     allocated_partition make_allocated_partition(
-      model::ntp ntp,
-      std::vector<model::broker_shard> replicas,
-      partition_allocation_domain) const;
+      model::ntp ntp, std::vector<model::broker_shard> replicas) const;
 
     /// try to substitute an existing replica with a newly allocated one and add
     /// it to the allocated_partition object. If the request fails,
@@ -114,29 +126,36 @@ public:
     // Partition state updates
 
     /// Best effort. Do not throw if we cannot find the replicas.
-    void add_allocations(
-      const std::vector<model::broker_shard>&, partition_allocation_domain);
-    void remove_allocations(
-      const std::vector<model::broker_shard>&, partition_allocation_domain);
-    void add_final_counts(
-      const std::vector<model::broker_shard>&, partition_allocation_domain);
-    void remove_final_counts(
-      const std::vector<model::broker_shard>&, partition_allocation_domain);
+    void add_allocations(const std::vector<model::broker_shard>&);
+    void remove_allocations(const std::vector<model::broker_shard>&);
+    void add_final_counts(const std::vector<model::broker_shard>&);
+    void remove_final_counts(const std::vector<model::broker_shard>&);
 
     void add_allocations_for_new_partition(
       const std::vector<model::broker_shard>& replicas,
-      raft::group_id group_id,
-      partition_allocation_domain domain) {
-        add_allocations(replicas, domain);
-        add_final_counts(replicas, domain);
+      raft::group_id group_id) {
+        add_allocations(replicas);
+        add_final_counts(replicas);
         _state->update_highest_group_id(group_id);
     }
 
     ss::future<> apply_snapshot(const controller_snapshot&);
 
 private:
-    std::error_code
-    check_cluster_limits(allocation_request const& request) const;
+    // new_partitions_replicas_requested represents the total number of
+    // partitions requested by a request. i.e. partitions * replicas requested.
+    std::error_code check_cluster_limits(
+      const uint64_t new_partitions_replicas_requested,
+      const model::topic_namespace& topic) const;
+
+    // sub-routine of the above, checks available memory
+    std::error_code check_memory_limits(
+      uint64_t new_partitions_replicas_requested,
+      uint64_t proposed_total_partitions,
+      uint64_t effective_cluster_memory) const;
+
+    ss::future<result<allocation_units::pointer>>
+      do_allocate(allocation_request);
 
     result<reallocation_step> do_allocate_replica(
       allocated_partition&,
@@ -148,8 +167,8 @@ private:
     std::unique_ptr<allocation_state> _state;
     allocation_strategy _allocation_strategy;
     ss::sharded<members_table>& _members;
+    features::feature_table& _feature_table;
 
-    config::binding<std::optional<size_t>> _memory_per_partition;
     config::binding<std::optional<int32_t>> _fds_per_partition;
     config::binding<uint32_t> _partitions_per_shard;
     config::binding<uint32_t> _partitions_reserve_shard0;

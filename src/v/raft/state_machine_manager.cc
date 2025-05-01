@@ -19,6 +19,8 @@
 #include "raft/logger.h"
 #include "raft/state_machine_base.h"
 #include "raft/types.h"
+#include "serde/async.h"
+#include "serde/rw/rw.h"
 #include "ssx/future-util.h"
 #include "ssx/semaphore.h"
 #include "storage/snapshot.h"
@@ -138,7 +140,6 @@ batch_applicator::apply_to_stm(
         }
 
         co_await state.stm_entry->stm->apply(batch);
-        state.stm_entry->stm->set_next(model::next_offset(last_offset));
         co_return applied_successfully::yes;
     } catch (...) {
         vlog(
@@ -161,13 +162,27 @@ state_machine_manager::state_machine_manager(
   consensus* raft, std::vector<named_stm> stms, ss::scheduling_group apply_sg)
   : _raft(raft)
   , _log(ctx_log(_raft->group(), _raft->ntp()))
-  , _apply_sg(apply_sg) {
+  , _apply_sg(apply_sg)
+  , _initial_recovery_snapshot_mgr(
+      std::filesystem::path(_raft->log_config().work_directory()),
+      "stm_manager.snapshot",
+      ss::default_priority_class()) {
     for (auto& n_stm : stms) {
+        _supports_snapshot_at_offset
+          = _supports_snapshot_at_offset
+            && n_stm.stm->supports_snapshot_at_offset();
         _machines.try_emplace(
           n_stm.name,
           ss::make_lw_shared<state_machine_entry>(
             n_stm.name, std::move(n_stm.stm)));
     }
+}
+
+model::offset state_machine_manager::max_next_offset() const {
+    auto offsets = _machines | std::views::transform([](const auto& entry) {
+                       return entry.second->stm->last_applied_offset();
+                   });
+    return model::next_offset(*std::ranges::max_element(offsets));
 }
 
 ss::future<> state_machine_manager::start() {
@@ -181,14 +196,35 @@ ss::future<> state_machine_manager::start() {
     });
     std::vector<model::offset> offsets;
     for (const auto& [name, stm_meta] : _machines) {
+        vlog(
+          _log.trace,
+          "state machine {} last applied offset: {}",
+          name,
+          stm_meta->stm->last_applied_offset());
         offsets.push_back(stm_meta->stm->last_applied_offset());
     }
-    std::sort(offsets.begin(), offsets.end());
-    _next = model::next_offset(offsets.front());
+    _next = model::next_offset(*std::ranges::max_element(offsets));
+    auto log_offsets = _raft->log()->offsets();
+    /**
+     * Special case for the `archival_metadata_stm` local snapshot created
+     * during recovery. The snapshot last included offset was set to the log
+     * start offset.
+     */
+    if (log_offsets.start_offset > log_offsets.committed_offset) {
+        vlog(
+          _log.info,
+          "starting state machine manager with empty log. Clamping _next {} to "
+          "the start offset: {}",
+          _next,
+          log_offsets.start_offset);
+        _next = log_offsets.start_offset;
+    }
     vlog(
       _log.debug,
       "started state machine manager with initial next offset: {}",
       _next);
+    // it safe to update next here as the apply loop didn't start yet.
+    co_await apply_initial_recovery_policy();
     ssx::spawn_with_gate(_gate, [this] {
         return ss::do_until(
           [this] { return _as.abort_requested(); }, [this] { return apply(); });
@@ -203,9 +239,126 @@ ss::future<> state_machine_manager::stop() {
     _apply_mutex.broken();
     _as.request_abort();
 
-    co_await _gate.close();
+    auto gate_f = _gate.close();
     co_await ss::coroutine::parallel_for_each(
       _machines, [](auto p) { return p.second->stm->stop(); });
+    co_await std::move(gate_f);
+}
+
+ss::future<> state_machine_manager::apply_initial_recovery_policy() {
+    auto snapshot = co_await read_initial_recovery_snapshot();
+    if (!snapshot) {
+        /**
+         * If snapshot is not available create one, it will be populated during
+         * initial recovery
+         */
+        vlog(_log.debug, "no initial recovery snapshot found");
+        snapshot.emplace(initial_recovery_snapshot{});
+    }
+    vlog(_log.debug, "Starting with initial recovery snapshot: {}", *snapshot);
+    for (auto& [name, entry] : _machines) {
+        auto it = snapshot->initial_recovery_next_offsets.find(name);
+        if (it != snapshot->initial_recovery_next_offsets.end()) {
+            const auto init_recovery_offset = it->second;
+            vlog(
+              _log.debug,
+              "skipping initial recovery for {} state machine as it was "
+              "recovered from snapshot",
+              name);
+            if (
+              entry->stm->next() > model::offset{0}
+              && entry->stm->next() < init_recovery_offset) {
+                vlog(
+                  _log.error,
+                  "State machine '{}' has next offset set to {} which is "
+                  "less than the snapshot offset {}. Skipping initial "
+                  "recovery.",
+                  name,
+                  entry->stm->next(),
+                  init_recovery_offset);
+                continue;
+            }
+            entry->stm->set_next(
+              std::max(init_recovery_offset, entry->stm->next()));
+            continue;
+        }
+        // Stm needs initial recovery
+        const auto policy = entry->stm->get_initial_recovery_policy();
+        vlog(
+          _log.info,
+          "Applying '{}' initial recovery policy for '{}' state machine",
+          policy,
+          name);
+        switch (policy) {
+        case stm_initial_recovery_policy::read_everything:
+            snapshot->initial_recovery_next_offsets.emplace(
+              name, model::offset{0});
+            continue;
+        case stm_initial_recovery_policy::skip_to_end:
+            /**
+             * special case of a state machine that already existed in the
+             * previous version but the initial policy logic wasn't there yet
+             */
+            if (entry->stm->next() > model::offset{0}) {
+                vlog(
+                  _log.info,
+                  "State machine '{}' already has next offset set to {}",
+                  name,
+                  entry->stm->next());
+                snapshot->initial_recovery_next_offsets.emplace(
+                  name, model::offset{0});
+                continue;
+            }
+            /**
+             * Here we apply the skip to end policy.
+             *
+             * The policy leverages the fact that the _next offset is already
+             * established as all local snapshots from the other state machines
+             * were already applied.
+             *
+             * We must not use the log end offset here as the end offset may
+             * change with the truncation as it haven't yet been committed in
+             * Raft sense.
+             *
+             * The `_next` is safe as it is based on the last applied offset of
+             * the other state machines i.e. the `_next` offset is already
+             * committed.
+             *
+             * This policy comes with the trade off. The newly added state
+             * machines will not actually rewind to the physical end of the log.
+             * But will read a small part of it.
+             */
+            vlog(
+              _log.info,
+              "Setting next offset: {} for: '{}' state machine as a part of "
+              "initial recovery policy.",
+              _next,
+              name);
+            entry->stm->set_next(_next);
+            /**
+             * Initial recovery finished, marked as done in the snapshot.
+             */
+            snapshot->initial_recovery_next_offsets.emplace(
+              name, entry->stm->next());
+        }
+    }
+
+    // clean up offsets from state machines that are not longer present in the
+    // manager but are still in the initial recovery snapshot.
+    absl::erase_if(
+      snapshot->initial_recovery_next_offsets,
+      [this](const auto& pair) { return !_machines.contains(pair.first); });
+
+    co_await write_initial_recovery_snapshot(std::move(*snapshot));
+}
+
+std::vector<state_machine_manager::entry_ptr>
+state_machine_manager::all_state_machines() const {
+    std::vector<entry_ptr> all_stms;
+    all_stms.reserve(_machines.size());
+    std::ranges::copy(
+      std::views::values(_machines), std::back_inserter(all_stms));
+    return all_stms;
 }
 
 ss::future<> state_machine_manager::apply_raft_snapshot() {
@@ -213,9 +366,17 @@ ss::future<> state_machine_manager::apply_raft_snapshot() {
     if (!snapshot) {
         co_return;
     }
-
     auto fut = co_await ss::coroutine::as_future(
-      do_apply_raft_snapshot(std::move(snapshot->metadata), snapshot->reader));
+      acquire_background_apply_mutexes().then([&, this](auto units) mutable {
+          return do_apply_raft_snapshot(
+            all_state_machines(),
+            std::move(snapshot->metadata),
+            snapshot->reader,
+            std::move(units));
+      }));
+    // update the _next offset to the max of the state machines applied offset
+    // as some of them might have thrown
+    _next = std::max(max_next_offset(), _next);
     co_await snapshot->reader.close();
     if (fut.failed()) {
         const auto e = fut.get_exception();
@@ -228,13 +389,16 @@ ss::future<> state_machine_manager::apply_raft_snapshot() {
 }
 
 ss::future<> state_machine_manager::do_apply_raft_snapshot(
-  snapshot_metadata metadata, storage::snapshot_reader& reader) {
+  std::vector<entry_ptr> state_machines,
+  snapshot_metadata metadata,
+  storage::snapshot_reader& reader,
+  [[maybe_unused]] std::vector<ssx::semaphore_units> background_apply_units) {
     const auto snapshot_file_sz = co_await reader.get_snapshot_size();
     const auto last_offset = metadata.last_included_index;
 
     auto snapshot_content = co_await read_iobuf_exactly(
       reader.input(), snapshot_file_sz);
-    auto const snapshot_content_sz = snapshot_content.size_bytes();
+    const auto snapshot_content_sz = snapshot_content.size_bytes();
 
     vlog(
       _log.debug,
@@ -253,8 +417,8 @@ ss::future<> state_machine_manager::do_apply_raft_snapshot(
           "compatibility",
           last_offset);
         co_await ss::coroutine::parallel_for_each(
-          _machines, [last_offset](auto& pair) {
-              auto stm = pair.second->stm;
+          state_machines, [last_offset](entry_ptr& entry) {
+              auto stm = entry->stm;
               if (stm->last_applied_offset() >= last_offset) {
                   return ss::now();
               }
@@ -269,13 +433,12 @@ ss::future<> state_machine_manager::do_apply_raft_snapshot(
         auto snap = co_await serde::read_async<managed_snapshot>(parser);
 
         co_await ss::coroutine::parallel_for_each(
-          _machines,
+          state_machines,
           [this, snap = std::move(snap), last_offset](
-            state_machines_t::value_type& stm_pair) mutable {
-              return apply_snapshot_to_stm(stm_pair.second, snap, last_offset);
+            entry_ptr& entry) mutable {
+              return apply_snapshot_to_stm(entry, snap, last_offset);
           });
     }
-    _next = model::next_offset(metadata.last_included_index);
 }
 
 ss::future<> state_machine_manager::apply_snapshot_to_stm(
@@ -300,7 +463,7 @@ ss::future<> state_machine_manager::apply_snapshot_to_stm(
       std::max(model::next_offset(last_offset), stm_entry->stm->next()));
 }
 
-ss::future<> state_machine_manager::apply() {
+ss::future<> state_machine_manager::try_apply_in_foreground() {
     try {
         ss::coroutine::switch_to sg_sw(_apply_sg);
         // wait until consensus commit index is >= _next
@@ -315,6 +478,30 @@ ss::future<> state_machine_manager::apply() {
             co_return co_await apply_raft_snapshot();
         }
 
+        // collect STMs which has the same _next offset as the offset in
+        // manager and there is no background apply taking place
+        std::vector<entry_ptr> machines;
+        for (auto& [_, entry] : _machines) {
+            /**
+             * We can simply check if a mutex is ready here as calling
+             * maybe_start_background_apply() will make the mutex underlying
+             * semaphore immediately not ready as there are no scheduling points
+             * before calling `get_units`
+             */
+            if (
+              entry->stm->next() == _next
+              && entry->background_apply_mutex.ready()) {
+                machines.push_back(entry);
+            }
+        }
+        if (machines.empty()) {
+            vlog(
+              _log.debug,
+              "no machines were selected to apply in foreground, current next "
+              "offset: {}",
+              _next);
+            co_return;
+        }
         /**
          * Raft make_reader method allows callers reading up to
          * last_visible index. In order to make the STMs safe and working
@@ -334,27 +521,26 @@ ss::future<> state_machine_manager::apply() {
           _next, _raft->committed_offset(), ss::default_priority_class());
 
         model::record_batch_reader reader = co_await _raft->make_reader(config);
-        // collect STMs which has the same _next offset as the offset in
-        // manager and there is no background apply taking place
-        std::vector<entry_ptr> machines;
-        for (auto& [_, entry] : _machines) {
-            /**
-             * We can simply check if a mutex is ready here as calling
-             * maybe_start_background_apply() will make the mutex underlying
-             * semaphore immediately not ready as there are no scheduling points
-             * before calling `get_units`
-             */
-            if (
-              entry->stm->next() == _next
-              && entry->background_apply_mutex.ready()) {
-                machines.push_back(entry);
-            }
-        }
-        auto last_applied = co_await std::move(reader).consume(
+
+        auto max_last_applied = co_await std::move(reader).consume(
           batch_applicator(default_ctx, machines, _as, _log),
           model::no_timeout);
 
-        _next = std::max(model::next_offset(last_applied), _next);
+        if (max_last_applied == model::offset{}) {
+            vlogl(
+              _log,
+              _raft->log_config().cache_enabled() ? ss::log_level::warn
+                                                  : ss::log_level::debug,
+              "no progress has been made during state machine apply. Current "
+              "next offset: {}",
+              _next);
+            /**
+             * If no progress has been made, yield to prevent busy looping
+             */
+            co_await ss::sleep_abortable(100ms, _as);
+            co_return;
+        }
+        _next = std::max(model::next_offset(max_last_applied), _next);
         vlog(_log.trace, "updating _next offset with: {}", _next);
     } catch (const ss::timed_out_error&) {
         vlog(_log.debug, "state machine apply timeout");
@@ -365,6 +551,9 @@ ss::future<> state_machine_manager::apply() {
         vlog(
           _log.warn, "manager apply exception: {}", std::current_exception());
     }
+}
+
+ss::future<> state_machine_manager::apply() {
     /**
      * If any of the state machine is behind, dispatch background apply fibers
      */
@@ -373,6 +562,7 @@ ss::future<> state_machine_manager::apply() {
             maybe_start_background_apply(entry);
         }
     }
+    co_await try_apply_in_foreground();
 }
 
 void state_machine_manager::maybe_start_background_apply(
@@ -407,8 +597,44 @@ void state_machine_manager::maybe_start_background_apply(
 ss::future<> state_machine_manager::background_apply_fiber(
   entry_ptr entry, ssx::semaphore_units units) {
     while (!_as.abort_requested() && entry->stm->next() < _next) {
+        if (entry->stm->next() < _raft->start_offset()) {
+            auto snapshot = co_await _raft->open_snapshot();
+            if (!snapshot) {
+                vlog(
+                  _log.warn,
+                  "background apply fiber was not able to open snapshot for "
+                  "'{}' stm",
+                  entry->name);
+                co_await ss::sleep_abortable(100ms, _as);
+                continue;
+            }
+            vlog(
+              _log.info,
+              "background apply fiber applying raft snapshot with offset {} "
+              "for {} state machine",
+              snapshot->metadata.last_included_index,
+              entry->name);
+
+            auto fut = co_await ss::coroutine::as_future(do_apply_raft_snapshot(
+              {entry},
+              std::move(snapshot->metadata),
+              snapshot->reader,
+              std::vector<ssx::semaphore_units>{}));
+            co_await snapshot->reader.close();
+            if (fut.failed()) {
+                const auto e = fut.get_exception();
+                // do not log known shutdown exceptions as errors
+                if (!ssx::is_shutdown_exception(e)) {
+                    vlog(_log.error, "error applying raft snapshot - {}", e);
+                }
+                std::rethrow_exception(e);
+            }
+            continue;
+        }
         storage::log_reader_config config(
-          entry->stm->next(), _next, ss::default_priority_class());
+          entry->stm->next(),
+          model::prev_offset(_next),
+          ss::default_priority_class());
 
         vlog(
           _log.debug,
@@ -416,14 +642,22 @@ ss::future<> state_machine_manager::background_apply_fiber(
           entry->stm->next(),
           _next,
           entry->name);
+        /**
+         * As the STM is catching up and not reading the tip of the log it is
+         * pointless to populate the batch cache with the read batches.
+         */
+        config.skip_batch_cache = true;
         bool error = false;
         try {
             model::record_batch_reader reader = co_await _raft->make_reader(
               config);
-            co_await std::move(reader).consume(
+            auto last_applied_before = entry->stm->last_applied_offset();
+            auto last_applied_after = co_await std::move(reader).consume(
               batch_applicator(background_ctx, {entry}, _as, _log),
               model::no_timeout);
-
+            if (last_applied_before >= last_applied_after) {
+                error = true;
+            }
         } catch (...) {
             error = true;
             vlog(
@@ -433,7 +667,7 @@ ss::future<> state_machine_manager::background_apply_fiber(
               std::current_exception());
         }
         if (error) {
-            co_await ss::sleep_abortable(1s, _as);
+            co_await ss::sleep_abortable(100ms, _as);
         }
     }
     units.return_all();
@@ -443,8 +677,13 @@ ss::future<> state_machine_manager::background_apply_fiber(
       entry->name);
 }
 
-ss::future<iobuf>
+ss::future<state_machine_manager::snapshot_result>
 state_machine_manager::take_snapshot(model::offset last_included_offset) {
+    vassert(
+      static_cast<bool>(_supports_snapshot_at_offset),
+      "Snapshot at arbitrary offset can only be taken if manager supports fast "
+      "reconfigurations");
+
     vlog(
       _log.debug,
       "taking snapshot with last included offset: {}",
@@ -474,7 +713,41 @@ state_machine_manager::take_snapshot(model::offset last_included_offset) {
             });
       });
 
-    co_return serde::to_iobuf(std::move(snapshot));
+    co_return state_machine_manager::snapshot_result{
+      serde::to_iobuf(std::move(snapshot)), last_included_offset};
+}
+
+ss::future<state_machine_manager::snapshot_result>
+state_machine_manager::take_snapshot() {
+    auto holder = _gate.hold();
+    // wait for all STMs to be on the same page
+    co_await wait(last_applied(), model::no_timeout, _as);
+
+    auto u = co_await _apply_mutex.get_units();
+    if (last_applied() < _raft->start_offset()) {
+        throw std::logic_error(fmt::format(
+          "Can not take snapshot of a state from before raft start offset. "
+          "Requested offset: {}, start offset: {}",
+          last_applied(),
+          _raft->start_offset()));
+    }
+    // wait once again for all state machines to finish applying batches
+    co_await wait(last_applied(), model::no_timeout, _as);
+    // snapshot can only be taken  after  all background applies finished
+    auto units = co_await acquire_background_apply_mutexes();
+    auto snapshot_offset = last_applied();
+    managed_snapshot snapshot;
+    co_await ss::coroutine::parallel_for_each(
+      _machines, [snapshot_offset, &snapshot](auto entry_pair) {
+          return entry_pair.second->stm->take_snapshot(snapshot_offset)
+            .then([&snapshot, key = entry_pair.first](auto snapshot_part) {
+                snapshot.snapshot_map.try_emplace(
+                  key, std::move(snapshot_part));
+            });
+      });
+
+    co_return state_machine_manager::snapshot_result{
+      serde::to_iobuf(std::move(snapshot)), snapshot_offset};
 }
 
 ss::future<> state_machine_manager::wait(
@@ -503,6 +776,92 @@ ss::future<> state_machine_manager::remove_local_state() {
     co_await ss::coroutine::parallel_for_each(_machines, [](auto entry_pair) {
         return entry_pair.second->stm->remove_local_state();
     });
+    co_await _initial_recovery_snapshot_mgr.remove_snapshot();
 }
 
+ss::future<std::optional<state_machine_manager::initial_recovery_snapshot>>
+state_machine_manager::read_initial_recovery_snapshot() {
+    auto reader = co_await _initial_recovery_snapshot_mgr.open_snapshot();
+    if (!reader) {
+        co_return std::nullopt;
+    }
+
+    auto md_buffer_f = co_await ss::coroutine::as_future(
+      reader->read_metadata());
+
+    if (md_buffer_f.failed()) {
+        auto e = md_buffer_f.get_exception();
+        vlog(
+          _log.error,
+          "failed to read initial recovery snapshot metadata: {}",
+          e);
+        co_await reader->close();
+        std::rethrow_exception(e);
+    }
+
+    auto snap_sz_f = co_await ss::coroutine::as_future(
+      reader->get_snapshot_size());
+    if (snap_sz_f.failed()) {
+        auto e = snap_sz_f.get_exception();
+        vlog(
+          _log.error, "failed to read initial recovery snapshot size: {}", e);
+        co_await reader->close();
+        std::rethrow_exception(e);
+    }
+    auto snapshot_content_f = co_await ss::coroutine::as_future(
+      read_iobuf_exactly(reader->input(), snap_sz_f.get()));
+
+    if (snapshot_content_f.failed()) {
+        auto e = snapshot_content_f.get_exception();
+        vlog(_log.error, "failed to read recovery snapshot: {}", e);
+        co_await reader->close();
+        std::rethrow_exception(e);
+    }
+    co_await reader->close();
+
+    co_await _initial_recovery_snapshot_mgr.remove_partial_snapshots();
+    co_return serde::from_iobuf<initial_recovery_snapshot>(
+      std::move(snapshot_content_f.get()));
+}
+
+ss::future<> state_machine_manager::write_initial_recovery_snapshot(
+  initial_recovery_snapshot snap) {
+    vlog(_log.trace, "writing initial recovery snapshot: {}", snap);
+    auto writer = co_await _initial_recovery_snapshot_mgr.start_snapshot();
+
+    auto md_f = co_await ss::coroutine::as_future(
+      writer.write_metadata(iobuf{}));
+    if (md_f.failed()) {
+        auto e = md_f.get_exception();
+        vlog(
+          _log.error,
+          "failed to write initial recovery snapshot metadata: {}",
+          e);
+        co_await writer.close();
+        std::rethrow_exception(e);
+    }
+
+    auto data_f = co_await ss::coroutine::as_future(
+      write_iobuf_to_output_stream(
+        serde::to_iobuf(std::move(snap)), writer.output()));
+    if (data_f.failed()) {
+        auto e = data_f.get_exception();
+        vlog(
+          _log.error, "failed to write initial recovery snapshot data: {}", e);
+        co_await writer.close();
+        std::rethrow_exception(e);
+    }
+
+    co_await writer.close();
+    co_await _initial_recovery_snapshot_mgr.finish_snapshot(writer);
+}
+
+std::ostream& operator<<(
+  std::ostream& o, const state_machine_manager::initial_recovery_snapshot& s) {
+    fmt::print(
+      o,
+      "{{ initial_recovery_next_offsets: {} }}",
+      s.initial_recovery_next_offsets);
+    return o;
+}
 } // namespace raft

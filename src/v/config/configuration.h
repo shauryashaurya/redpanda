@@ -11,17 +11,17 @@
 
 #pragma once
 
-#include "cloud_storage_clients/types.h"
 #include "config/bounded_property.h"
 #include "config/broker_endpoint.h"
-#include "config/client_group_byte_rate_quota.h"
 #include "config/config_store.h"
 #include "config/convert.h"
 #include "config/data_directory_path.h"
 #include "config/endpoint_tls_config.h"
+#include "config/leaders_preference.h"
 #include "config/property.h"
 #include "config/throughput_control_group.h"
 #include "config/tls_config.h"
+#include "config/types.h"
 #include "model/compression.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
@@ -38,6 +38,8 @@
 #include <chrono>
 #include <vector>
 
+class monitor_unsafe;
+
 namespace config {
 
 /// Redpanda configuration
@@ -45,7 +47,67 @@ namespace config {
 /// All application modules depend on configuration. The configuration module
 /// can not depend on any other module to prevent cyclic dependencies.
 
+struct configuration;
+
+/*
+ * A configuration property wrapper that fails validation unless experimental
+ * property support has already been enabled.
+ *
+ * Note that our configuration system does not understand dependencies between
+ * configuration options. So if experimental feature support were enabled within
+ * the same request that tried to modify an experimental feature property it may
+ * fail depending on which order updates were applied to the config store.
+ *
+ * The simplest way to circumvent this is to enable support in one request,
+ * and then proceed to interact with experiemntal feature properties.
+ *
+ * Development properties are hidden from the outside world until experimental
+ * property support is enabled, at which point the visibility of the property is
+ * identical to the wrapped property.
+ */
+template<typename T>
+class development_feature_property : public property<T> {
+public:
+    development_feature_property(
+      configuration& conf,
+      std::string_view name,
+      std::string_view desc,
+      base_property::metadata meta,
+      T def,
+      property<T>::validator validator = property<T>::noop_validator)
+      : property<T>(
+          conf,
+          name,
+          desc,
+          meta,
+          def,
+          [&conf, validator = std::move(validator)](
+            const auto& v) -> std::optional<ss::sstring> {
+              if (development_features_enabled(conf)) {
+                  // delegate to the underlying property's validator
+                  return validator(v);
+              }
+              return "Development feature support is not enabled.";
+          })
+      , _conf(conf)
+
+    {}
+
+    bool is_hidden() const override {
+        if (development_features_enabled(_conf)) {
+            return property<T>::is_hidden();
+        }
+        return true;
+    }
+
+private:
+    static bool development_features_enabled(const configuration&);
+    configuration& _conf;
+};
+
 struct configuration final : public config_store {
+    using meta = base_property::metadata;
+
     // WAL
     bounded_property<uint64_t> log_segment_size;
     property<std::optional<uint64_t>> log_segment_size_min;
@@ -91,6 +153,7 @@ struct configuration final : public config_store {
     bounded_property<std::optional<int32_t>> topic_fds_per_partition;
     bounded_property<uint32_t> topic_partitions_per_shard;
     bounded_property<uint32_t> topic_partitions_reserve_shard0;
+    bounded_property<uint32_t> topic_partitions_memory_allocation_percent;
     property<std::chrono::milliseconds>
       partition_manager_shutdown_watchdog_timeout;
 
@@ -112,6 +175,10 @@ struct configuration final : public config_store {
     property<std::chrono::milliseconds> raft_flush_timer_interval_ms;
     property<std::chrono::milliseconds> raft_replica_max_flush_delay_ms;
     property<bool> raft_enable_longest_log_detection;
+    bounded_property<size_t>
+      raft_max_inflight_follower_append_entries_requests_per_shard;
+    bounded_property<size_t>
+      raft_max_buffered_follower_append_entries_bytes_per_shard;
     // Kafka
     property<bool> enable_usage;
     bounded_property<size_t> usage_num_windows;
@@ -122,13 +189,15 @@ struct configuration final : public config_store {
     bounded_property<int16_t> default_num_windows;
     bounded_property<std::chrono::milliseconds> default_window_sec;
     property<std::chrono::milliseconds> quota_manager_gc_sec;
-    bounded_property<uint32_t> target_quota_byte_rate;
-    property<std::optional<uint32_t>> target_fetch_quota_byte_rate;
-    bounded_property<std::optional<uint32_t>> kafka_admin_topic_api_rate;
+    deprecated_property target_quota_byte_rate;
+    deprecated_property target_fetch_quota_byte_rate;
+    deprecated_property kafka_admin_topic_api_rate;
     property<std::optional<ss::sstring>> cluster_id;
     property<bool> disable_metrics;
     property<bool> disable_public_metrics;
     property<bool> aggregate_metrics;
+    property<std::vector<ss::sstring>> enable_consumer_group_metrics;
+    property<std::chrono::seconds> consumer_group_lag_collection_interval;
     property<std::chrono::milliseconds> group_min_session_timeout_ms;
     property<std::chrono::milliseconds> group_max_session_timeout_ms;
     property<std::chrono::milliseconds> group_initial_rebalance_delay;
@@ -143,12 +212,18 @@ struct configuration final : public config_store {
     deprecated_property tx_registry_sync_timeout_ms;
     deprecated_property tm_violation_recovery_policy;
     property<std::chrono::milliseconds> rm_sync_timeout_ms;
-    property<std::chrono::milliseconds> find_coordinator_timeout_ms;
+    deprecated_property find_coordinator_timeout_ms;
     deprecated_property seq_table_min_size;
     property<std::chrono::milliseconds> tx_timeout_delay_ms;
     deprecated_property rm_violation_recovery_policy;
     property<std::chrono::milliseconds> fetch_reads_debounce_timeout;
-    deprecated_property fetch_read_strategy;
+    enum_property<model::fetch_read_strategy> fetch_read_strategy;
+    bounded_property<double, numeric_bounds> fetch_pid_p_coeff;
+    bounded_property<double, numeric_bounds> fetch_pid_i_coeff;
+    bounded_property<double, numeric_bounds> fetch_pid_d_coeff;
+    bounded_property<double, numeric_bounds>
+      fetch_pid_target_utilization_fraction;
+    property<std::chrono::milliseconds> fetch_pid_max_debounce_ms;
     property<std::chrono::milliseconds> alter_topic_cfg_timeout_ms;
     property<model::cleanup_policy_bitflags> log_cleanup_policy;
     enum_property<model::timestamp_type> log_message_timestamp_type;
@@ -159,6 +234,8 @@ struct configuration final : public config_store {
     enum_property<model::compression> log_compression_type;
     property<size_t> fetch_max_bytes;
     property<bool> use_fetch_scheduler_group;
+    property<bool> use_produce_scheduler_group;
+    property<bool> use_kafka_handler_scheduler_group;
     property<std::chrono::milliseconds> metadata_status_wait_timeout_ms;
     property<std::chrono::seconds> kafka_tcp_keepalive_idle_timeout_seconds;
     property<std::chrono::seconds> kafka_tcp_keepalive_probe_interval_seconds;
@@ -175,8 +252,14 @@ struct configuration final : public config_store {
     // same as log.retention.ms in kafka
     retention_duration_property log_retention_ms;
     property<std::chrono::milliseconds> log_compaction_interval_ms;
+    // same as delete.retention.ms in kafka
+    property<std::optional<std::chrono::milliseconds>> tombstone_retention_ms;
+    bounded_property<std::optional<double>, numeric_bounds>
+      min_cleanable_dirty_ratio;
     property<bool> log_disable_housekeeping_for_tests;
     property<bool> log_compaction_use_sliding_window;
+    property<std::optional<size_t>>
+      log_compaction_adjacent_merge_self_compaction_count;
     // same as retention.size in kafka - TODO: size not implemented
     property<std::optional<size_t>> retention_bytes;
     property<int32_t> group_topic_partitions;
@@ -192,6 +275,8 @@ struct configuration final : public config_store {
     property<uint64_t> transaction_coordinator_log_segment_size;
     property<std::chrono::milliseconds>
       abort_timed_out_transactions_interval_ms;
+    // same as transaction.max.timeout.ms in Apache Kafka.
+    property<std::chrono::milliseconds> transaction_max_timeout_ms;
     property<std::chrono::seconds> tx_log_stats_interval_s;
     property<std::chrono::milliseconds> create_topic_timeout_ms;
     property<std::chrono::milliseconds> wait_for_leader_timeout_ms;
@@ -205,7 +290,7 @@ struct configuration final : public config_store {
     property<size_t> raft_learner_recovery_rate;
     property<bool> raft_recovery_throttle_disable_dynamic_mode;
     property<std::optional<uint32_t>> raft_smp_max_non_local_requests;
-    property<uint32_t> raft_max_concurrent_append_requests_per_follower;
+    deprecated_property raft_max_concurrent_append_requests_per_follower;
     enum_property<model::write_caching_mode> write_caching_default;
 
     property<size_t> reclaim_min_size;
@@ -248,7 +333,7 @@ struct configuration final : public config_store {
     property<int16_t> id_allocator_log_capacity;
     property<int16_t> id_allocator_batch_size;
     property<bool> enable_sasl;
-    property<std::vector<ss::sstring>> sasl_mechanisms;
+    enterprise<property<std::vector<ss::sstring>>> sasl_mechanisms;
     property<ss::sstring> sasl_kerberos_config;
     property<ss::sstring> sasl_kerberos_keytab;
     property<ss::sstring> sasl_kerberos_principal;
@@ -256,6 +341,7 @@ struct configuration final : public config_store {
     bounded_property<std::optional<std::chrono::milliseconds>>
       kafka_sasl_max_reauth_ms;
     property<std::optional<bool>> kafka_enable_authorization;
+    enum_property<tls_name_format> tls_certificate_name_format;
     property<std::optional<std::vector<ss::sstring>>>
       kafka_mtls_principal_mapping_rules;
     property<bool> kafka_enable_partition_reassignment;
@@ -279,17 +365,15 @@ struct configuration final : public config_store {
     property<std::optional<uint32_t>> kafka_connections_max;
     property<std::optional<uint32_t>> kafka_connections_max_per_ip;
     property<std::vector<ss::sstring>> kafka_connections_max_overrides;
-    one_or_many_map_property<client_group_quota>
-      kafka_client_group_byte_rate_quota;
-    one_or_many_map_property<client_group_quota>
-      kafka_client_group_fetch_byte_rate_quota;
+    deprecated_property kafka_client_group_byte_rate_quota;
+    deprecated_property kafka_client_group_fetch_byte_rate_quota;
     bounded_property<std::optional<int>> kafka_rpc_server_tcp_recv_buf;
     bounded_property<std::optional<int>> kafka_rpc_server_tcp_send_buf;
     bounded_property<std::optional<size_t>> kafka_rpc_server_stream_recv_buf;
     property<bool> kafka_enable_describe_log_dirs_remote_storage;
 
     // Audit logging
-    property<bool> audit_enabled;
+    enterprise<property<bool>> audit_enabled;
     property<int32_t> audit_log_num_partitions;
     property<std::optional<int16_t>> audit_log_replication_factor;
     property<size_t> audit_client_max_buffer_size;
@@ -300,7 +384,7 @@ struct configuration final : public config_store {
     property<std::vector<ss::sstring>> audit_excluded_principals;
 
     // Archival storage
-    property<bool> cloud_storage_enabled;
+    enterprise<property<bool>> cloud_storage_enabled;
     property<bool> cloud_storage_enable_remote_read;
     property<bool> cloud_storage_enable_remote_write;
     property<bool> cloud_storage_disable_archiver_manager;
@@ -309,7 +393,7 @@ struct configuration final : public config_store {
     property<std::optional<ss::sstring>> cloud_storage_region;
     property<std::optional<ss::sstring>> cloud_storage_bucket;
     property<std::optional<ss::sstring>> cloud_storage_api_endpoint;
-    enum_property<cloud_storage_clients::s3_url_style> cloud_storage_url_style;
+    enum_property<std::optional<s3_url_style>> cloud_storage_url_style;
     enum_property<model::cloud_credentials_source>
       cloud_storage_credentials_source;
     property<std::optional<ss::sstring>>
@@ -325,6 +409,7 @@ struct configuration final : public config_store {
     property<bool> cloud_storage_disable_tls;
     property<int16_t> cloud_storage_api_endpoint_port;
     property<std::optional<ss::sstring>> cloud_storage_trust_file;
+    property<std::optional<ss::sstring>> cloud_storage_crl_file;
     property<std::chrono::milliseconds> cloud_storage_initial_backoff_ms;
     property<std::chrono::milliseconds> cloud_storage_segment_upload_timeout_ms;
     property<std::chrono::milliseconds>
@@ -388,8 +473,14 @@ struct configuration final : public config_store {
     property<std::chrono::milliseconds>
       cloud_storage_topic_purge_grace_period_ms;
     property<bool> cloud_storage_disable_upload_consistency_checks;
-    property<bool> cloud_storage_disable_metadata_consistency_checks;
+    deprecated_property cloud_storage_disable_metadata_consistency_checks;
+    property<bool> cloud_storage_disable_archival_stm_rw_fence;
     property<std::chrono::milliseconds> cloud_storage_hydration_timeout_ms;
+    property<bool> cloud_storage_disable_remote_labels_for_tests;
+
+    // Safe pause/resume functionality
+    property<bool> cloud_storage_enable_segment_uploads;
+    property<bool> cloud_storage_enable_remote_allow_gaps;
 
     // Azure Blob Storage
     property<std::optional<ss::sstring>> cloud_storage_azure_storage_account;
@@ -436,6 +527,7 @@ struct configuration final : public config_store {
     property<uint32_t> cloud_storage_cache_max_objects;
     property<uint32_t> cloud_storage_cache_trim_carryover_bytes;
     property<std::chrono::milliseconds> cloud_storage_cache_check_interval_ms;
+    bounded_property<uint16_t> cloud_storage_cache_trim_walk_concurrency;
     property<std::optional<uint32_t>>
       cloud_storage_max_segment_readers_per_shard;
     property<std::optional<uint32_t>>
@@ -451,6 +543,19 @@ struct configuration final : public config_store {
     enum_property<model::cloud_storage_chunk_eviction_strategy>
       cloud_storage_chunk_eviction_strategy;
     property<uint16_t> cloud_storage_chunk_prefetch;
+    bounded_property<uint32_t> cloud_storage_cache_num_buckets;
+    bounded_property<std::optional<double>, numeric_bounds>
+      cloud_storage_cache_trim_threshold_percent_size;
+    bounded_property<std::optional<double>, numeric_bounds>
+      cloud_storage_cache_trim_threshold_percent_objects;
+
+    property<bool> cloud_storage_inventory_based_scrub_enabled;
+    property<ss::sstring> cloud_storage_inventory_id;
+    property<ss::sstring> cloud_storage_inventory_reports_prefix;
+    property<bool> cloud_storage_inventory_self_managed_report_config;
+    property<std::chrono::milliseconds>
+      cloud_storage_inventory_report_check_interval_ms;
+    property<uint64_t> cloud_storage_inventory_max_hash_size_during_parse;
 
     one_or_many_property<ss::sstring> superusers;
 
@@ -472,7 +577,7 @@ struct configuration final : public config_store {
     deprecated_property full_raft_configuration_recovery_pattern;
     property<bool> enable_auto_rebalance_on_node_add;
 
-    enum_property<model::partition_autobalancing_mode>
+    enterprise<enum_property<model::partition_autobalancing_mode>>
       partition_autobalancing_mode;
     property<std::chrono::seconds>
       partition_autobalancing_node_availability_timeout_sec;
@@ -486,11 +591,17 @@ struct configuration final : public config_store {
     property<bool> partition_autobalancing_topic_aware;
 
     property<bool> enable_leader_balancer;
-    enum_property<model::leader_balancer_mode> leader_balancer_mode;
+    deprecated_property leader_balancer_mode;
     property<std::chrono::milliseconds> leader_balancer_idle_timeout;
     property<std::chrono::milliseconds> leader_balancer_mute_timeout;
     property<std::chrono::milliseconds> leader_balancer_node_mute_timeout;
     bounded_property<size_t> leader_balancer_transfer_limit_per_shard;
+    enterprise<property<config::leaders_preference>> default_leaders_preference;
+
+    property<bool> core_balancing_on_core_count_change;
+    enterprise<property<bool>> core_balancing_continuous;
+    property<std::chrono::milliseconds> core_balancing_debounce_timeout;
+
     property<int> internal_topic_replication_factor;
     property<std::chrono::milliseconds> health_manager_tick_interval;
 
@@ -542,14 +653,13 @@ struct configuration final : public config_store {
     bounded_property<std::optional<int64_t>> kafka_throughput_limit_node_in_bps;
     bounded_property<std::optional<int64_t>>
       kafka_throughput_limit_node_out_bps;
-    property<bool> kafka_throughput_throttling_v2;
+    deprecated_property kafka_throughput_throttling_v2;
     bounded_property<std::optional<int64_t>>
       kafka_throughput_replenish_threshold;
-    bounded_property<std::chrono::milliseconds> kafka_quota_balancer_window;
-    bounded_property<std::chrono::milliseconds>
-      kafka_quota_balancer_node_period;
-    property<double> kafka_quota_balancer_min_shard_throughput_ratio;
-    bounded_property<int64_t> kafka_quota_balancer_min_shard_throughput_bps;
+    deprecated_property kafka_quota_balancer_window;
+    deprecated_property kafka_quota_balancer_node_period;
+    deprecated_property kafka_quota_balancer_min_shard_throughput_ratio;
+    deprecated_property kafka_quota_balancer_min_shard_throughput_bps;
     property<std::vector<ss::sstring>> kafka_throughput_controlled_api_keys;
     property<std::vector<throughput_control_group>> kafka_throughput_control;
 
@@ -561,10 +671,13 @@ struct configuration final : public config_store {
     property<std::chrono::seconds> legacy_unsafe_log_warning_interval_sec;
 
     // schema id validation
-    enum_property<pandaproxy::schema_registry::schema_id_validation_mode>
+    enterprise<
+      enum_property<pandaproxy::schema_registry::schema_id_validation_mode>>
       enable_schema_id_validation;
     config::property<size_t> kafka_schema_id_validation_cache_capacity;
 
+    property<bool> schema_registry_always_normalize;
+    deprecated_property schema_registry_protobuf_renderer_v2;
     property<std::optional<uint32_t>> pp_sr_smp_max_non_local_requests;
     bounded_property<size_t> max_in_flight_schema_registry_requests_per_shard;
     bounded_property<size_t> max_in_flight_pandaproxy_requests_per_shard;
@@ -574,6 +687,10 @@ struct configuration final : public config_store {
     // debug controls
     property<bool> cpu_profiler_enabled;
     bounded_property<std::chrono::milliseconds> cpu_profiler_sample_period_ms;
+    property<std::filesystem::path> rpk_path;
+    property<std::optional<std::filesystem::path>> debug_bundle_storage_dir;
+    property<std::optional<std::chrono::seconds>>
+      debug_bundle_auto_removal_seconds;
 
     // oidc authentication
     property<ss::sstring> oidc_discovery_url;
@@ -583,16 +700,115 @@ struct configuration final : public config_store {
     property<std::chrono::seconds> oidc_keys_refresh_interval;
 
     // HTTP Authentication
-    property<std::vector<ss::sstring>> http_authentication;
+    enterprise<property<std::vector<ss::sstring>>> http_authentication;
 
     // MPX
     property<bool> enable_mpx_extensions;
     bounded_property<uint64_t> virtual_cluster_min_producer_ids;
 
+    // temporary - to be deprecated
+    property<bool> unsafe_enable_consumer_offsets_delete_retention;
+
+    enum_property<tls_version> tls_min_version;
+    property<bool> tls_enable_renegotiation;
+
+    // datalake configurations
+    enterprise<property<bool>> iceberg_enabled;
+    bounded_property<std::chrono::milliseconds>
+      iceberg_catalog_commit_interval_ms;
+    bounded_property<std::chrono::milliseconds>
+      iceberg_latest_schema_cache_ttl_ms;
+    property<ss::sstring> iceberg_catalog_base_location;
+    bounded_property<std::chrono::seconds>
+      datalake_coordinator_snapshot_max_delay_secs;
+
+    // datalake catalog configuration
+    enum_property<datalake_catalog_type> iceberg_catalog_type;
+    property<std::optional<ss::sstring>> iceberg_rest_catalog_endpoint;
+    property<std::optional<ss::sstring>> iceberg_rest_catalog_client_id;
+    property<std::optional<ss::sstring>> iceberg_rest_catalog_client_secret;
+    property<std::optional<ss::sstring>> iceberg_rest_catalog_token;
+    property<std::chrono::milliseconds> iceberg_rest_catalog_request_timeout_ms;
+    property<std::optional<ss::sstring>> iceberg_rest_catalog_trust_file;
+    property<std::optional<ss::sstring>> iceberg_rest_catalog_trust;
+    property<std::optional<ss::sstring>> iceberg_rest_catalog_crl_file;
+    property<std::optional<ss::sstring>> iceberg_rest_catalog_crl;
+    property<std::optional<ss::sstring>> iceberg_rest_catalog_warehouse;
+    property<std::optional<ss::sstring>> iceberg_rest_catalog_oauth2_server_uri;
+    property<ss::sstring> iceberg_rest_catalog_oauth2_scope;
+    enum_property<datalake_catalog_auth_mode>
+      iceberg_rest_catalog_authentication_mode;
+    property<double> iceberg_backlog_controller_p_coeff;
+    property<double> iceberg_backlog_controller_i_coeff;
+    bounded_property<uint32_t> iceberg_target_backlog_size;
+    property<double> iceberg_throttle_backlog_size_ratio;
+
+    property<bool> iceberg_delete;
+    property<ss::sstring> iceberg_default_partition_spec;
+    enum_property<model::iceberg_invalid_record_action>
+      iceberg_invalid_record_action;
+    bounded_property<std::chrono::milliseconds> iceberg_target_lag_ms;
+    property<bool> iceberg_disable_snapshot_tagging;
+    property<bool> iceberg_disable_automatic_snapshot_expiry;
+
+    property<bool> enable_host_metrics;
+
+    // datalake scheduler configs
+    bounded_property<size_t> datalake_scheduler_block_size_bytes;
+    bounded_property<size_t> datalake_scheduler_max_concurrent_translations;
+    bounded_property<std::chrono::milliseconds>
+      datalake_scheduler_time_slice_ms;
+    bounded_property<size_t> datalake_translator_flush_bytes;
+    property<bool> datalake_disk_space_monitor_enable;
+    deprecated_property datalake_disk_space_monitor_interval;
+    property<size_t> datalake_scratch_space_size_bytes;
+    bounded_property<double, numeric_bounds>
+      datalake_scratch_space_soft_limit_size_percent;
+    property<double> datalake_disk_usage_overage_coeff;
+    bounded_property<size_t> datalake_scheduler_disk_reservation_block_size;
+
     configuration();
 
     error_map_t load(const YAML::Node& root_node);
+
+public:
+    development_feature_property<bool> development_enable_cloud_topics;
+
+    development_feature_property<int> development_feature_property_testing_only;
+
+private:
+    // to query if experimental features are enabled in order to log a nag. it
+    // does not use the query to control any experimental feature.
+    friend class ::monitor_unsafe;
+
+    template<typename T>
+    friend class development_feature_property;
+
+    /*
+     * This configuration property shouldn't be queried directly. Rather, it is
+     * used to enable the use of other feature-specific experimental properties.
+     *
+     * This property is hidden when its value is the same as its default, which
+     * corresponds to the case in which experimental features are not enabled.
+     *
+     * In addition to this property thus being hidden in production scenarios,
+     * it also fixes several tests like rpk-import-export that expect to be able
+     * to set values for all properties that it discovers.
+     */
+    hidden_when_default_property<ss::sstring>
+      enable_developmental_unrecoverable_data_corrupting_features;
+
+    bool development_features_enabled() const {
+        return !enable_developmental_unrecoverable_data_corrupting_features()
+                  .empty();
+    }
 };
+
+template<typename T>
+bool development_feature_property<T>::development_features_enabled(
+  const configuration& conf) {
+    return conf.development_features_enabled();
+}
 
 configuration& shard_local_cfg();
 

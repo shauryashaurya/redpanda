@@ -2,11 +2,17 @@ from copy import copy
 from dataclasses import astuple, dataclass
 from enum import Enum, auto
 from logging import Logger
-from typing import Iterator, Protocol
+import re
+from typing import Iterator, Protocol, Sequence
+from rptest.utils.allow_logs_on_predicate import AllowLogsOnPredicate
 
 # pyright: strict
 
 # Basic types shared between various redpanda service and test modes.
+
+# Things which are allowed in the low_allow_list for @cluster
+LogAllowListElem = str | AllowLogsOnPredicate | re.Pattern[str]
+LogAllowList = Sequence[LogAllowListElem]
 
 
 @dataclass
@@ -53,7 +59,7 @@ class SecurityProtocol(Enum):
         return self.name
 
 
-SIMPLE_SASL_MECHANISMS = ['SCRAM-SHA-256', 'SCRAM-SHA-512']
+SIMPLE_SASL_MECHANISMS = ['PLAIN', 'SCRAM-SHA-256', 'SCRAM-SHA-512']
 COMPLEX_SASL_MECHANISMS = ['GSSAPI', 'OAUTHBEARER']
 
 

@@ -15,6 +15,11 @@
 #include "base/units.h"
 #include "model/fundamental.h"
 #include "serde/envelope.h"
+#include "serde/rw/named_type.h"
+#include "serde/rw/optional.h"
+#include "serde/rw/rw.h"
+#include "serde/rw/tristate_rw.h"
+#include "serde/rw/vector.h"
 #include "utils/named_type.h"
 #include "utils/unresolved_address.h"
 #include "utils/xid.h"
@@ -26,6 +31,7 @@
 #include <boost/functional/hash.hpp>
 
 #include <compare>
+#include <cstddef>
 #include <optional>
 #include <stdexcept>
 #include <unordered_map>
@@ -47,7 +53,7 @@ struct broker_properties
     // key=value properties in /etc/redpanda/machine_properties.yaml
     std::unordered_map<ss::sstring, ss::sstring> etc_props;
     uint64_t available_memory_bytes = 0;
-    bool in_fips_mode = false;
+    fips_mode_flag in_fips_mode = fips_mode_flag::disabled;
 
     bool operator==(const broker_properties& other) const = default;
 
@@ -191,11 +197,11 @@ public:
       std::optional<rack_id> rack,
       broker_properties props) noexcept
       : broker(
-        id,
-        {broker_endpoint(std::move(kafka_advertised_listener))},
-        std::move(rpc_address),
-        std::move(rack),
-        std::move(props)) {}
+          id,
+          {broker_endpoint(std::move(kafka_advertised_listener))},
+          std::move(rpc_address),
+          std::move(rack),
+          std::move(props)) {}
 
     broker(broker&&) noexcept = default;
     broker& operator=(broker&&) noexcept = default;
@@ -270,7 +276,7 @@ struct broker_shard {
     }
 
     friend void read_nested(
-      iobuf_parser& in, broker_shard& bs, std::size_t const bytes_left_limit) {
+      iobuf_parser& in, broker_shard& bs, const std::size_t bytes_left_limit) {
         using serde::read_nested;
         read_nested(in, bs.node_id, bytes_left_limit);
         read_nested(in, bs.shard, bytes_left_limit);
@@ -369,7 +375,7 @@ struct topic_namespace {
     friend void read_nested(
       iobuf_parser& in,
       topic_namespace& t,
-      std::size_t const bytes_left_limit) {
+      const std::size_t bytes_left_limit) {
         using serde::read_nested;
         read_nested(in, t.ns, bytes_left_limit);
         read_nested(in, t.tp, bytes_left_limit);
@@ -377,6 +383,8 @@ struct topic_namespace {
 
     model::ns ns;
     model::topic tp;
+
+    ss::sstring path() const;
 
     friend std::ostream& operator<<(std::ostream&, const topic_namespace&);
 };
@@ -466,7 +474,8 @@ enum class cloud_storage_backend {
     google_s3_compat = 1,
     azure = 2,
     minio = 3,
-    unknown = 4,
+    oracle_s3_compat = 4,
+    unknown
 };
 
 inline std::ostream& operator<<(std::ostream& os, cloud_storage_backend csb) {
@@ -479,30 +488,12 @@ inline std::ostream& operator<<(std::ostream& os, cloud_storage_backend csb) {
         return os << "azure";
     case cloud_storage_backend::minio:
         return os << "minio";
+    case cloud_storage_backend::oracle_s3_compat:
+        return os << "oracle_s3_compat";
     case cloud_storage_backend::unknown:
         return os << "unknown";
     }
 }
-
-enum class leader_balancer_mode : uint8_t {
-    greedy_balanced_shards = 0,
-    random_hill_climbing = 1,
-};
-
-constexpr const char*
-leader_balancer_mode_to_string(leader_balancer_mode mode) {
-    switch (mode) {
-    case leader_balancer_mode::greedy_balanced_shards:
-        return "greedy_balanced_shards";
-    case leader_balancer_mode::random_hill_climbing:
-        return "random_hill_climbing";
-    default:
-        throw std::invalid_argument("unknown leader_balancer_mode");
-    }
-}
-
-std::ostream& operator<<(std::ostream&, leader_balancer_mode);
-std::istream& operator>>(std::istream&, leader_balancer_mode&);
 
 enum class cloud_storage_chunk_eviction_strategy {
     eager = 0,
@@ -521,6 +512,31 @@ operator<<(std::ostream& os, cloud_storage_chunk_eviction_strategy st) {
         return os << "predictive";
     }
 }
+
+enum class fetch_read_strategy : uint8_t {
+    polling = 0,
+    non_polling = 1,
+    non_polling_with_debounce = 2,
+    non_polling_with_pid = 3,
+};
+
+constexpr const char* fetch_read_strategy_to_string(fetch_read_strategy s) {
+    switch (s) {
+    case fetch_read_strategy::polling:
+        return "polling";
+    case fetch_read_strategy::non_polling:
+        return "non_polling";
+    case fetch_read_strategy::non_polling_with_debounce:
+        return "non_polling_with_debounce";
+    case fetch_read_strategy::non_polling_with_pid:
+        return "non_polling_with_pid";
+    default:
+        throw std::invalid_argument("unknown fetch_read_strategy");
+    }
+}
+
+std::ostream& operator<<(std::ostream&, fetch_read_strategy);
+std::istream& operator>>(std::istream&, fetch_read_strategy&);
 
 /**
  * Type representing MPX virtual cluster. MPX uses XID to identify clusters.
@@ -559,25 +575,6 @@ std::optional<write_caching_mode>
 std::ostream& operator<<(std::ostream&, write_caching_mode);
 std::istream& operator>>(std::istream&, write_caching_mode&);
 
-namespace internal {
-/*
- * Old version for use in backwards compatibility serialization /
- * deserialization helpers.
- */
-struct broker_v0 {
-    model::node_id id;
-    net::unresolved_address kafka_address;
-    net::unresolved_address rpc_address;
-    std::optional<rack_id> rack;
-    model::broker_properties properties;
-
-    model::broker to_v3() const {
-        return model::broker(id, kafka_address, rpc_address, rack, properties);
-    }
-};
-
-} // namespace internal
-
 enum class recovery_validation_mode : std::uint16_t {
     // ensure that either the manifest is in TS or that no manifest is present.
     // download issues will fail the validation
@@ -591,6 +588,136 @@ enum class recovery_validation_mode : std::uint16_t {
 
 std::ostream& operator<<(std::ostream&, recovery_validation_mode);
 std::istream& operator>>(std::istream&, recovery_validation_mode&);
+
+// Iceberg enablement options for a topic
+class iceberg_mode {
+public:
+    iceberg_mode() = default;
+
+    enum class variant : uint8_t {
+        // Iceberg is disabled
+        disabled = 0,
+        // Iceberg translation interprets record key and value as binary
+        // types and uses default Iceberg table schema.
+        key_value = 1,
+        // Iceberg translation interprets the record value using the schema
+        // id embedded in value. Kafka serializers embed a magic byte as the
+        // first byte of the value to indicate the presence of a schema id
+        // which is then resolved with the schema registry. The value bytes
+        // are then interepted using the schema and the resulting columns are
+        // mapped to appropriate iceberg types and corresponding table columns.
+        value_schema_id_prefix = 2,
+        // Iceberg translation always uses the latest schema found in
+        // the topic's subject in schema registry. By default we assume the
+        // TopicNamingStrategy (<topic>-value) and if protobuf the 0th message
+        // in the file descriptor. However these can both be overridden by the
+        // user.
+        value_schema_latest = 3,
+    };
+    static iceberg_mode disabled;
+
+    static iceberg_mode key_value;
+
+    static iceberg_mode value_schema_id_prefix;
+
+    // Creates a new iceberg mode with the latest protobuf value kind and the
+    // protobuf full name.
+    static iceberg_mode value_schema_latest(
+      std::string_view protobuf_full_name, std::string_view subject_name) {
+        return {latest_protobuf_value_t{}, protobuf_full_name, subject_name};
+    }
+
+    // Returns the kind of iceberg mode is being used.
+    variant kind() const noexcept {
+        return static_cast<variant>(_impl.index());
+    }
+
+    // Returns the protobuf message's full name if specified.
+    //
+    // Throws is variant() != variant::latest_protobuf_value
+    std::optional<ss::sstring> protobuf_full_name() const {
+        const auto& name
+          = std::get<latest_protobuf_value_impl>(_impl).message_full_name;
+        if (name.empty()) {
+            return std::nullopt;
+        }
+        return name;
+    }
+
+    // Returns the subject name if specified.
+    //
+    // Throws is variant() != variant::latest_protobuf_value
+    std::optional<ss::sstring> subject_name() const {
+        const auto& subject
+          = std::get<latest_protobuf_value_impl>(_impl).subject_name;
+        if (subject.empty()) {
+            return std::nullopt;
+        }
+        return subject;
+    }
+
+    bool operator==(const iceberg_mode&) const = default;
+
+    friend void write(iobuf& out, const iceberg_mode& m);
+
+    friend void read_nested(
+      iobuf_parser& in, iceberg_mode& m, const std::size_t bytes_left_limit);
+
+private:
+    template<variant v>
+    static iceberg_mode make() noexcept {
+        iceberg_mode m;
+        m._impl = decltype(m._impl){
+          std::in_place_index<static_cast<size_t>(v)>};
+        return m;
+    }
+
+    struct latest_protobuf_value_t {};
+    iceberg_mode(
+      latest_protobuf_value_t,
+      std::string_view protobuf_full_name,
+      std::string_view subject_name)
+      : _impl(
+          std::in_place_type<latest_protobuf_value_impl>,
+          ss::sstring(protobuf_full_name),
+          ss::sstring(subject_name)) {}
+
+    struct disabled_impl {
+        bool operator==(const disabled_impl&) const = default;
+    };
+    struct key_value_impl {
+        bool operator==(const key_value_impl&) const = default;
+    };
+    struct value_schema_id_prefix_impl {
+        bool operator==(const value_schema_id_prefix_impl&) const = default;
+    };
+    struct latest_protobuf_value_impl {
+        ss::sstring message_full_name;
+        ss::sstring subject_name;
+        bool operator==(const latest_protobuf_value_impl&) const = default;
+    };
+
+    std::variant<
+      disabled_impl,
+      key_value_impl,
+      value_schema_id_prefix_impl,
+      latest_protobuf_value_impl>
+      _impl;
+};
+
+std::ostream& operator<<(std::ostream&, const iceberg_mode&);
+std::istream& operator>>(std::istream&, iceberg_mode&);
+
+// How to handle invalid records during Iceberg translation.
+enum class iceberg_invalid_record_action : uint8_t {
+    // Drop invalid records.
+    drop = 0,
+    // Write invalid records to a dead letter queue table.
+    dlq_table = 1,
+};
+
+std::ostream& operator<<(std::ostream&, const iceberg_invalid_record_action&);
+std::istream& operator>>(std::istream&, iceberg_invalid_record_action&);
 
 } // namespace model
 
@@ -609,7 +736,7 @@ struct fmt::formatter<model::isolation_level> final
             str = "read_committed";
             break;
         }
-        return formatter<string_view>::format(str, ctx);
+        return fmt::format_to(ctx.out(), "{}", str);
     }
 };
 
@@ -649,7 +776,8 @@ struct hash<model::broker_properties> {
             boost::hash_combine(h, std::hash<ss::sstring>()(k));
             boost::hash_combine(h, std::hash<ss::sstring>()(v));
         }
-        boost::hash_combine(h, std::hash<bool>()(b.in_fips_mode));
+        boost::hash_combine(
+          h, std::hash<model::fips_mode_flag>()(b.in_fips_mode));
         return h;
     }
 };

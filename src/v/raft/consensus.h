@@ -113,11 +113,12 @@ public:
       keep_snapshotted_log = keep_snapshotted_log::no);
 
     /// Initial call. Allow for internal state recovery
-    ss::future<>
-      start(std::optional<state_machine_manager_builder> = std::nullopt);
+    ss::future<> start(
+      std::optional<state_machine_manager_builder> = std::nullopt,
+      std::optional<xshard_transfer_state> = std::nullopt);
 
     /// Stop all communications.
-    ss::future<> stop();
+    ss::future<xshard_transfer_state> stop();
 
     /// Stop consensus instance from accepting requests
     void shutdown_input();
@@ -127,7 +128,7 @@ public:
     ss::future<install_snapshot_reply>
     install_snapshot(install_snapshot_request&& r);
 
-    ss::future<timeout_now_reply> timeout_now(timeout_now_request&& r);
+    ss::future<timeout_now_reply> timeout_now(timeout_now_request r);
 
     /// This method adds member to a group
     ss::future<std::error_code>
@@ -194,16 +195,17 @@ public:
      * Sends a round of heartbeats to followers, when majority of followers
      * replied with success to either this of any following request all reads up
      * to returned offsets are linearizable. (i.e. majority of followers have
-     * updated their commit indices to at least reaturned offset). For more
+     * updated their commit indices to at least returned offset). For more
      * details see paragraph 6.4 of Raft protocol dissertation.
      */
-    ss::future<result<model::offset>> linearizable_barrier();
+    ss::future<result<model::offset>> linearizable_barrier(
+      model::timeout_clock::time_point deadline = model::no_timeout);
 
     vnode self() const { return _self; }
     protocol_metadata meta() const;
     raft::group_id group() const { return _group; }
     model::term_id term() const { return _term; }
-    group_configuration config() const;
+    const group_configuration& config() const;
     const model::ntp& ntp() const { return _log->config().ntp(); }
     clock_type::time_point last_heartbeat() const { return _hbeat; };
     clock_type::time_point became_leader_at() const {
@@ -246,9 +248,13 @@ public:
       model::offset);
 
     ss::future<result<replicate_result>>
-    replicate(model::record_batch_reader&&, replicate_options);
+      replicate(chunked_vector<model::record_batch>, replicate_options);
+    ss::future<result<replicate_result>>
+      replicate(model::record_batch, replicate_options);
+    replicate_stages replicate_in_stages(
+      chunked_vector<model::record_batch>, replicate_options);
     replicate_stages
-    replicate_in_stages(model::record_batch_reader&&, replicate_options);
+      replicate_in_stages(model::record_batch, replicate_options);
     uint64_t get_snapshot_size() const { return _snapshot_size; }
 
     std::optional<state_machine_manager>& stm_manager() { return _stm_manager; }
@@ -276,10 +282,14 @@ public:
      *      d. cache the term
      *      e. continue with step #1
      */
+    ss::future<result<replicate_result>> replicate(
+      model::term_id, chunked_vector<model::record_batch>, replicate_options);
     ss::future<result<replicate_result>>
-    replicate(model::term_id, model::record_batch_reader&&, replicate_options);
+      replicate(model::term_id, model::record_batch, replicate_options);
     replicate_stages replicate_in_stages(
-      model::term_id, model::record_batch_reader&&, replicate_options);
+      model::term_id, chunked_vector<model::record_batch>, replicate_options);
+    replicate_stages replicate_in_stages(
+      model::term_id, model::record_batch, replicate_options);
     ss::future<model::record_batch_reader> make_reader(
       storage::log_reader_config,
       std::optional<clock_type::time_point> = std::nullopt);
@@ -416,31 +426,31 @@ public:
      * lock. In order to prevent reordering and do not flood followers with
      * heartbeats that they will not be able to respond to we suppress sending
      * heartbeats when other append entries request or heartbeat request is in
-     * flight.
+     * flight. This RAII utility keeps track of inflight appends so heartbeat
+     * manager can decide whether to pause heartbeats while appends are in
+     * progress.
      */
 
-    class suppress_heartbeats_guard {
+    class inflight_appends_guard {
     public:
-        suppress_heartbeats_guard() noexcept = default;
-        explicit suppress_heartbeats_guard(
+        inflight_appends_guard() noexcept = default;
+        explicit inflight_appends_guard(
           consensus& parent, vnode target) noexcept;
 
-        void unsuppress();
+        void mark_finished();
 
-        suppress_heartbeats_guard(suppress_heartbeats_guard&& other) noexcept
+        inflight_appends_guard(inflight_appends_guard&& other) noexcept
           : _parent(other._parent)
           , _term(other._term)
           , _target(other._target) {
             other._parent = nullptr;
         }
-        suppress_heartbeats_guard(const suppress_heartbeats_guard& other)
+        inflight_appends_guard(const inflight_appends_guard& other) = delete;
+        inflight_appends_guard& operator=(inflight_appends_guard&& other)
           = delete;
-        suppress_heartbeats_guard& operator=(suppress_heartbeats_guard&& other)
+        inflight_appends_guard& operator=(const inflight_appends_guard& other)
           = delete;
-        suppress_heartbeats_guard&
-        operator=(const suppress_heartbeats_guard& other)
-          = delete;
-        ~suppress_heartbeats_guard() noexcept { unsuppress(); }
+        ~inflight_appends_guard() noexcept { mark_finished(); }
 
     private:
         consensus* _parent = nullptr;
@@ -449,7 +459,7 @@ public:
     };
 
     // precondition: is_elected_leader() must be true.
-    suppress_heartbeats_guard suppress_heartbeats(vnode);
+    inflight_appends_guard track_append_inflight(vnode);
 
     void update_heartbeat_status(vnode, bool);
 
@@ -460,7 +470,7 @@ public:
     size_t get_follower_count() const;
     bool has_followers() const { return _fstats.size() > 0; }
 
-    offset_monitor& visible_offset_monitor() {
+    offset_monitor<model::offset>& visible_offset_monitor() {
         return _consumable_offset_monitor;
     }
 
@@ -523,6 +533,24 @@ public:
     replication_monitor& get_replication_monitor() {
         return _replication_monitor;
     }
+    /**
+     * Returns the number of bytes that are required to deliver to all
+     * learners that are being recovered.
+     */
+    size_t bytes_to_deliver_to_learners() const;
+
+    bool has_configuration_override() const {
+        return _configuration_manager.has_configuration_override();
+    }
+
+    // start/stop simulating failed requests (for debug purposes)
+    void toggle_append_entries_error_injection(bool inject_error) {
+        vlog(
+          _ctxlog.warn,
+          "toggle_append_entries_error_injection block={}",
+          inject_error);
+        _inject_error_in_append_entries = inject_error;
+    }
 
 private:
     friend replication_monitor;
@@ -540,12 +568,15 @@ private:
     // all these private functions assume that we are under exclusive operations
     // via the _op_sem
     void do_step_down(std::string_view);
+    // steps down and requests the other replica to start leader election
+    // immediately
+    ss::future<> transfer_and_stepdown(std::string_view);
     ss::future<vote_reply> do_vote(vote_request);
     ss::future<append_entries_reply>
     do_append_entries(append_entries_request&&);
     ss::future<install_snapshot_reply>
     do_install_snapshot(install_snapshot_request r);
-    ss::future<> do_start();
+    ss::future<> do_start(std::optional<xshard_transfer_state>);
 
     ss::future<result<replicate_result>> dispatch_replicate(
       append_entries_request,
@@ -574,13 +605,13 @@ private:
 
     replicate_stages do_replicate(
       std::optional<model::term_id>,
-      model::record_batch_reader&&,
+      chunked_vector<model::record_batch>,
       replicate_options);
 
     ss::future<result<replicate_result>> chain_stages(replicate_stages);
 
-    ss::future<storage::append_result>
-    disk_append(model::record_batch_reader&&, update_last_quorum_index);
+    ss::future<storage::append_result> disk_append(
+      chunked_vector<model::record_batch>, update_last_quorum_index);
 
     using success_reply = ss::bool_class<struct successfull_reply_tag>;
 
@@ -648,6 +679,8 @@ private:
     template<typename Func>
     ss::future<std::error_code> change_configuration(Func&&);
 
+    model::offset_delta
+    get_offset_delta(const storage::offset_stats&, model::offset) const;
     template<typename Func>
     ss::future<std::error_code>
       interrupt_configuration_change(model::revision_id, Func);
@@ -752,11 +785,6 @@ private:
 
     void update_confirmed_term();
 
-    bool use_all_serde_append_entries() const {
-        return _features.is_active(
-          features::feature::raft_append_entries_serde);
-    }
-
     // Called when during processing of an append_entries request we realize
     // that we need recovery or that the leader is already recovering us.
     // Will initialize or update _follower_recovery_state.
@@ -767,13 +795,21 @@ private:
 
     std::optional<model::offset> get_learner_start_offset() const;
 
-    bool use_serde_configuration() const {
-        return _features.is_active(features::feature::raft_config_serde);
-    }
-
     flush_delay_t compute_max_flush_delay() const;
     ss::future<> do_flush();
 
+    bool supports_symmetric_reconfiguration_cancel() const {
+        return _features.is_active(
+          features::feature::raft_symmetric_reconfiguration_cancel);
+    }
+
+    void try_updating_configuration_version(group_configuration& cfg);
+
+    void validate_offset_translator_delta(
+      const protocol_metadata&, const storage::offset_stats& lstats);
+
+    std::optional<model::offset>
+      adjust_learner_initial_offset(std::optional<model::offset>);
     // args
     vnode _self;
     raft::group_id _group;
@@ -812,7 +848,7 @@ private:
     bool _transferring_leadership{false};
 
     /// useful for when we are not the leader
-    clock_type::time_point _hbeat = clock_type::now();
+    clock_type::time_point _hbeat = clock_type::now(); // is max() iff leader
     clock_type::time_point _became_leader_at = clock_type::now();
     clock_type::time_point _instantiated_at = clock_type::now();
 
@@ -833,19 +869,26 @@ private:
     /// used to wait for background ops before shutting down
     ss::gate _bg;
 
+    /**
+     * Locks listed in the order of nestedness, election being the outermost
+     * and snapshot the innermost. I.e. if any of these locks are used at the
+     * same time, they should be acquired in the listed order and released in
+     * reverse order.
+     */
+    /// guards from concurrent election where this instance is a candidate
+    mutex _election_lock{"consensus::election_lock"};
     /// all raft operations must happen exclusively since the common case
     /// is for the operation to touch the disk
     mutex _op_lock{"consensus::op_lock"};
     /// since snapshot state is orthogonal to raft state when writing snapshot
     /// it is enough to grab the snapshot mutex, there is no need to keep
-    /// oplock, if the two locks are expected to be acquired at the same time
-    /// the snapshot lock should always be an internal (taken after the
-    /// _op_lock)
+    /// oplock
     mutex _snapshot_lock{"consensus::snapshot_lock"};
+
     /// used for notifying when commits happened to log
     event_manager _event_manager;
     std::unique_ptr<probe> _probe;
-    ctx_log _ctxlog;
+    mutable ctx_log _ctxlog;
     ss::condition_variable _commit_index_updated;
 
     std::chrono::milliseconds _replicate_append_timeout;
@@ -885,7 +928,7 @@ private:
     model::offset _last_quorum_replicated_index_with_flush;
     model::offset _last_leader_visible_offset;
     flush_after_append _last_write_flushed;
-    offset_monitor _consumable_offset_monitor;
+    offset_monitor<model::offset> _consumable_offset_monitor;
     ss::condition_variable _follower_reply;
     append_entries_buffer _append_requests_buffer;
     std::optional<state_machine_manager> _stm_manager;
@@ -914,6 +957,9 @@ private:
     ss::timer<ss::lowres_clock> _deferred_flusher;
 
     replication_monitor _replication_monitor;
+
+    // simulate storage issues
+    bool _inject_error_in_append_entries = false;
 
     friend std::ostream& operator<<(std::ostream&, const consensus&);
 };

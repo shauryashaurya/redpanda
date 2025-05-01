@@ -36,6 +36,7 @@ class KgoVerifierService(Service):
     Use ctx.cluster.alloc(ClusterSpec.simple_linux(1)) to allocate node and pass it to constructor
     """
     _status_thread: Optional[StatusThread]
+    _stopped: bool
 
     def __init__(self,
                  context,
@@ -88,6 +89,7 @@ class KgoVerifierService(Service):
                 node.kgo_verifier_ports = {}
 
         self._status_thread = None
+        self._stopped = False
 
     def __del__(self):
         self._release_port()
@@ -199,7 +201,14 @@ class KgoVerifierService(Service):
     def stop_node(self, node, **kwargs):
         if self._status_thread:
             self._status_thread.stop()
+            self._status_thread.raise_on_error()
             self._status_thread = None
+            # Record that we just stopped, so that we can't wait() after.
+            # This is done inside this if statement because stop_node() is also
+            # called during the start of the service to potentially stop a previous
+            # instance of the service. Here, we know that we are stopping the service
+            # that we started because it was us who initialized the _status_thread.
+            self._stopped = True
 
         if self._pid is None:
             return
@@ -219,6 +228,7 @@ class KgoVerifierService(Service):
         self._redpanda.logger.info(f"{self.__class__.__name__}.clean_node")
         node.account.kill_process("kgo-verifier", clean_shutdown=False)
         node.account.remove("valid_offsets*json", True)
+        node.account.remove("latest_value*json", True)
         node.account.remove(f"/tmp/{self.__class__.__name__}*", True)
 
     def _remote(self, node, action, timeout=60):
@@ -237,8 +247,9 @@ class KgoVerifierService(Service):
                 return
             except Exception as e:
                 last_error = e
-                self._redpanda.logger.warn(
+                self._redpanda.logger.warning(
                     f"{self.who_am_i()} remote call failed, {e}")
+                time.sleep(3)
         if last_error:
             raise last_error
 
@@ -247,13 +258,20 @@ class KgoVerifierService(Service):
         Wrapper to catch timeouts on wait, and send a `/print_stack` to the remote
         process in case it is experiencing a hang bug.
         """
+
+        if self._stopped:
+            raise RuntimeError(
+                f"Can't wait {self.who_am_i()}. It was already stopped."
+                f" You can either stop() a service or wait() and then stop() it"
+                f" but not the other way around.")
+
         try:
             return self._do_wait_node(node, timeout_sec)
         except:
             try:
                 self._remote(node, "print_stack")
             except Exception as e:
-                self._redpanda.logger.warn(
+                self._redpanda.logger.warning(
                     f"{self.who_am_i()} failed to print stacks during wait failure: {e}"
                 )
 
@@ -414,7 +432,7 @@ class StatusThread(threading.Thread):
                 # status read
                 return
             else:
-                self._stop_requested.wait(self.INTERVAL)
+                self._shutdown_requested.wait(self.INTERVAL)
 
     def join_with_timeout(self):
         """
@@ -436,6 +454,7 @@ class StatusThread(threading.Thread):
         """
         Drop out of poll loop as soon as possible, and join.
         """
+        self._shutdown_requested.set()
         self._stop_requested.set()
         self.join_with_timeout()
 
@@ -457,8 +476,8 @@ class ValidatorStatus:
 
     def __init__(self, name: str, valid_reads: int, invalid_reads: int,
                  out_of_scope_invalid_reads: int,
-                 max_offsets_consumed: Optional[int], lost_offsets: Dict[str,
-                                                                         int]):
+                 max_offsets_consumed: Optional[int],
+                 lost_offsets: Dict[str, int], tombstones_consumed: int):
         # Validator name is just a unique name per worker thread in kgo-verifier: useful in logging
         # but we mostly don't care
         self.name = name
@@ -468,6 +487,7 @@ class ValidatorStatus:
         self.out_of_scope_invalid_reads = out_of_scope_invalid_reads
         self.max_offsets_consumed = max_offsets_consumed
         self.lost_offsets = lost_offsets
+        self.tombstones_consumed = tombstones_consumed
 
     @property
     def total_reads(self):
@@ -492,7 +512,8 @@ class ValidatorStatus:
             f"valid_reads={self.valid_reads}, " \
             f"invalid_reads={self.invalid_reads}, " \
             f"out_of_scope_invalid_reads={self.out_of_scope_invalid_reads}, " \
-            f"lost_offsets={self.lost_offsets}>"
+            f"lost_offsets={self.lost_offsets}, " \
+            f"tombstones_consumed={self.tombstones_consumed}>"
 
 
 class ConsumerStatus:
@@ -513,7 +534,8 @@ class ConsumerStatus:
                 'out_of_scope_invalid_reads': 0,
                 'name': "",
                 'max_offsets_consumed': dict(),
-                'lost_offsets': dict()
+                'lost_offsets': dict(),
+                'tombstones_consumed': 0
             }
 
         self.validator = ValidatorStatus(**validator)
@@ -552,7 +574,11 @@ class KgoVerifierProducer(KgoVerifierService):
                  enable_tls=False,
                  msgs_per_producer_id=None,
                  max_buffered_records=None,
-                 tolerate_data_loss=False):
+                 tolerate_data_loss=False,
+                 tolerate_failed_produce=False,
+                 tombstone_probability=0.0,
+                 validate_latest_values=False,
+                 client_name=None):
         super(KgoVerifierProducer,
               self).__init__(context, redpanda, topic, msg_size, custom_node,
                              debug_logs, trace_logs, username, password,
@@ -570,6 +596,10 @@ class KgoVerifierProducer(KgoVerifierService):
         self._msgs_per_producer_id = msgs_per_producer_id
         self._max_buffered_records = max_buffered_records
         self._tolerate_data_loss = tolerate_data_loss
+        self._tolerate_failed_produce = tolerate_failed_produce
+        self._tombstone_probability = tombstone_probability
+        self._validate_latest_values = validate_latest_values
+        self._client_name = client_name
 
     @property
     def produce_status(self):
@@ -598,8 +628,13 @@ class KgoVerifierProducer(KgoVerifierService):
             # the same topic, or that Redpanda showed a buggy behavior with
             # idempotency: producer records should always land at the next offset
             # after the last record they wrote.
-            raise RuntimeError(
-                f"{self.who_am_i()} possible idempotency bug: {self._status}")
+            if self._tolerate_data_loss:
+                self._redpanda.logger.warning(
+                    f"{self.who_am_i()} observed data loss: {self._status}")
+            else:
+                raise RuntimeError(
+                    f"{self.who_am_i()} possible idempotency bug: {self._status}"
+                )
 
         return super().wait_node(node, timeout_sec=timeout_sec)
 
@@ -610,23 +645,36 @@ class KgoVerifierProducer(KgoVerifierService):
             backoff_sec=backoff_sec)
         self._status_thread.raise_on_error()
 
+    def _wait_for_file_on_nodes(self, file_name):
+        self._redpanda.wait_until(
+            lambda: self._status_thread.errored or all(
+                node.account.exists(file_name) for node in self.nodes),
+            timeout_sec=15,
+            backoff_sec=1,
+            err_msg=f"Timed out waiting for {file_name} to be created")
+        self._status_thread.raise_on_error()
+
     def wait_for_offset_map(self):
         # Producer worker aims to checkpoint every 5 seconds, so we should see this promptly.
-        self._redpanda.wait_until(lambda: self._status_thread.errored or all(
-            node.account.exists(f"valid_offsets_{self._topic}.json")
-            for node in self.nodes),
-                                  timeout_sec=15,
-                                  backoff_sec=1)
-        self._status_thread.raise_on_error()
+        offset_map_file_name = f"valid_offsets_{self._topic}.json"
+        self._wait_for_file_on_nodes(offset_map_file_name)
+
+    def wait_for_latest_value_map(self):
+        # Producer worker aims to checkpoint every 5 seconds, so we should see this promptly.
+        value_map_file_name = f"latest_value_{self._topic}.json"
+        self._wait_for_file_on_nodes(value_map_file_name)
 
     def is_complete(self):
         return self._status.acked >= self._msg_count
+
+    def client_name(self):
+        return self._client_name if self._client_name else self.who_am_i()
 
     def start_node(self, node, clean=False):
         if clean:
             self.clean_node(node)
 
-        cmd = f"{TESTS_DIR}/kgo-verifier --brokers {self._redpanda.brokers()} --topic {self._topic} --msg_size {self._msg_size} --produce_msgs {self._msg_count} --rand_read_msgs 0 --seq_read=0 --client-name {self.who_am_i()}"
+        cmd = f"{TESTS_DIR}/kgo-verifier --brokers {self._redpanda.brokers()} --topic {self._topic} --msg_size {self._msg_size} --produce_msgs {self._msg_count} --rand_read_msgs 0 --seq_read=0 --client-name {self.client_name()}"
 
         if self._username is not None:
             cmd = cmd + f' --username {self._username}'
@@ -668,6 +716,14 @@ class KgoVerifierProducer(KgoVerifierService):
 
         if self._tolerate_data_loss:
             cmd += " --tolerate-data-loss"
+
+        if self._tolerate_failed_produce:
+            cmd += " --tolerate-failed-produce"
+
+        if self._tombstone_probability is not None:
+            cmd += f" --tombstone-probability {self._tombstone_probability}"
+        if self._validate_latest_values:
+            cmd += " --validate-latest-values"
 
         self.spawn(cmd, node)
 
@@ -716,7 +772,10 @@ class KgoVerifierSeqConsumer(AbstractConsumer):
             producer: Optional[KgoVerifierProducer] = None,
             username: Optional[str] = None,
             password: Optional[str] = None,
-            enable_tls: Optional[bool] = False):
+            enable_tls: Optional[bool] = False,
+            use_transactions: Optional[bool] = False,
+            compacted: Optional[bool] = False,
+            validate_latest_values: Optional[bool] = False):
         super().__init__(context, redpanda, topic, msg_size, nodes, debug_logs,
                          trace_logs, username, password, enable_tls)
         self._max_msgs = max_msgs
@@ -725,6 +784,9 @@ class KgoVerifierSeqConsumer(AbstractConsumer):
         self._continuous = continuous
         self._tolerate_data_loss = tolerate_data_loss
         self._producer = producer
+        self._use_transactions = use_transactions
+        self._compacted = compacted
+        self._validate_latest_values = validate_latest_values
 
     def start_node(self, node, clean=False):
         if clean:
@@ -746,6 +808,13 @@ class KgoVerifierSeqConsumer(AbstractConsumer):
             cmd += " --continuous"
         if self._tolerate_data_loss:
             cmd += " --tolerate-data-loss"
+        if self._use_transactions:
+            cmd += " --use-transactions"
+        if self._compacted:
+            cmd += " --compacted"
+        if self._validate_latest_values:
+            cmd += " --validate-latest-values"
+
         self.spawn(cmd, node)
 
         self._status_thread = StatusThread(self, node, ConsumerStatus)
@@ -795,11 +864,13 @@ class KgoVerifierRandomConsumer(AbstractConsumer):
                  trace_logs=False,
                  username=None,
                  password=None,
-                 enable_tls=False):
+                 enable_tls=False,
+                 use_transactions: Optional[bool] = False):
         super().__init__(context, redpanda, topic, msg_size, nodes, debug_logs,
                          trace_logs, username, password, enable_tls)
         self._rand_read_msgs = rand_read_msgs
         self._parallel = parallel
+        self._use_transactions = use_transactions
 
     def start_node(self, node, clean=False):
         if clean:
@@ -812,6 +883,8 @@ class KgoVerifierRandomConsumer(AbstractConsumer):
             cmd = cmd + f' --password {self._password}'
         if self._enable_tls:
             cmd = cmd + f' --enable-tls'
+        if self._use_transactions:
+            cmd += " --use-transactions"
 
         self.spawn(cmd, node)
 
@@ -840,7 +913,10 @@ class KgoVerifierConsumerGroupConsumer(AbstractConsumer):
                  enable_tls=False,
                  continuous=False,
                  tolerate_data_loss=False,
-                 group_name=None):
+                 group_name=None,
+                 use_transactions=False,
+                 compacted=False,
+                 validate_latest_values=False):
         super().__init__(context, redpanda, topic, msg_size, nodes, debug_logs,
                          trace_logs, username, password, enable_tls)
 
@@ -851,6 +927,9 @@ class KgoVerifierConsumerGroupConsumer(AbstractConsumer):
         self._group_name = group_name
         self._continuous = continuous
         self._tolerate_data_loss = tolerate_data_loss
+        self._use_transactions = use_transactions
+        self._compacted = compacted
+        self._validate_latest_values = validate_latest_values
 
     def start_node(self, node, clean=False):
         if clean:
@@ -875,6 +954,13 @@ class KgoVerifierConsumerGroupConsumer(AbstractConsumer):
             cmd += " --tolerate-data-loss"
         if self._group_name is not None:
             cmd += f" --consumer_group_name {self._group_name}"
+        if self._use_transactions:
+            cmd += " --use-transactions"
+        if self._compacted:
+            cmd += " --compacted"
+        if self._validate_latest_values:
+            cmd += " --validate-latest-values"
+
         self.spawn(cmd, node)
 
         self._status_thread = StatusThread(self, node, ConsumerStatus)
@@ -892,7 +978,9 @@ class ProduceStatus:
                  latency=None,
                  active=False,
                  failed_transactions=0,
-                 aborted_transaction_msgs=0):
+                 aborted_transaction_msgs=0,
+                 fails=0,
+                 tombstones_produced=0):
         self.topic = topic
         self.sent = sent
         self.acked = acked
@@ -905,7 +993,9 @@ class ProduceStatus:
         self.active = active
         self.failed_transactions = failed_transactions
         self.aborted_transaction_messages = aborted_transaction_msgs
+        self.fails = fails
+        self.tombstones_produced = tombstones_produced
 
     def __str__(self):
         l = self.latency
-        return f"ProduceStatus<{self.sent} {self.acked} {self.bad_offsets} {self.restarts} {self.failed_transactions} {self.aborted_transaction_messages} {l['p50']}/{l['p90']}/{l['p99']}>"
+        return f"ProduceStatus<{self.sent} {self.acked} {self.bad_offsets} {self.restarts} {self.failed_transactions} {self.aborted_transaction_messages} {self.fails} {self.tombstones_produced} {l['p50']}/{l['p90']}/{l['p99']}>"

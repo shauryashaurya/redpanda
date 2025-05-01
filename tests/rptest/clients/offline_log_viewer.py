@@ -39,11 +39,27 @@ class OfflineLogViewer:
             self._redpanda.logger.error(f"Invalid JSON output: {json_out}")
             raise
 
+    def read_kafka_records(self, node, topic):
+        return self._json_cmd(node, f"--type kafka_records --topic {topic}")
+
     def read_controller(self, node):
         return self._json_cmd(node, "--type controller")
 
+    def has_controller_snapshot(self, node):
+        return node.account.exists(
+            f"{self._redpanda.DATA_DIR}/redpanda/controller/0_0/snapshot")
+
+    def read_controller_snapshot(self, node):
+        return self._json_cmd(node, "--type controller_snapshot")
+
     def read_consumer_offsets(self, node):
         return self._json_cmd(node, "--type consumer_offsets")
+
+    def consumer_offsets_summary(self, node):
+        return self._json_cmd(node, "--type consumer_offsets_summary")
+
+    def read_crash_reports(self, node):
+        return self._json_cmd(node, "--type crash_report")
 
     def read_bin_topic_manifest(self, bin_data, return_legacy_format=True):
         """

@@ -11,7 +11,6 @@
 
 #pragma once
 
-#include "cloud_storage/fwd.h"
 #include "cluster/cloud_metadata/producer_id_recovery_manager.h"
 #include "cluster/controller_probe.h"
 #include "cluster/controller_stm.h"
@@ -19,11 +18,13 @@
 #include "cluster/node_status_table.h"
 #include "cluster/scheduling/leader_balancer.h"
 #include "cluster/types.h"
+#include "crash_reporter.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "raft/fwd.h"
 #include "rpc/fwd.h"
 #include "security/fwd.h"
+#include "ssx/single_sharded.h"
 #include "storage/api.h"
 #include "storage/fwd.h"
 
@@ -32,6 +33,10 @@
 
 #include <chrono>
 #include <vector>
+
+namespace cloud_storage {
+class topic_mount_handler;
+}
 
 namespace cluster {
 
@@ -131,6 +136,10 @@ public:
         return _partition_balancer;
     }
 
+    ss::sharded<shard_balancer>& get_shard_balancer() {
+        return _shard_balancer;
+    }
+
     ss::sharded<ss::abort_source>& get_abort_source() { return _as; }
 
     ss::sharded<storage::api>& get_storage() { return _storage; }
@@ -138,6 +147,19 @@ public:
         return _members_backend;
     }
     ss::sharded<controller_stm>& get_controller_stm() { return _stm; }
+
+    ss::sharded<data_migrations::migrated_resources>&
+    get_data_migrated_resources() {
+        return _data_migrated_resources;
+    }
+    ss::sharded<data_migrations::frontend>& get_data_migration_frontend() {
+        return _data_migration_frontend;
+    }
+
+    ss::sharded<data_migrations::irpc_frontend>&
+    get_data_migration_irpc_frontend() {
+        return _data_migration_irpc_frontend;
+    }
 
     std::optional<std::reference_wrapper<cloud_metadata::uploader>>
     metadata_uploader() {
@@ -154,6 +176,12 @@ public:
     ss::sharded<cluster_recovery_table>& get_cluster_recovery_table() {
         return _recovery_table;
     }
+
+    ss::sharded<client_quota::frontend>& get_quota_frontend() {
+        return _quota_frontend;
+    }
+
+    ss::sharded<client_quota::store>& get_quota_store() { return _quota_store; }
 
     bool is_raft0_leader() const {
         vassert(
@@ -226,7 +254,7 @@ public:
     ss::future<result<partition_state_reply>>
     do_get_controller_partition_state(model::node_id id);
 
-    static const bytes invariants_key;
+    static bytes invariants_key();
 
 private:
     friend controller_probe;
@@ -242,7 +270,7 @@ private:
     std::optional<cloud_storage_clients::bucket_name> get_configured_bucket();
 
     // Checks configuration invariants stored in kvstore
-    ss::future<> validate_configuration_invariants();
+    ss::future<configuration_invariants> validate_configuration_invariants();
 
     config_manager::preload_result _config_preload;
 
@@ -252,9 +280,12 @@ private:
     ss::sharded<members_table> _members_table;             // instance per core
     ss::sharded<partition_balancer_state>
       _partition_balancer_state; // single instance
+    ss::sharded<data_migrations::migrated_resources> _data_migrated_resources;
+    ssx::single_sharded<data_migrations::migrations_table>
+      _data_migration_table;
     ss::sharded<partition_leaders_table>
       _partition_leaders;                                // instance per core
-    ss::sharded<shard_placement_table> _shard_placement; // istance per core
+    ss::sharded<shard_placement_table> _shard_placement; // instance per core
     ss::sharded<drain_manager> _drain_manager;           // instance per core
     ss::sharded<members_manager> _members_manager;       // single instance
     ss::sharded<topics_frontend> _tp_frontend;           // instance per core
@@ -266,6 +297,7 @@ private:
     ss::sharded<members_backend> _members_backend;       // single instance
     ss::sharded<config_frontend> _config_frontend;       // instance per core
     ss::sharded<config_manager> _config_manager;         // single instance
+    ss::sharded<data_migrations::frontend> _data_migration_frontend;
     ss::sharded<rpc::connection_cache>& _connections;
     ss::sharded<partition_manager>& _partition_manager;
     ss::sharded<shard_table>& _shard_table;
@@ -285,6 +317,7 @@ private:
     ss::sharded<health_monitor_backend> _hm_backend;   // single instance
     ss::sharded<health_manager> _health_manager;
     ss::sharded<metrics_reporter> _metrics_reporter;
+    ss::sharded<crash_reporter> _crash_reporter;          // single instance
     ss::sharded<feature_manager> _feature_manager;        // single instance
     ss::sharded<feature_backend> _feature_backend;        // instance per core
     ss::sharded<features::feature_table>& _feature_table; // instance per core
@@ -294,7 +327,13 @@ private:
     ss::sharded<cluster_recovery_table> _recovery_table; // instance per core
     ss::sharded<cluster_recovery_manager> _recovery_manager; // single instance
     std::unique_ptr<cloud_metadata::cluster_recovery_backend> _recovery_backend;
-
+    ss::sharded<client_quota::frontend> _quota_frontend; // instance per core
+    ss::sharded<client_quota::store> _quota_store;       // instance per core
+    ss::sharded<client_quota::backend> _quota_backend;   // single instance
+    ss::sharded<data_migrations::worker> _data_migration_worker;
+    ss::sharded<cloud_storage::topic_mount_handler> _topic_mount_handler;
+    ssx::single_sharded<data_migrations::backend> _data_migration_backend;
+    ss::sharded<data_migrations::irpc_frontend> _data_migration_irpc_frontend;
     ss::gate _gate;
     consensus_ptr _raft0;
     ss::sharded<cloud_storage::remote>& _cloud_storage_api;

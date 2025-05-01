@@ -1,4 +1,14 @@
 add_subdirectory(protocol)
+add_subdirectory(data)
+
+include(rpcgen)
+
+rpcgen(
+  TARGET consumer_lag_metrics_rpc
+  IN_FILE ${CMAKE_CURRENT_SOURCE_DIR}/server/consumer_group_lag_metrics_rpc.json
+  OUT_FILE ${CMAKE_CURRENT_BINARY_DIR}/server/consumer_group_lag_metrics_rpc_service.h
+  INCLUDES ${CMAKE_BINARY_DIR}/src/v
+)
 
 set(handlers_srcs
   server/handlers/api_versions.cc
@@ -27,16 +37,18 @@ set(handlers_srcs
   server/handlers/describe_producers.cc
   server/handlers/describe_transactions.cc
   server/handlers/handler_probe.cc
-  server/handlers/alter_client_quotas.cc
-  server/handlers/describe_client_quotas.cc
+  server/handlers/client_quotas.cc
 )
 
 v_cc_library(
   NAME kafka
   SRCS
     ${handlers_srcs}
+    server/consumer_group_lag_metrics_frontend.cc
+    server/consumer_group_lag_metrics_service.cc
     server/requests.cc
     server/member.cc
+    server/datalake_throttle_manager.cc
     server/group_stm.cc
     server/group.cc
     server/group_router.cc
@@ -48,17 +60,23 @@ v_cc_library(
     server/server.cc
     server/protocol_utils.cc
     server/quota_manager.cc
+    server/client_quota_translator.cc
     server/snc_quota_manager.cc
+    server/fetch_pid_controller.cc
     server/fetch_session_cache.cc
-    server/replicated_partition.cc
-    server/partition_proxy.cc
     server/group_recovery_consumer.cc
     server/group_metadata.cc
+    server/group_tx_tracker_stm.cc
+    server/logger.cc
+    server/app.cc
  DEPS
+    consumer_lag_metrics_rpc
     Seastar::seastar
     v::bytes
     v::rpc
     v::cluster
+    v::datalake_partition_spec_parser
+    v::kafka_partition_proxy
     v::kafka_protocol
     v::security
     v::security_audit
@@ -70,6 +88,7 @@ v_cc_library(
 
 add_subdirectory(client)
 add_subdirectory(server/tests)
+add_subdirectory(utils)
 
 set_source_files_properties(
     server/group.cc # too big => negative impact on minimal rebuilds for unity

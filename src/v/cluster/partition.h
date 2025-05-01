@@ -11,23 +11,39 @@
 
 #pragma once
 
-#include "archival/archival_metadata_stm.h"
-#include "archival/fwd.h"
 #include "cloud_storage/fwd.h"
+#include "cluster/archival/archival_metadata_stm.h"
+#include "cluster/archival/fwd.h"
 #include "cluster/fwd.h"
 #include "cluster/partition_probe.h"
+#include "cluster/partition_properties_stm.h"
 #include "cluster/types.h"
 #include "features/fwd.h"
 #include "model/record_batch_reader.h"
 #include "model/timeout_clock.h"
 #include "raft/replicate.h"
+#include "storage/ntp_config.h"
 #include "storage/translating_reader.h"
 #include "storage/types.h"
+#include "utils/notification_list.h"
+#include "utils/rwlock.h"
 
 #include <seastar/core/shared_ptr.hh>
 
+namespace experimental::cloud_topics {
+class dl_stm_api;
+};
+
 namespace cluster {
 class partition_manager;
+
+// A struct holding in-memory state that can make starting the partition
+// instance on the destination shard of the x-shard transfer easier. Note that
+// it is strictly an optimization, as the partition must always be able to
+// perform a "cold start" from persistent state only.
+struct xshard_transfer_state {
+    raft::xshard_transfer_state raft;
+};
 
 /// holds cluster logic that is not raft related
 /// all raft logic is proxied transparently
@@ -46,7 +62,9 @@ public:
     ~partition() = default;
 
     raft::group_id group() const;
-    ss::future<> start(state_machine_registry&);
+    ss::future<> start(
+      raft::state_machine_manager_builder&&,
+      std::optional<xshard_transfer_state>&&);
     ss::future<> stop();
 
     /// This method exposes reset mutex for the external subsystem
@@ -64,8 +82,8 @@ public:
     /// after a configuration change.
     void maybe_construct_archiver();
 
-    ss::future<result<kafka_result>>
-    replicate(model::record_batch_reader&&, raft::replicate_options);
+    ss::future<result<kafka_result>> replicate(
+      chunked_vector<model::record_batch> batches, raft::replicate_options);
 
     /// Truncate the beginning of the log up until a given offset
     /// Can only be performed on logs that are deletable and non internal
@@ -74,7 +92,7 @@ public:
 
     kafka_stages replicate_in_stages(
       model::batch_identity,
-      model::record_batch_reader&&,
+      model::record_batch batch,
       raft::replicate_options);
 
     /**
@@ -156,6 +174,13 @@ public:
     ss::future<std::error_code>
       transfer_leadership(raft::transfer_leadership_request);
 
+    /**
+     * Returns the maximum offset that may not be delivered to the newly joining
+     * learners as claimed by the state machines implemented on top of this
+     * partition.
+     */
+    model::offset max_removable_local_log_offset();
+
     ss::future<std::error_code> update_replica_set(
       std::vector<raft::broker_revision> brokers,
       model::revision_id new_revision_id);
@@ -175,6 +200,7 @@ public:
 
     model::revision_id get_revision_id() const;
     model::revision_id get_log_revision_id() const;
+    model::revision_id get_topic_revision_id() const;
 
     std::optional<model::node_id> get_leader_id() const;
 
@@ -188,6 +214,8 @@ public:
     get_offset_translator_state() const;
 
     ss::shared_ptr<cluster::rm_stm> rm_stm();
+
+    ss::shared_ptr<experimental::cloud_topics::dl_stm_api> dl_stm_api();
 
     size_t size_bytes() const;
 
@@ -263,6 +291,16 @@ public:
     ss::future<std::error_code>
     force_abort_replica_set_update(model::revision_id rev);
 
+    /**
+     * Downloads partition manifest to query for latest offset available in
+     * object store.
+     *
+     * IMPORTANT: this may not be the last offset of last segment uploaded to
+     * the cloud as partition manifest is eventually consistent.
+     */
+    ss::future<result<model::offset>> fetch_latest_cloud_offset_from_manifest(
+      model::timeout_clock::time_point deadline);
+
     consensus_ptr raft() const;
 
     std::optional<std::reference_wrapper<archival::ntp_archiver>> archiver() {
@@ -303,12 +341,17 @@ public:
     ss::sharded<features::feature_table>& feature_table() const;
 
     result<std::vector<raft::follower_metrics>> get_follower_metrics() const;
+    /**
+     * This method return a recovery state i.e. the offset and bytes that are
+     * left to be delivered to the recovering replica.
+     */
+    result<recovery_state> get_recovery_state() const;
 
     // Attempt to reset the partition manifest of a cloud storage partition
     // from an iobuf containing the JSON representation of the manifest.
     //
     // Warning: in order to call this safely, one must stop the archiver
-    // manually whilst ensuring that the max collectible offset reported
+    // manually whilst ensuring that the max removable offset reported
     // by the archival metadata STM remains stable. Prefer its sibling
     // which resets from the cloud state.
     //
@@ -332,7 +375,31 @@ public:
     ss::shared_ptr<cloud_storage::async_manifest_view>
     get_cloud_storage_manifest_view();
 
+    ss::future<result<model::offset>> set_writes_disabled(
+      partition_properties_stm::writes_disabled disable,
+      model::timeout_clock::time_point deadline);
+
+    using flush_hook = ss::noncopyable_function<ss::future<errc>(
+      model::offset,
+      model::timeout_clock::time_point,
+      std::optional<std::reference_wrapper<ss::abort_source>>)>;
+
+    // Register and execute actions to make sure we leave partition belongings
+    // in up-to-date state. Used for unmount.
+    partition_flush_hook_id register_flush_hook(flush_hook&& cb);
+    void unregister_flush_hook(partition_flush_hook_id id);
+    ss::future<errc>
+    flush(model::offset, model::timeout_clock::time_point, ss::abort_source&);
+
+    // callers must not invoke it multiple times concurrently
+    ss::future<errc> flush_archiver();
+
+    bool started() const noexcept { return _started; }
+    void mark_started() noexcept { _started = true; }
+
 private:
+    ss::future<result<ssx::rwlock_unit>> hold_writes_enabled();
+
     ss::future<>
     replicate_unsafe_reset(cloud_storage::partition_manifest manifest);
 
@@ -345,12 +412,19 @@ private:
     bool may_read_from_cloud() const;
 
     ss::future<std::optional<storage::timequery_result>>
-      local_timequery(storage::timequery_config);
+    local_timequery(storage::timequery_config, bool allow_cloud_fallback);
 
-    consensus_ptr _raft;
+    // Restarts the archiver
+    // If should_notify_topic_config is set, it marks the topic_manifest as
+    // dirty so that it gets reuploaded
+    ss::future<> restart_archiver(bool should_notify_topic_config);
+
+    consensus_ptr _raft; // never null
     ss::shared_ptr<cluster::log_eviction_stm> _log_eviction_stm;
     ss::shared_ptr<cluster::rm_stm> _rm_stm;
     ss::shared_ptr<archival_metadata_stm> _archival_meta_stm;
+    ss::shared_ptr<partition_properties_stm> _partition_properties_stm;
+    ss::shared_ptr<experimental::cloud_topics::dl_stm_api> _dl_stm_api;
     ss::abort_source _as;
     partition_probe _probe;
     ss::sharded<features::feature_table>& _feature_table;
@@ -376,6 +450,21 @@ private:
     std::unique_ptr<cluster::topic_configuration> _topic_cfg;
 
     ss::sharded<archival::upload_housekeeping_service>& _upload_housekeeping;
+    config::binding<model::cleanup_policy_bitflags> _log_cleanup_policy;
+
+    // Used in `sync_kafka_start_offset_override` to avoid having to re-sync the
+    // `archival_meta_stm`.
+    bool _has_synced_archival_for_start_override{false};
+
+    // acquire shared ("read") for produce,
+    // exclusive ("write") for enabling/disabling writes
+    ssx::rwlock _produce_lock;
+
+    notification_list<flush_hook, partition_flush_hook_id> _flush_hooks;
+    partition_flush_hook_id _archiver_flush_subscription
+      = partition_flush_hook_id_invalid;
+
+    bool _started{false};
 
     friend std::ostream& operator<<(std::ostream& o, const partition& x);
 };

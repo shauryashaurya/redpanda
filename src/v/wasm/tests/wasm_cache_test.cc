@@ -15,8 +15,10 @@
 #include "model/tests/randoms.h"
 #include "model/transform.h"
 #include "random/generators.h"
-#include "wasm/api.h"
+#include "test_utils/random_bytes.h"
 #include "wasm/cache.h"
+#include "wasm/engine.h"
+#include "wasm/wasi_logger.h"
 
 #include <seastar/core/lowres_clock.hh>
 #include <seastar/core/sharded.hh>
@@ -80,9 +82,7 @@ public:
     }
 
     ss::future<> transform(
-      model::record_batch batch,
-      transform_probe*,
-      transform_callback) override {
+      model::record_batch, transform_probe*, transform_callback) override {
         if (_state->engine_transform_should_throw) {
             throw std::runtime_error("test error");
         }
@@ -193,7 +193,7 @@ public:
     }
 
 private:
-    iobuf _wasm_module = random_generators::make_iobuf();
+    iobuf _wasm_module = tests::random_iobuf();
     model::offset _offset = model::offset(0);
     fake_runtime* _fake_runtime;
     std::unique_ptr<caching_runtime> _caching_runtime;

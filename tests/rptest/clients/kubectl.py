@@ -11,13 +11,30 @@ import json
 from logging import Logger
 import os
 import subprocess
-from typing import Any
+from typing import Any, Union, Generator
 
-SUPPORTED_PROVIDERS = ['aws', 'gcp']
+SUPPORTED_PROVIDERS = ['aws', 'gcp', 'azure']
 
 
 def is_redpanda_pod(pod_obj: dict[str, Any], cluster_id: str) -> bool:
-    """Returns true if the pod API object name matches the Redpanda pattern."""
+    """Returns true if the pod looks like a Redpanda broker pod"""
+
+    # Azure behaves this way.  This is also the 'new' way going forward (circa 2024/7)
+    # We look for pods whose metadata indicates that it is part of a statefulset, and that
+    # the pod names are generated with the template "redpanda-broker-...".
+    # False positives are quite unlikely with this criterion:
+    # Scenario would be:
+    # - Another Statefulset
+    # - That reuses the SAME generateName (bad!)
+    try:
+        if pod_obj['metadata']['generateName'] == 'redpanda-broker-':
+            if pod_obj['metadata']['labels'][
+                    'app.kubernetes.io/component'] == 'redpanda-statefulset':
+                return True
+    except KeyError:
+        pass
+
+    # Other providers like AWS / GCP behave this way ("the old way")
     return pod_obj['metadata']['name'].startswith(f'rp-{cluster_id}')
 
 
@@ -37,7 +54,7 @@ class KubectlTool:
         remote_uri=None,
         namespace='redpanda',
         cluster_id='',
-        cluster_privider='aws',
+        cluster_provider='aws',
         cluster_region='us-west-2',
         tp_proxy=None,
         tp_token=None,
@@ -47,7 +64,7 @@ class KubectlTool:
         self._namespace = namespace
         self._cluster_id = cluster_id
 
-        self._provider = cluster_privider.lower()
+        self._provider = cluster_provider.lower()
         if self._provider not in SUPPORTED_PROVIDERS:
             raise RuntimeError("KubectlTool does not yet support "
                                f"'{self._provider}' cloud provider")
@@ -116,57 +133,160 @@ class KubectlTool:
             f'--identity={self.TELEPORT_IDENT_FILE}', src, dest
         ]
 
-    def _aws_config_cmd(self):
-        return [
-            'awscli2', 'eks', 'update-kubeconfig', '--name',
-            f'redpanda-{self._cluster_id}', '--region', self._region
-        ]
-
-    def _gcp_config_cmd(self):
-        return [
-            'gcloud', 'container', 'clusters', 'get-credentials',
-            f'redpanda-{self._cluster_id}', '--region', self._region
-        ]
-
     def _install(self):
-        '''Installs kubectl on a remote target host
-        '''
+        '''Installs kubectl on a remote target host'''
         if not self._kubectl_installed and self._remote_uri is not None:
-            ssh_prefix = self._ssh_prefix()
-            bg_cmd = ssh_prefix + ['./breakglass-tools.sh']
+            breakglass_cmd = ['./breakglass-tools.sh']
+            if self._provider == 'azure':
+                # for azure, we manually override the path here to ensure
+                # that azure-cli installed as a snap gets found (workaround)
+                p = ['env', 'PATH=/usr/local/bin:/usr/bin:/bin:/snap/bin']
+                breakglass_cmd = p + breakglass_cmd
+            self._ssh_cmd(breakglass_cmd)
 
-            if self._provider == 'aws':
-                config_cmd = ssh_prefix + self._aws_config_cmd()
-            elif self._provider == 'gcp':
-                config_cmd = ssh_prefix + self._gcp_config_cmd()
+            # Determine the appropriate command for the cloud provider
+            self._redpanda.logger.info(
+                f"Setting up kubectl config for provider: {self._provider}")
 
-            self._redpanda.logger.info(bg_cmd)
-            res = subprocess.check_output(bg_cmd)
-            self._redpanda.logger.info(config_cmd)
-            res = subprocess.check_output(config_cmd)
+            config_cmd = {
+                'aws': [
+                    'awscli2', 'eks', 'update-kubeconfig', '--name',
+                    f'redpanda-{self._cluster_id}', '--region', self._region
+                ],
+                'gcp': [
+                    'gcloud', 'container', 'clusters', 'get-credentials',
+                    f'redpanda-{self._cluster_id}', '--region', self._region
+                ],
+                'azure': ['kubectl', 'get', 'nodes']
+            }[self._provider]
+
+            # Log the full command to be executed
+            self._redpanda.logger.debug(f"Config command: {config_cmd}")
+            self._ssh_cmd(config_cmd)
             self._kubectl_installed = True
-        return
 
     @property
     def logger(self) -> Logger:
         return self._redpanda.logger
 
-    def _cmd(self, cmd):
-        # Log and run
-        ssh_prefix = self._ssh_prefix()
-        remote_cmd = ssh_prefix + cmd
-        self._redpanda.logger.info(remote_cmd)
-        try:
-            return subprocess.check_output(remote_cmd, stderr=subprocess.PIPE)
-        except subprocess.CalledProcessError as e:
-            self.logger.info(
-                f'Command failed (rc={e.returncode}).\n' +
-                f'--------- stdout -----------\n{e.stdout.decode()}' +
-                f'--------- stderr -----------\n{e.stderr.decode()}')
-            raise
+    def _local_captured(self, cmd: list[str]):
+        """Runs kubectl subcommands on a Cloud Agent
+        with streaming stdout and stderr to output
 
-    def cmd(self, kcmd: list[str] | str):
+        Args:
+            cmd (list[str]): kubectl commands to run
+
+        Raises:
+            RuntimeError: when return code is present
+
+        Yields:
+            Generator[str]: Generator of output line by line
+        """
+        self._redpanda.logger.info(cmd)
+        process = subprocess.Popen(cmd,
+                                   stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT)
+        if process.returncode:
+            if process.stdout is not None:
+                s_out = process.stdout.read()
+            else:
+                s_out = "stdout empty"
+            raise subprocess.CalledProcessError(process.returncode, cmd, s_out,
+                                                "stderr piped")
+
+        for line in process.stdout:  # type: ignore
+            yield line
+
+        return
+
+    def _local_cmd(self, cmd: list[str], timeout=900):
+        """Run the given command locally and return the stdout as bytes.
+           Logs stdout and stderr on failure.
+
+           cmd: list[str]: command to run
+
+           throws CalledProcessError on non-zero exit code
+           thwows TimeoutExpired on timeout
+
+           returns: stdout as string if not empty, else stderr
+        """
+        def _prepare_output(sout: str, serr: str) -> str:
+            return f"\n--------- stdout -----------\n{sout}" \
+                   f"\n--------- stderr -----------\n{serr}\n"
+
+        self._redpanda.logger.info(cmd)
+
+        # Using text mode to get strings, not binary
+        # Following code will capture all output to log and work
+        # significantly faster than 'check_output'
+        process = subprocess.Popen(cmd,
+                                   stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE,
+                                   text=True)
+        try:
+            s_out, s_err = process.communicate(timeout=timeout)
+            # safety check for process termination
+            if process.poll() is None:
+                # Should never happen (c)
+                process.kill()
+        except subprocess.TimeoutExpired:
+            process.kill()
+            s_out, s_err = process.communicate()
+            raise subprocess.TimeoutExpired(cmd, timeout, s_out, s_err)
+
+        # TODO: Handle s_err output
+        # It will be hard to detect errors as a lot of apps and utils
+        # just uses stderr as normal output. For example, tsh (teleport tunnel)
+
+        if process.returncode != 0:
+            self.logger.info(f"Command failed (rc={process.returncode}): "
+                             f"'{' '.join(cmd)}'\n"
+                             f"{_prepare_output(s_out, s_err)}")
+            raise subprocess.CalledProcessError(process.returncode, cmd, s_out,
+                                                s_err)
+        else:
+            # Log all collected strings, including JSONs collected
+            self.logger.debug(_prepare_output(s_out, s_err))
+
+        # Most of the time stdout will hold valuable data
+        # In rare occasions when return code is 0, and and stderr is not empty
+        # return that instead.
+        return s_out if len(s_out) > 0 else s_err
+
+    @property
+    def _redpanda_operator_v2(self) -> bool:
+        return self._provider == 'azure'
+
+    def _redpanda_broker_pod_name(self) -> str:
+        if self._redpanda_operator_v2:
+            return 'redpanda-broker-0'
+        else:
+            return f'rp-{self._cluster_id}-blue-a-0'
+
+    def _ssh_cmd(
+            self,
+            cmd: list[str],
+            capture: bool = False) -> Union[str, Generator[bytes, Any, None]]:
+        """Execute a command on a the remote node using ssh/tsh as appropriate."""
+        local_cmd = self._ssh_prefix() + cmd
+        if capture:
+            return self._local_captured(local_cmd)
+        else:
+            return self._local_cmd(local_cmd)
+
+    def cmd(self, kcmd: list[str] | str, capture=False):
         """Execute a kubectl command on the agent node.
+        Capture mode streams data from process stdout via Generator
+        Non-capture more returns whole output as a list
+
+        Args:
+            kcmd (list[str] | str): command to run on agent with kubectl
+            capture (bool, optional): Whether return whole result or
+                                      iterate line by line. Defaults to False.
+
+        Returns:
+            list[str / bytes]: Return is either a whole lines list
+                or a Generator with lines as items
         """
         # prepare
         self._install()
@@ -176,9 +296,9 @@ class KubectlTool:
         _kcmd = kcmd if isinstance(kcmd, list) else kcmd.split()
         # Format command
         cmd = _kubectl + _kcmd
-        return self._cmd(cmd)
+        return self._ssh_cmd(cmd, capture=capture)
 
-    def exec(self, remote_cmd, pod_name=None):
+    def exec(self, remote_cmd, pod_name=None) -> str:
         """Execute a command inside of a redpanda pod container.
 
         :param remote_cmd: string of bash command to run inside of pod container
@@ -187,24 +307,24 @@ class KubectlTool:
 
         self._install()
         if pod_name is None:
-            pod_name = f'rp-{self._cluster_id}-0'
+            pod_name = self._redpanda_broker_pod_name()
         cmd = [
             'kubectl', 'exec', pod_name, f'-n={self._namespace}',
             '-c=redpanda', '--', 'bash', '-c'
         ] + ['"' + remote_cmd + '"']
-        return self._cmd(cmd)
+        return self._ssh_cmd(cmd)  # type: ignore
 
-    def exists(self, remote_path):
+    def exists(self, remote_path, pod_name=None):
         self._install()
-        ssh_prefix = self._ssh_prefix()
-        cmd = ssh_prefix + [
-            'kubectl', 'exec', '-n', self._namespace, '-c', 'redpanda',
-            f'rp-{self._cluster_id}-0', '--', 'stat'
-        ] + [remote_path]
+        if pod_name is None:
+            pod_name = self._redpanda_broker_pod_name()
         try:
-            subprocess.check_output(cmd)
+            self._ssh_cmd([
+                'kubectl', 'exec', '-n', self._namespace, '-c', 'redpanda',
+                pod_name, '--', 'stat', remote_path
+            ])
             return True
-        except subprocess.CalledProcessError as e:
+        except subprocess.CalledProcessError:
             return False
 
     def _get_privileged_pod(self, pod_name=None):
@@ -273,7 +393,10 @@ class KubectlTool:
         _method = "iam"
         if self._provider == 'gcp':
             _method = "gcp"
+        elif self._provider == 'azure':
+            _method = "azure"
         self._redpanda.logger.info('cleaning teleport data dir')
+        self._redpanda.logger.info(f"Selected join method: {_method}")
         subprocess.check_output(['rm', '-f', '-r', self.TELEPORT_DATA_DIR])
         self._redpanda.logger.info('starting tbot to generate identity')
         cmd = [
@@ -283,7 +406,19 @@ class KubectlTool:
             f'--token={self._tp_token}', '--certificate-ttl=6h',
             '--renewal-interval=6h', '--oneshot'
         ]
-        return subprocess.check_output(cmd)
+        # Log the full command to be executed
+        self._redpanda.logger.debug(f"Running tbot command: {cmd}")
+
+        try:
+            self._local_cmd(cmd)
+        except subprocess.CalledProcessError as e:
+            self._redpanda.logger.debug(
+                f"Contents of {self.TELEPORT_DATA_DIR}:")
+            subprocess.call(['ls', '-la', self.TELEPORT_DATA_DIR])
+            self._redpanda.logger.debug(
+                f"Contents of {self.TELEPORT_DEST_DIR}:")
+            subprocess.call(['ls', '-la', self.TELEPORT_DEST_DIR])
+            raise
 
     def _setup_privileged_pod(self):
         if not self._privileged_pod_installed and self._remote_uri is not None:
@@ -292,13 +427,11 @@ class KubectlTool:
                                          'everything-allowed-exec-pod.yml')
             self._redpanda.logger.info(filename_path)
             setup_cmd = self._scp_cmd(filename_path, f'{self._remote_uri}:')
-            ssh_prefix = self._ssh_prefix()
-            apply_cmd = ssh_prefix + ['kubectl', 'apply', '-f', filename]
             if len(setup_cmd) > 0:
                 self._redpanda.logger.info(setup_cmd)
-                res = subprocess.check_output(setup_cmd)
-            self._redpanda.logger.info(apply_cmd)
-            res = subprocess.check_output(apply_cmd)
+                subprocess.check_output(setup_cmd)
+            apply_cmd = ['kubectl', 'apply', '-f', filename]
+            self._ssh_cmd(apply_cmd)
             self._privileged_pod_installed = True
 
     def exec_privileged(self, remote_cmd, pod_name=None):
@@ -314,13 +447,18 @@ class KubectlTool:
 
 
 class KubeNodeShell():
-    def __init__(self, kubectl: KubectlTool, node_name: str) -> None:
+    def __init__(self,
+                 kubectl: KubectlTool,
+                 node_name: str,
+                 namespace: str = 'redpanda',
+                 clean=False) -> None:
         self.kubectl = kubectl
         self.node_name = node_name
         # It is bad, but it works
         self.logger = self.kubectl._redpanda.logger
+        self.namespace = namespace
         self.current_context = self.kubectl.cmd(
-            f"config current-context").decode().strip()
+            f"config current-context").strip()
         # Make sure that name is not longer that 63 chars
         # The Pod "gke-redpanda-co9uuq78jo-redpanda-6a66-fcfacc41-65mz-priviledged-shell" is invalid: metadata.labels:
         # Invalid value: "gke-redpanda-co9uuq78jo-redpanda-6a66-fcfacc41-65mz-priviledged-shell": must be no more than 63 characters
@@ -330,8 +468,8 @@ class KubeNodeShell():
             # Cut them to fit
             self.pod_name = self.pod_name[:63]
 
-        # In case of concurrent tests, just reuse existing pod
-        self.pod_reused = True if self._is_shell_running() else False
+        # Set cleaning flag on exit
+        self.clean = clean
 
     def _is_shell_running(self):
         # Check if such pod exists
@@ -383,12 +521,16 @@ class KubeNodeShell():
             }
         }
 
-    def __enter__(self):
-        if not self.pod_reused:
+    def initialize_nodeshell(self):
+        if not self._is_shell_running():
             # Init node shell
             overrides = self._build_overrides()
+            # We do not require timeout option to fail
+            # if pod is not running at this point
+            # Feel free to uncomment
             _out = self.kubectl.cmd([
                 f"--context={self.current_context}",
+                f"--namespace={self.namespace}",
                 "run",
                 "--image docker.io/library/alpine",
                 "--restart=Never",
@@ -396,26 +538,37 @@ class KubeNodeShell():
                 # "--pod-running-timeout=1m",
                 f"{self.pod_name}"
             ])
-            self.logger.debug(f"Response: {_out.decode()}")
+            self.logger.debug(f"Response: {_out}")
         return self
 
-    def __call__(self, cmd: list[str] | str) -> list:
-        self.logger.info(f"Running command inside node '{self.node_name}'")
-        # Prefix for running inside proper pod
-        _kcmd = ["exec", self.pod_name, "--"]
-        # Universal for list and str
-        _cmd = cmd if isinstance(cmd, list) else cmd.split()
-        _kcmd += _cmd
-        # exception handler is inside subclass
-        _out = self.kubectl.cmd(_kcmd)
-        return _out.decode().splitlines()
-
-    def __exit__(self, *args, **kwargs):
-        # If this instance created this pod, delete it
-        if not self.pod_reused:
+    def destroy_nodeshell(self):
+        if self._is_shell_running():
             try:
-                self.kubectl.cmd(f"delete pod {self.pod_name}")
+                self.kubectl.cmd(
+                    f"-n {self.namespace} delete pod {self.pod_name}")
             except Exception as e:
                 self.logger.warning("Failed to delete node shell pod "
                                     f"'{self.pod_name}': {e}")
         return
+
+    def __enter__(self):
+        return self.initialize_nodeshell()
+
+    def __exit__(self, *args, **kwargs):
+        if self.clean:
+            self.destroy_nodeshell()
+        return
+
+    def __call__(self, cmd: list[str] | str, capture=False):
+        self.logger.info(f"Running command inside node '{self.node_name}'")
+        # Prefix for running inside proper pod
+        _kcmd = ["-n", f"{self.namespace}", "exec", self.pod_name, "--"]
+        # Universal for list and str
+        _cmd = cmd if isinstance(cmd, list) else cmd.split()
+        _kcmd += _cmd
+        # exception handler is inside subclass
+        _out = self.kubectl.cmd(_kcmd, capture=capture)
+        if capture:
+            return _out
+        else:
+            return _out.splitlines()

@@ -7,13 +7,13 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0
 
-#include "bytes/random.h"
 #include "config/configuration.h"
 #include "random/generators.h"
 #include "reflection/adl.h"
 #include "storage/kvstore.h"
 #include "storage/tests/kvstore_fixture.h"
 #include "test_utils/fixture.h"
+#include "test_utils/random_bytes.h"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/testing/thread_test_case.hh>
@@ -23,7 +23,7 @@ template<typename T>
 static void set_configuration(ss::sstring p_name, T v) {
     ss::smp::invoke_on_all([p_name, v = std::move(v)] {
         config::shard_local_cfg().get(p_name).set_value(v);
-    }).get0();
+    }).get();
 }
 
 FIXTURE_TEST(key_space, kvstore_test_fixture) {
@@ -32,13 +32,13 @@ FIXTURE_TEST(key_space, kvstore_test_fixture) {
     auto kvs = make_kvstore();
     kvs->start().get();
 
-    const auto value_a = bytes_to_iobuf(random_generators::get_bytes(100));
-    const auto value_b = bytes_to_iobuf(random_generators::get_bytes(100));
-    const auto value_c = bytes_to_iobuf(random_generators::get_bytes(100));
-    const auto value_d = bytes_to_iobuf(random_generators::get_bytes(100));
+    const auto value_a = bytes_to_iobuf(tests::random_bytes(100));
+    const auto value_b = bytes_to_iobuf(tests::random_bytes(100));
+    const auto value_c = bytes_to_iobuf(tests::random_bytes(100));
+    const auto value_d = bytes_to_iobuf(tests::random_bytes(100));
 
     const auto empty_key = bytes();
-    const auto key = random_generators::get_bytes(2);
+    const auto key = tests::random_bytes(2);
 
     kvs->put(storage::kvstore::key_space::testing, key, value_a.copy()).get();
     kvs->put(storage::kvstore::key_space::consensus, key, value_b.copy()).get();
@@ -58,6 +58,18 @@ FIXTURE_TEST(key_space, kvstore_test_fixture) {
     BOOST_REQUIRE(
       kvs->get(storage::kvstore::key_space::consensus, empty_key).value()
       == value_d);
+
+    std::map<bytes, iobuf> testing_kvs;
+    kvs
+      ->for_each(
+        storage::kvstore::key_space::testing,
+        [&](bytes_view key, const iobuf& val) {
+            BOOST_REQUIRE(testing_kvs.emplace(key, val.copy()).second);
+        })
+      .get();
+    BOOST_REQUIRE_EQUAL(testing_kvs.size(), 2);
+    BOOST_REQUIRE(testing_kvs.at(key) == value_a);
+    BOOST_REQUIRE(testing_kvs.at(empty_key) == value_c);
 
     kvs->stop().get();
 
@@ -101,19 +113,19 @@ FIXTURE_TEST(kvstore_empty, kvstore_test_fixture) {
 
     std::vector<ss::future<>> batch;
     for (int i = 0; i < 500; i++) {
-        auto key = random_generators::get_bytes(2);
-        auto value = bytes_to_iobuf(random_generators::get_bytes(100));
+        auto key = tests::random_bytes(2);
+        auto value = bytes_to_iobuf(tests::random_bytes(100));
 
         truth[key] = value.copy();
         batch.push_back(kvs->put(
           storage::kvstore::key_space::testing, key, std::move(value)));
         if (batch.size() > 10) {
-            ss::when_all(batch.begin(), batch.end()).get0();
+            ss::when_all(batch.begin(), batch.end()).get();
             batch.clear();
         }
     }
     if (!batch.empty()) {
-        ss::when_all(batch.begin(), batch.end()).get0();
+        ss::when_all(batch.begin(), batch.end()).get();
         batch.clear();
     }
 
@@ -151,8 +163,8 @@ FIXTURE_TEST(kvstore, kvstore_test_fixture) {
     auto kvs = make_kvstore();
     kvs->start().get();
     for (int i = 0; i < 500; i++) {
-        auto key = random_generators::get_bytes(2);
-        auto value = bytes_to_iobuf(random_generators::get_bytes(100));
+        auto key = tests::random_bytes(2);
+        auto value = bytes_to_iobuf(tests::random_bytes(100));
 
         truth[key] = value.copy();
         kvs->put(storage::kvstore::key_space::testing, key, std::move(value))
@@ -164,7 +176,7 @@ FIXTURE_TEST(kvstore, kvstore_test_fixture) {
         // maybe delete something
         auto coin = random_generators::get_int(1000);
         if (coin < 500) {
-            auto key = random_generators::get_bytes(2);
+            auto key = tests::random_bytes(2);
             truth.erase(key);
             kvs->remove(storage::kvstore::key_space::testing, key).get();
         }

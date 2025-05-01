@@ -10,13 +10,13 @@
  */
 #include "cluster/controller.h"
 #include "cluster/security_frontend.h"
+#include "features/enterprise_feature_messages.h"
 #include "json/document.h"
 #include "json/json.h"
 #include "json/stringbuffer.h"
 #include "kafka/server/server.h"
 #include "redpanda/admin/api-doc/security.json.hh"
 #include "redpanda/admin/server.h"
-#include "redpanda/admin/util.h"
 #include "security/credential_store.h"
 #include "security/oidc_authenticator.h"
 #include "security/oidc_service.h"
@@ -53,7 +53,7 @@ security::scram_credential parse_scram_credential(const json::Document& doc) {
     const auto algorithm = std::string_view(
       doc["algorithm"].GetString(), doc["algorithm"].GetStringLength());
     validate_no_control(
-      algorithm, admin_server::string_conversion_exception{algorithm});
+      algorithm, admin_server::string_conversion_exception{"algorithm"});
 
     if (!doc.HasMember("password") || !doc["password"].IsString()) {
         throw ss::httpd::bad_request_exception(
@@ -61,7 +61,7 @@ security::scram_credential parse_scram_credential(const json::Document& doc) {
     }
     const auto password = doc["password"].GetString();
     validate_no_control(
-      password, admin_server::string_conversion_exception{"PASSWORD"});
+      password, admin_server::string_conversion_exception{"password"});
 
     security::scram_credential credential;
 
@@ -88,7 +88,7 @@ bool match_scram_credential(
     const auto algorithm = std::string_view(
       doc["algorithm"].GetString(), doc["algorithm"].GetStringLength());
     validate_no_control(
-      algorithm, admin_server::string_conversion_exception{algorithm});
+      algorithm, admin_server::string_conversion_exception{"algorithm"});
 
     if (algorithm == security::scram_sha256_authenticator::name) {
         return security::scram_sha256::validate_password(
@@ -265,11 +265,11 @@ parse_json_members_list(const json::Document& doc, std::string_view key) {
 }
 
 security::role_name parse_role_name(const ss::http::request& req) {
-    ss::sstring role_v;
-    if (!admin::path_decode(req.param["role"], role_v)) {
+    ss::sstring role_v = req.get_path_param("role");
+    if (role_v == "") {
         vlog(adminlog.debug, "Invalid parameter 'role' got {}", role_v);
         throw ss::httpd::bad_param_exception{fmt::format(
-          "Invalid parameter 'role' got {{{}}}", req.param["role"])};
+          "Invalid parameter 'role' got {{{}}}", req.get_path_param("role"))};
     }
     return security::role_name(role_v);
 }
@@ -289,7 +289,7 @@ security::role_name parse_role_definition(const json::Document& doc) {
 
     auto role_name = security::role_name{doc["role"].GetString()};
     validate_no_control(
-      role_name(), admin_server::string_conversion_exception{role_name()});
+      role_name(), admin_server::string_conversion_exception{"role"});
 
     if (!security::validate_scram_username(role_name())) {
         throw_role_exception(role_errc::invalid_name);
@@ -362,7 +362,7 @@ void admin_server::register_security_routes() {
           bool include_ephemeral = req->get_query_param("include_ephemeral")
                                    == "true";
 
-          auto pred = [include_ephemeral](auto const& c) {
+          auto pred = [include_ephemeral](const auto& c) {
               return include_ephemeral
                      || security::credential_store::is_not_ephemeral(c);
           };
@@ -398,6 +398,7 @@ void admin_server::register_security_routes() {
     register_route<superuser>(
       ss::httpd::security_json::create_role,
       request_handler_fn{[this](auto req, auto reply) {
+          check_license(features::enterprise_error_message::acl_with_rbac());
           return create_role_handler(std::move(req), std::move(reply));
       }});
 
@@ -436,6 +437,7 @@ void admin_server::register_security_routes() {
       ss::httpd::security_json::update_role_members,
       [this]([[maybe_unused]] std::unique_ptr<ss::http::request> req)
         -> ss::future<ss::json::json_return_type> {
+          check_license(features::enterprise_error_message::acl_with_rbac());
           return update_role_members_handler(std::move(req));
       });
 }
@@ -458,7 +460,7 @@ admin_server::create_user_handler(std::unique_ptr<ss::http::request> req) {
     }
 
     auto username = security::credential_user(doc["username"].GetString());
-    validate_no_control(username(), string_conversion_exception{username()});
+    validate_no_control(username(), string_conversion_exception{"username"});
 
     if (!security::validate_scram_username(username())) {
         throw ss::httpd::bad_request_exception(
@@ -504,10 +506,10 @@ admin_server::delete_user_handler(std::unique_ptr<ss::http::request> req) {
         throw co_await redirect_to_leader(*req, model::controller_ntp);
     }
 
-    ss::sstring user_v;
-    if (!admin::path_decode(req->param["user"], user_v)) {
+    ss::sstring user_v = req->get_path_param("user");
+    if (user_v == "") {
         throw ss::httpd::bad_param_exception{fmt::format(
-          "Invalid parameter 'user' got {{{}}}", req->param["user"])};
+          "Invalid parameter 'user' got {{{}}}", req->get_path_param("user"))};
     }
     auto user = security::credential_user(user_v);
 
@@ -536,10 +538,10 @@ admin_server::update_user_handler(std::unique_ptr<ss::http::request> req) {
         throw co_await redirect_to_leader(*req, model::controller_ntp);
     }
 
-    ss::sstring user_v;
-    if (!admin::path_decode(req->param["user"], user_v)) {
+    ss::sstring user_v = req->get_path_param("user");
+    if (user_v == "") {
         throw ss::httpd::bad_param_exception{fmt::format(
-          "Invalid parameter 'user' got {{{}}}", req->param["user"])};
+          "Invalid parameter 'user' got {{{}}}", req->get_path_param("user"))};
     }
     auto user = security::credential_user(user_v);
 
@@ -684,12 +686,12 @@ admin_server::update_role_members_handler(
         throw co_await redirect_to_leader(*req, model::controller_ntp);
     }
 
-    ss::sstring role_v;
-    if (!admin::path_decode(req->param["role"], role_v)) {
+    ss::sstring role_v = req->get_path_param("role");
+    if (role_v == "") {
         vlog(
           adminlog.debug,
           "Invalid parameter 'role' got {{{}}}",
-          req->param["role"]);
+          req->get_path_param("role"));
         throw_role_exception(role_errc::invalid_name);
     }
 

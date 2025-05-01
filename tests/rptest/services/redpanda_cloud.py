@@ -6,6 +6,7 @@ import os
 import requests
 import uuid
 import yaml
+import ipaddress
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -28,8 +29,13 @@ CLOUD_TYPE_FMC = 'FMC'
 CLOUD_TYPE_BYOC = 'BYOC'
 PROVIDER_AWS = 'AWS'
 PROVIDER_GCP = 'GCP'
+PROVIDER_AZURE = 'AZURE'
 
-TIER_DEFAULTS = {PROVIDER_AWS: "tier-1-aws", PROVIDER_GCP: "tier-1-gcp"}
+TIER_DEFAULTS = {
+    PROVIDER_AWS: "tier-1-aws",
+    PROVIDER_GCP: "tier-1-gcp",
+    PROVIDER_AZURE: "tier-1-azure-v2-x86"
+}
 
 
 def get_config_profile_name(config: None | dict[str, Any]) -> str:
@@ -81,6 +87,15 @@ class CloudTierName(Enum):
     GCP_5_P5 = 'tco-p5-tier-5-gcp'
     GCP_6_P5 = 'tco-p5-tier-6-gcp'
     GCP_7_P5 = 'tco-p5-tier-7-gcp'
+    AZURE_1 = 'tier-1-azure-v2-x86'
+    AZURE_2 = 'tier-2-azure-v2-x86'
+    AZURE_3 = 'tier-3-azure-v2-x86'
+    AZURE_4 = 'tier-4-azure-v2-x86'
+    AZURE_5 = 'tier-5-azure-v2-x86'
+    AZURE_6 = 'tier-6-azure-v2-x86'
+    AZURE_7 = 'tier-7-azure-v2-x86'
+    AZURE_8 = 'tier-8-azure-v2-x86'
+    AZURE_9 = 'tier-9-azure-v2-x86'
 
     @classmethod
     def list(cls):
@@ -100,6 +115,7 @@ class CloudClusterConfig:
     oauth_audience: str = ""
     api_url: str = ""
     admin_api_url: str = ""
+    public_api_url: str = ""
     teleport_auth_server: str = ""
     teleport_bot_token: str = ""
     id: str = ""  # empty string makes it easier to pass thru default value from duck.py
@@ -117,6 +133,7 @@ class CloudClusterConfig:
     install_pack_auth: str = ""
     grafana_token: str = ""
     grafana_alerts_url: str = ""
+    require_broker_metrics_in_health_check: bool = True
 
 
 @dataclass
@@ -131,6 +148,7 @@ class LiveClusterParams:
     cluster_id: str = ""
     _isAlive: bool = False
     connection_type: str = 'public'
+    namespace: str | None = None
     namespace_uuid: str | None = None
     name: str | None = None
     last_status: str = ""
@@ -155,6 +173,8 @@ class LiveClusterParams:
     # https://docs.python.org/3/library/dataclasses.html#dataclasses.field
     zones: list[str] = field(default_factory=list)
     aws_vpc_peering: dict[str, Any] = field(default_factory=dict)
+    # TODO Azure vpc peering was not yet tested since Azure cluster creation on cloud with Tiers is blocked. This part might change
+    azure_vpc_peering: dict[str, Any] = field(default_factory=dict)
 
     @property
     def network_endpoint(self):
@@ -162,10 +182,10 @@ class LiveClusterParams:
 
 
 @dataclass
-class ProductInfo:
+class ThroughputTierInfo:
     max_ingress: int
     max_egress: int
-    max_connection_count: int
+    max_connections_count: int
     max_partition_count: int
 
 
@@ -212,7 +232,13 @@ class CloudCluster():
             self.config.config_profile_name = TIER_DEFAULTS[
                 self.config.provider]
         # Init API client
-        self.cloudv2 = RpCloudApiClient(self.config, logger)
+        self.rpcloud = RpCloudApiClient(self.config, logger)
+
+        # copy the regular config, but override the api_url to point
+        # to the public API instead
+        public_config = CloudClusterConfig(**cluster_config)
+        public_config.api_url = public_config.public_api_url
+        self.public_api = RpCloudApiClient(public_config, logger)
 
         # Create helper bool variable
         self.isPublicNetwork = self.config.network == 'public'
@@ -224,22 +250,35 @@ class CloudCluster():
         # init live cluster params
         self.current = LiveClusterParams()
         # Provider specific actions
-        if self.config.provider not in [PROVIDER_AWS, PROVIDER_GCP]:
+        if self.config.provider not in [
+                PROVIDER_AWS, PROVIDER_GCP, PROVIDER_AZURE
+        ]:
             raise RuntimeError(f"Provider '{self.config.provider}' "
                                "is not yet supported by CloudV2")
 
         if self.config.provider == PROVIDER_AWS:
             self.provider_key = provider_config['access_key']
             self.provider_secret = provider_config['secret_key']
+            self.provider_tenant = None
         elif self.config.provider == PROVIDER_GCP:
             self.provider_key = self.config.gcp_keyfile
             self.provider_secret = None
+            self.provider_tenant = None
+        elif self.config.provider == PROVIDER_AZURE:
+            self.provider_key = provider_config['azure_client_id']
+            self.provider_secret = provider_config['azure_client_secret']
+            self.provider_tenant = provider_config['azure_tenant_id']
         # Create client for the provider
-        self.provider_cli = make_provider_client(self.config.provider, logger,
+        self.provider_cli = make_provider_client(self.config.provider,
+                                                 logger,
                                                  self.config.region,
                                                  self.provider_key,
-                                                 self.provider_secret)
+                                                 self.provider_secret,
+                                                 tenant=self.provider_tenant)
         if self.config.network != 'public':
+            # Check that private network is a correct CIDR
+            self.config.network = self.validate_cidr(self.config.network)
+            # Get all metadata from ducktape runner node
             self._ducktape_meta = self.get_ducktape_meta()
             if self.config.provider == PROVIDER_AWS:
                 # We should have only 1 interface on ducktape client
@@ -255,12 +294,18 @@ class CloudCluster():
                     prefix="")
                 self.current.peer_vpc_id = _net[self.provider_cli.VPC_ID_LABEL]
                 self.current.peer_owner_id = self.provider_cli.project_id
+            elif self.config.provider == PROVIDER_AZURE:
+                # For Azure, retrieve VNet and Subscription ID
+                self.current.peer_vpc_id = self._ducktape_meta[
+                    'network-interfaces-0-vnet-id']
+                self.current.peer_owner_id = self._ducktape_meta[
+                    'subscription-id']
 
             # Currently we need provider client only for VCP in private networking
-            # Raise exception is client in not implemented yet
+            # Raise exception if client is not implemented yet
             if self.provider_cli is None and self.config.network != 'public':
                 self._logger.error(
-                    f"Current provider is not yet supports private networking "
+                    f"Current provider does not yet support private networking"
                 )
                 raise RuntimeError("Private networking is not implemented "
                                    f"for '{self.config.provider}'")
@@ -272,7 +317,8 @@ class CloudCluster():
                                        self.provider_key, self.provider_secret,
                                        self.config.provider,
                                        self.config.api_url, oauth_url_origin,
-                                       self.config.oauth_audience)
+                                       self.config.oauth_audience,
+                                       self.config.public_api_url)
         if self.config.type == CLOUD_TYPE_BYOC:
             # remove current plugin if any
             self.utils.rpk_plugin_uninstall('byoc', sudo=True)
@@ -280,6 +326,14 @@ class CloudCluster():
 
         # save context
         self._ctx = context
+
+    def validate_cidr(self, network_cidr):
+        try:
+            ip_address = ipaddress.ip_network(network_cidr)
+        except ValueError as e:
+            raise RuntimeError(
+                f"Invalid CIDR for private network: '{network_cidr}'") from e
+        return str(ip_address)
 
     @property
     def cluster_id(self):
@@ -302,8 +356,9 @@ class CloudCluster():
     @property
     def isAlive(self):
         _c = self._get_cluster(self.current.cluster_id)
-        self.current._isAlive = True if _c['status'][
-            'health'] == 'healthy' else False
+        # the public API does not seem to return cluster health information
+        # self.current._isAlive = _c['status']['health'] == 'healthy'
+        self.current._isAlive = _c['state'] == 'STATE_READY'
         return self.current._isAlive
 
     def _get_cloud_users(self):
@@ -312,7 +367,7 @@ class CloudCluster():
         _total = 1
         while _offset < _total:
             _params = {'offset': _offset}
-            _r = self.cloudv2._http_get(endpoint="/api/v1/users",
+            _r = self.rpcloud._http_get(endpoint="/api/v1/users",
                                         params=_params)
             if _r is None:
                 return {}
@@ -322,7 +377,7 @@ class CloudCluster():
         return _users
 
     def _get_cluster_users(self):
-        _r = self.cloudv2._http_get(
+        _r = self.rpcloud._http_get(
             base_url=self.current.consoleUrl,
             endpoint="/api/users",
         )
@@ -357,11 +412,14 @@ class CloudCluster():
         name = self._format_namespace_name()
         self._logger.debug(f'creating namespace name {name}')
         body = {'name': name}
-        r = self.cloudv2._http_post(endpoint='/api/v1/namespaces', json=body)
-        self._logger.debug(f'created namespaceUuid {r["id"]}')
+        # namespace, resource-group… totally the same thing
+        r = self.public_api._http_post(endpoint='/v1beta2/resource-groups',
+                                       json=body)
+        _id = r['resource_group']['id']
+        self._logger.debug(f"created namespaceUuid {_id}")
         # save namespace name
-        self.config.namespace = name
-        return r['id']
+        self.current.namespace = name
+        return _id
 
     def _cluster_ready(self):
         # Get cluster info
@@ -374,40 +432,30 @@ class CloudCluster():
         # Check state and raise error if anything critical happens
         self._logger.debug(f"Cluster status: {c['state']}")
         self.current.last_status = c['state']
-        if c['state'] == 'ready':
-            return True
-        elif c['state'] == 'unknown':
-            raise RuntimeError("Creation failed (state 'unknown') "
-                               f"for '{self.config.provider}'")
-        elif c['state'] == 'deleting':
-            raise RuntimeError("Creation failed (state 'deleting') "
-                               f"for '{self.config.provider}'")
+        match c['state']:
+            case 'STATE_READY':
+                return True
+            case 'STATE_UNKNOWN':
+                raise RuntimeError("Creation failed (state 'unknown') "
+                                   f"for '{self.config.provider}'")
+            case 'STATE_DELETING':
+                raise RuntimeError("Creation failed (state 'deleting') "
+                                   f"for '{self.config.provider}'")
+            case _:
+                return False
 
-        return False
-
-    def _cluster_status(self, status):
-        _cluster = self.cloudv2._http_get(
-            endpoint=f'/api/v1/clusters/{self.current.cluster_id}')
-        return _cluster['state'] == status
+    def _cluster_state(self, state: str):
+        _cluster = self.rpcloud.get_cluster(self.current.cluster_id)
+        return _cluster['state'] == state
 
     def _get_cluster_console_url(self):
-        cluster = self.cloudv2._http_get(
-            endpoint=f'/api/v1/clusters/{self.current.cluster_id}')
-        return cluster['status']['listeners']['redpandaConsole']['default'][
-            'urls'][0]
+        cluster = self.rpcloud.get_cluster(self.current.cluster_id)
+        return cluster['redpanda_console']['url']
 
-    def _get_network_id(self):
-        """
-        Get network id.
-        :return: networkId as a string or None if not found
-        """
-        _cluster = self.cloudv2._http_get(
-            endpoint=f'/api/v1/clusters/{self.current.cluster_id}')
-        return _cluster['spec']['networkId']
-
-    def _get_network(self):
-        return self.cloudv2._http_get(
-            endpoint=f"/api/v1/networks/{self.current.network_id}")
+    def _get_network(self) -> dict[str, Any] | None:
+        if type(self.current.network_id) is not str:
+            return None
+        return self.rpcloud.get_network(self.current.network_id)
 
     def _get_latest_install_pack_ver(self):
         """Get latest certified install pack ver by searching list of avail.
@@ -415,7 +463,7 @@ class CloudCluster():
         :return: version, e.g. '23.2.20230707135118', or None if not found
         """
 
-        versions = self.cloudv2._http_get(
+        versions = self.rpcloud._http_get(
             endpoint='/api/v1/clusters-resources/install-pack-versions')
         latest_version = ''
         for v in versions:
@@ -428,96 +476,99 @@ class CloudCluster():
     def _get_region_id(self):
         """Get the region id for a region.
 
-        :param cluster_type: cluster type, e.g. 'FMC'
-        :param provider: cloud provider, e.g. 'AWS'
-        :param region: region name, e.g. 'us-west-2'
+        :param cloudProvider: cloud provider, e.g. 'CLOUD_PROVIDER_AWS'
+        :param name: region name, e.g. 'us-west-2'
         :return: id, e.g. 'cckac9vvbr5ofm048jjg'
         """
 
-        params = {'cluster_type': self.config.type}
-        regions = self.cloudv2._http_get(
-            endpoint='/api/v1/clusters-resources/regions', params=params)
-        for r in regions[self.config.provider]:
-            if r['name'] == self.current.region:
-                return r['id']
-        return None
+        provider = f'CLOUD_PROVIDER_{self.config.provider}'
+        body = {'cloudProvider': provider, 'name': self.current.region}
+        regions = self.public_api._http_post(
+            endpoint='/redpanda.api.ui.v1alpha1.RegionService/ListRegions',
+            override_headers={'connect-protocol-version': '1'},
+            json=body)
 
-    def _get_product_name(self, config_profile_name):
+        return next(
+            filter(lambda r: r['name'] == self.current.region,
+                   regions['regions']), {'id': None})['id']
+
+    def _get_tier_name(self, config_profile_name):
         """Get the product name for the first matching config
         profile name using filter parameters.
         Uses self.current as a source of params
-            provider: cloud provider filter, e.g. 'AWS'
-            cluster_type: cluster type filter, e.g. 'FMC'
+            provider: cloud provider filter, e.g. 'CLOUD_PROVIDER_AWS'
+            cluster_type: cluster type filter, e.g. 'TYPE_BYOC'
             region: region name filter, e.g. 'us-west-2'
-            install_pack_ver: install pack version filter,
-               e.g. '23.2.20230707135118'
 
         :param config_profile_name: config profile name, e.g. 'tier-1-aws'
-        :return: productId, e.g. 'chqrd4q37efgkmohsbdg'
+        :return: product_name, e.g. 'tier-1-aws-v3-arm'
         """
 
+        _provider = f'CLOUD_PROVIDER_{self.config.provider}'
+        _type = 'TYPE_BYOC' if self.config.type == 'BYOC' else 'TYPE_DEDICATED'
         params = {
-            'cloud_provider': self.config.provider,
-            'cluster_type': self.config.type,
-            'region': self.config.region,
-            'install_pack_version': self.current.install_pack_ver
+            'filter.cloud_provider': _provider,
+            'filter.cluster_type': _type,
+            'filter.region': self.config.region,
         }
-        products = self.cloudv2._http_get(
-            endpoint='/api/v1/clusters-resources/products', params=params)
-        for p in products:
-            if p['redpandaConfigProfileName'] == config_profile_name:
-                return p['name']
-        self._logger.warning("CloudV2 API returned empty 'product_name' list "
-                             f"for request: '{params}'")
+        tiers = self.public_api._http_get(endpoint='/v1beta2/tiers',
+                                          params=params)
+        for t in tiers['throughput_tiers']:
+            if t['name'] == config_profile_name:
+                return t['name']
+        self._logger.warning("Could not find throughput tier, "
+                             f"request: '{params}', response:\n{tiers}")
         return None
 
-    def _create_cluster_payload(self):
-        _cidr = "10.1.0.0/16" if self.isPublicNetwork else self.config.network
+    def _create_network_payload(self):
+        _net = self.config.network,
+        _provider = f"CLOUD_PROVIDER_{self.config.provider.upper()}"
+        _type = 'TYPE_BYOC' if self.config.type == 'BYOC' else 'TYPE_DEDICATED'
+        # In case of private network, the value of config.network
+        # should be a CIDR, but we're validating that in __init__
         return {
-            "cluster": {
-                "name": self.current.name,
-                "spec": {
-                    "productName": self.current.product_name,
-                    "clusterType": self.config.type,
-                    "connectors": {
-                        "enabled": True
-                    },
-                    "installPackVersion": self.current.install_pack_ver,
-                    "isMultiAz": False,
-                    "networkId": "",
-                    "provider": self.config.provider,
-                    "region": self.config.region,
-                    "zones": self.current.zones,
-                }
-            },
-            "connectionType": self.current.connection_type,
-            "namespaceUuid": self.current.namespace_uuid,
-            "network": {
-                "displayName":
-                f"{self.current.connection_type}-network-{self.current.name}",
-                "spec": {
-                    "cidr": _cidr,
-                    "deploymentType": self.config.type,
-                    "installPackVersion": self.current.install_pack_ver,
-                    "provider": self.config.provider,
-                    "regionId": self.current.region_id,
-                }
-            },
+            "cidr_block": "10.1.0.0/16" if self.isPublicNetwork else _net,
+            "cloud_provider": _provider,
+            "cluster_type": _type,
+            "name": f"{self.current.name}-network",
+            "region": self.config.region,
+            "resource_group_id": self.current.namespace_uuid
         }
 
-    def _get_cluster(self, _id) -> dict[str, Any]:
+    def _create_cluster_payload(self):
+        _conn_type = f"CONNECTION_TYPE_{self.current.connection_type.upper()}"
+        _provider = f"CLOUD_PROVIDER_{self.config.provider.upper()}"
+        _type = 'TYPE_BYOC' if self.config.type == 'BYOC' else 'TYPE_DEDICATED'
+        return {
+            "cloud_provider": _provider,
+            "connection_type": _conn_type,
+            "name": self.current.name,
+            "network_id": self.current.network_id,
+            "region": self.config.region,
+            "resource_group_id": self.current.namespace_uuid,
+            "throughput_tier": self.current.product_name,
+            "type": _type,
+            "zones": self.current.zones
+        }
+
+    def _get_cluster(self, _id: str) -> dict[str, Any]:
         """
-        Calls CloudV2 API to get cluster info
+        Calls public API to get cluster info
         """
-        _endpoint = f"/api/v1/clusters/{_id}"
-        return self.cloudv2._http_get(endpoint=_endpoint)
+        return self.rpcloud.get_cluster(_id)
+
+    def _get_legacy_cluster(self, _id: str) -> dict[str, Any]:
+        """
+        Calls deprecated cloud API to get cluster info
+        """
+        return self.rpcloud.get_legacy_cluster(_id)
 
     def _update_live_cluster_info(self):
         """
         Update info from existing cluster (BYOC)
         """
-        # get cluster data
-        _c = self._get_cluster(self.current.cluster_id)
+        # get cluster data (needs legacy data, revisit for DEVPROD-2525)
+        _c = self._get_legacy_cluster(self.current.cluster_id)
         # Fill in immediate configuration
         self.current._isAlive = True if _c['status'][
             'health'] == 'healthy' else False
@@ -542,15 +593,16 @@ class CloudCluster():
         :return: string or None if failure
         """
 
-        cluster = self._get_cluster(self.current.cluster_id)
-        base_url = cluster['status']['listeners']['redpandaConsole'][
-            'default']['urls'][0]
-        username = cluster['spec']['consolePrometheusCredentials']['username']
-        password = cluster['spec']['consolePrometheusCredentials']['password']
+        base_url = self._get_cluster_console_url()
+        # revisit when there's a public API endpoint for prometheus
+        # credentials (DEVPROD-2525)
+        legacy = self._get_legacy_cluster(self.current.cluster_id)
+        username = legacy['spec']['consolePrometheusCredentials']['username']
+        password = legacy['spec']['consolePrometheusCredentials']['password']
         b64 = base64.b64encode(bytes(f'{username}:{password}', 'utf-8'))
         token = b64.decode('utf-8')
         headers = {'Authorization': f'Basic {token}'}
-        return self.cloudv2._http_get(
+        return self.rpcloud._http_get(
             endpoint=f'/api/cloud/prometheus/public_metrics',
             base_url=base_url,
             override_headers=headers,
@@ -570,10 +622,6 @@ class CloudCluster():
     def _cid_file(self):
         return os.path.join(self._ctx.session_context.results_dir,
                             self._cid_filename)
-
-    def _cluster_id_updated(self, uuid):
-        _cluster = self.cloudv2._http_get(endpoint=f'/api/v1/clusters/{uuid}')
-        return _cluster['id'] != uuid
 
     def rm_cluster_id_file(self):
         """
@@ -601,18 +649,33 @@ class CloudCluster():
                 _id = cf.read()
         return _id
 
-    def _wait_for_cluster_id(self, uuid, timeout=120):
-        wait_until(lambda: self._cluster_id_updated(uuid),
+    def _netop_complete(self, netop_id: str, target: str) -> bool:
+        n = self.public_api._http_get(
+            endpoint=f'/v1beta2/operations/{netop_id}')
+        if n is None:
+            return False
+        if 'operation' not in n or 'state' not in n['operation']:
+            return False
+        self._logger.debug(
+            f"reached target state: {n['operation']['state'] == target}")
+        return n['operation']['state'] == target
+
+    def _wait_for_netop_id(self,
+                           netop_id,
+                           timeout=300,
+                           target='STATE_COMPLETED') -> str:
+        self._logger.debug(f'polling /v1beta2/operations/{netop_id}')
+        wait_until(lambda: self._netop_complete(netop_id, target) == True,
                    timeout_sec=timeout,
                    backoff_sec=10,
                    err_msg='Failed to get proper id '
                    f'of cloud cluster {self.current.name}')
-
-        # Use clusters handle to wait for non-uuid id :)
-        _cluster = self.cloudv2._http_get(endpoint=f'/api/v1/clusters/{uuid}')
-        _id = _cluster['id']
-        self._logger.info(f"Cluster ID is '{_id}'")
-        return _id
+        n = self.public_api._http_get(
+            endpoint=f'/v1beta2/operations/{netop_id}')
+        if n is None or 'operation' not in n or 'resource_id' not in n[
+                'operation']:
+            return ""
+        return n['operation']['resource_id']
 
     def _create_new_cluster(self):
         # In order not to have long list of arguments in each internal
@@ -630,10 +693,11 @@ class CloudCluster():
         # Multi-zone not supported, so get a single one from the list
         self.current.region = self.config.region
         self.current.region_id = self._get_region_id()
-        self.current.zones = self.provider_cli.get_single_zone(
-            self.current.region)
+        self.current.zones = [
+            self.provider_cli.get_single_zone(self.current.region)
+        ]
         # Call CloudV2 API to determine Product ID
-        self.current.product_name = self._get_product_name(
+        self.current.product_name = self._get_tier_name(
             self.config.config_profile_name)
         if self.current.product_name is None:
             raise RuntimeError("ProductID failed to be determined for "
@@ -642,33 +706,42 @@ class CloudCluster():
                                f"'{self.config.install_pack_ver}', "
                                f"'{self.config.region}'")
 
-        # Call Api to create cluster
-        self._logger.info(f'creating cluster name {self.current.name}')
+        # Call public API to create network
+        self._logger.warning(
+            f'creating network name "{self.current.name}-network"')
+        # Prepare network payload block
+        _body = self._create_network_payload()
+        self._logger.debug(
+            f'POST to /v1beta2/networks body: {json.dumps(_body)}')
+        # Send API request to create network
+        n = self.public_api._http_post(endpoint='/v1beta2/networks',
+                                       json=_body)
+        if n is None:
+            raise RuntimeError(self.rpcloud.lasterror)
+        netop_id = n['operation']['id']
+        self.current.network_id = self._wait_for_netop_id(netop_id)
+
+        # Call public API to create cluster
+        self._logger.warning(f'creating cluster name {self.current.name}')
         # Prepare cluster payload block
         _body = self._create_cluster_payload()
-        self._logger.debug(f'body: {json.dumps(_body)}')
+        self._logger.debug(
+            f'POST to /v1beta2/clusters body: {json.dumps(_body)}')
         # Send API request to create cluster
-        r = self.cloudv2._http_post(
-            endpoint='/api/v1/workflows/network-cluster', json=_body)
-
+        r = self.public_api._http_post(endpoint='/v1beta2/clusters',
+                                       json=_body)
         # handle error on CloudV2 side
         if r is None:
-            raise RuntimeError(self.cloudv2.lasterror)
+            raise RuntimeError(self.rpcloud.lasterror)
+        netop_id = r['operation']['id']
 
         try:
-            # At this point cluster has UUID instead of normal one
-
-            # For BYOC creation a non-uuid is needed
-            # It gets updated when spec makes it through
-            # the workslow, so just wait
-
-            # For FMC, we just make sure that cluster is created
-            # in API and its status is updated
-            _cluster_id = self._wait_for_cluster_id(r['id'])
+            _cluster_id = self._wait_for_netop_id(netop_id,
+                                                  target='STATE_IN_PROGRESS')
             c = self._get_cluster(_cluster_id)
             self.current.last_status = c['state']
-            self._logger.info("Cluster status when id was available: "
-                              f"'{self.current.last_status}'")
+            self._logger.warning(f"Cluster ID is {_cluster_id}, last status: "
+                                 f"'{self.current.last_status}'")
         except Exception as e:
             raise RuntimeError("Failed to get initial cluster spec") from e
 
@@ -682,6 +755,7 @@ class CloudCluster():
             self.current.cluster_id = _cluster_id
             # Kick off cluster creation
             # Timeout for this is half an hour as this is only agent
+            self.utils.rpk_cloud_byoc_install(_cluster_id)
             self.utils.rpk_cloud_apply(_cluster_id)
         elif self.config.type == CLOUD_TYPE_FMC:
             # Nothing to do here
@@ -696,29 +770,29 @@ class CloudCluster():
         # Announce wait
         self._logger.info(
             f'waiting for creation of cluster {self.current.name} '
-            f'({self.current.cluster_id}), namespaceUuid {r["namespaceUuid"]},'
+            f'({self.current.cluster_id}), namespaceUuid {self.current.namespace_uuid},'
             f' checking every {self.CHECK_BACKOFF_SEC} seconds')
         wait_until(lambda: self._cluster_ready(),
                    timeout_sec=self.CHECK_TIMEOUT_SEC,
                    backoff_sec=self.CHECK_BACKOFF_SEC,
-                   err_msg='Unable to deterimine readiness '
+                   err_msg='Unable to determine readiness '
                    f'of cloud cluster {self.current.name}; '
                    f'last state {self.current.last_status}')
-
-        self.current.network_id = self._get_network_id()
 
         # at this point cluster is ready
         # just save the id to reuse it in next test
         if self.config.use_same_cluster:
             self.save_cluster_id(self.current.cluster_id)
 
+        self._logger.warning(
+            f"Cloud cluster {_cluster_id} created successfully.")
+
         return
 
     @cache
     def panda_proxy_url(self):
         cluster = self._get_cluster(self.current.cluster_id)
-        return cluster['status']['listeners']['pandaProxy']['panda-proxy'][
-            'urls'][0]
+        return cluster['http_proxy']['url']
 
     def _query_panda_proxy(self, path):
         # Prepare credentials
@@ -727,7 +801,7 @@ class CloudCluster():
         b64 = base64.b64encode(bytes(f'{_u}:{_p}', 'utf-8'))
         token = b64.decode('utf-8')
         headers = {'Authorization': f'Basic {token}'}
-        return self.cloudv2._http_get(path,
+        return self.rpcloud._http_get(path,
                                       base_url=self.panda_proxy_url(),
                                       override_headers=headers)
 
@@ -759,15 +833,13 @@ class CloudCluster():
 
         # list cluster specs
         self._logger.info(f"Cluster '{self.current.cluster_id}': "
-                          f"health = '{cluster['status']['health']}', "
                           f"state = '{cluster['state']}'")
 
         # Check if panda-proxy is available
-        if not 'panda-proxy' in cluster['status']['listeners']['pandaProxy']:
+        if not 'url' in cluster['http_proxy']:
             return warn_and_return("Panda-Proxy listener is not available")
         else:
-            _u = cluster['status']['listeners']['pandaProxy']['panda-proxy'][
-                'urls'][0]
+            _u = self.panda_proxy_url()
             self._logger.info(f"Panda-Proxy listener: '{_u}'")
 
         # Check that cluster is operational
@@ -782,13 +854,20 @@ class CloudCluster():
         # Check topic count
         self._logger.info("Checking cluster topics")
         _topics = self._query_panda_proxy("/topics")
-        _critical = [
-            "_schemas", "__redpanda.connectors_logs",
-            "_internal_connectors_status", "_internal_connectors_configs",
-            "_redpanda_e2e_probe", "_internal_connectors_offsets"
-        ]
+        # For Azure, connect is in development
+        if self.config.provider == PROVIDER_AZURE:
+            _critical = ["_schemas", "_redpanda_e2e_probe"]
+            required_critical_topic_count = 2
+        else:
+            _critical = [
+                "_schemas", "__redpanda.connectors_logs",
+                "_internal_connectors_status", "_internal_connectors_configs",
+                "_redpanda_e2e_probe", "_internal_connectors_offsets"
+            ]
+            required_critical_topic_count = 6
+
         _intersect = list(set(_topics) & set(_critical))
-        if len(_intersect) < 6:
+        if len(_intersect) < required_critical_topic_count:
             return warn_and_return("Cluster missing critical topics")
         else:
             _t = ', '.join(_intersect)
@@ -803,7 +882,13 @@ class CloudCluster():
             if _metric.name == "redpanda_cluster_brokers":
                 _brokers_metric = _metric
         if _brokers_metric is None:
-            return warn_and_return("Failed to get brokers metric")
+            if self.config.require_broker_metrics_in_health_check:
+                return warn_and_return("Failed to get brokers metric")
+            else:
+                self._logger.info(
+                    "Public metric 'redpanda_cluster_brokers' is unavailable, but it is not required."
+                )
+                return None
         else:
             self._logger.info("Public metric 'redpanda_cluster_brokers' "
                               "is available")
@@ -901,20 +986,31 @@ class CloudCluster():
                 # Populate self.current from cluster info
                 self._update_live_cluster_info()
                 # Fill in additional info based on collected from cluster
-                self.current.product_name = self._get_product_name(
+                self.current.product_name = self._get_tier_name(
                     self.config.config_profile_name)
         else:
             # Just create new cluster
             self._create_new_cluster()
+
+        # If network type is private, trigger VPC Peering
+        if not self.isPublicNetwork:
+            # Checks for if such VPC exists is not needed
+
+            # In case of AWS, it will not create
+            # duplicate Peering connection, just return existing one.
+
+            # In case of GCP, there is no need for Peering for BYOC
+            # and FMC type will create proper peering if it is not in place
+
+            # Routes detection logic is in place, so no duplicated
+            # routes/tables will be created
+            self.create_vpc_peering()
 
         # Update Cluster console Url
         self.current.consoleUrl = self._get_cluster_console_url()
         # update cluster ACLs
         self.update_cluster_acls(superuser)
 
-        # If network type is private, trigget VPC Peering
-        if not self.isPublicNetwork:
-            self.create_vpc_peering()
         self.current._isAlive = True
         return self.current.cluster_id
 
@@ -939,9 +1035,8 @@ class CloudCluster():
                 pass
 
         self._logger.info("Deleting cluster")
-        resp = self.cloudv2._http_get(
-            endpoint=f'/api/v1/clusters/{self.current.cluster_id}')
-        namespace_uuid = resp['namespaceUuid']
+        resp = self.rpcloud.get_cluster(self.current.cluster_id)
+        namespace_uuid = resp['resource_group_id']
 
         # For FMC, just delete the cluster and the rest will happen
         # by itself
@@ -951,13 +1046,13 @@ class CloudCluster():
         # 2. Wait for status "delete agent"
         # 3. Use rpk to delete agent
 
-        resp = self.cloudv2._http_delete(
-            endpoint=f'/api/v1/clusters/{self.current.cluster_id}')
+        resp = self.rpcloud._http_delete(
+            endpoint=self.rpcloud.cluster_endpoint(self.current.cluster_id))
         self._logger.debug(f'resp: {json.dumps(resp)}')
 
         # Check if this is a BYOC and delete agent
         if self.config.type == CLOUD_TYPE_BYOC:
-            wait_until(lambda: self._cluster_status('deleting_agent'),
+            wait_until(lambda: self._cluster_state('STATE_DELETING_AGENT'),
                        timeout_sec=self.CHECK_TIMEOUT_SEC,
                        backoff_sec=self.CHECK_BACKOFF_SEC,
                        err_msg='Timeout waiting for deletion '
@@ -969,8 +1064,8 @@ class CloudCluster():
         self.current.cluster_id = ''
         # skip namespace deletion to avoid error because cluster delete not complete yet
         if self._delete_namespace:
-            resp = self.cloudv2._http_delete(
-                endpoint=f'/api/v1/namespaces/{namespace_uuid}')
+            resp = self.public_api._http_delete(
+                endpoint=f'/v1beta2/resource-groups/{namespace_uuid}')
             self._logger.debug(f'resp: {json.dumps(resp)}')
 
     def _create_user(self, user: SaslCredentials):
@@ -982,7 +1077,7 @@ class CloudCluster():
             'username': user.username,
         }
         # use the console api url to create sasl users; uses the same auth token
-        return self.cloudv2._http_post(base_url=self.current.consoleUrl,
+        return self.rpcloud._http_post(base_url=self.current.consoleUrl,
                                        endpoint='/api/users',
                                        json=payload)
 
@@ -990,10 +1085,7 @@ class CloudCluster():
         """Create ACLs for user
         """
 
-        cluster = self.cloudv2._http_get(
-            endpoint=f'/api/v1/clusters/{self.current.cluster_id}')
-        base_url = cluster['status']['listeners']['redpandaConsole'][
-            'default']['urls'][0]
+        base_url = self._get_cluster_console_url()
         for rt in ('Topic', 'Group', 'TransactionalID'):
             payload = {
                 'host': '*',
@@ -1004,7 +1096,7 @@ class CloudCluster():
                 'resourcePatternType': 'Literal',
                 'resourceType': rt,
             }
-            self.cloudv2._http_post(base_url=base_url,
+            self.rpcloud._http_post(base_url=base_url,
                                     endpoint='/api/acls',
                                     json=payload)
 
@@ -1017,17 +1109,16 @@ class CloudCluster():
             'resourcePatternType': 'Literal',
             'resourceType': 'Cluster',
         }
-        self.cloudv2._http_post(base_url=base_url,
+        self.rpcloud._http_post(base_url=base_url,
                                 endpoint='/api/acls',
                                 json=payload)
 
     def get_broker_address(self):
-        cluster = self.cloudv2._http_get(
-            endpoint=f'/api/v1/clusters/{self.current.cluster_id}')
-        return cluster['status']['listeners']['kafka']['default']['urls'][0]
+        cluster = self.rpcloud.get_cluster(self.current.cluster_id)
+        return cluster['kafka_api']['seed_brokers'][0]
 
     def get_install_pack_version(self):
-        cluster = self.cloudv2._http_get(
+        cluster = self.rpcloud._http_get(
             endpoint=f'/api/v1/clusters/{self.current.cluster_id}')
         return cluster['status']['installPackVersion']
 
@@ -1059,6 +1150,23 @@ class CloudCluster():
                             "peerProjectId": self.current.peer_owner_id,
                             "peerVpcName":
                             self.current.peer_vpc_id.split('/')[-1]
+                        }
+                    }
+                }
+            },
+            "namespaceUuid": self.current.namespace_uuid
+        }
+
+    def _create_network_peering_payload_azure(self):
+        return {
+            "networkPeering": {
+                "displayName": f'peer-{self.current.name}',
+                "spec": {
+                    "provider": "AZURE",
+                    "cloudProvider": {
+                        "azure": {
+                            "peerSubscriptionId": self.current.peer_owner_id,
+                            "peerVirtualNetworkId": self.current.peer_vpc_id
                         }
                     }
                 }
@@ -1099,7 +1207,7 @@ class CloudCluster():
         Get VPC peering connection from CloudV2
         """
         _endpoint = f"{endpoint}/{self.vpc_peering['id']}"
-        return self.cloudv2._http_get(endpoint=_endpoint)
+        return self.rpcloud._http_get(endpoint=_endpoint)
 
     def _check_peering_status_cluster(self, endpoint, state):
         """
@@ -1210,13 +1318,13 @@ class CloudCluster():
             self._logger.debug(f"body: '{_body}'")
 
             # Create peering
-            resp = self.cloudv2._http_post(
+            resp = self.rpcloud._http_post(
                 endpoint=self.current.network_endpoint, json=_body)
             if resp is None:
                 # Check if such peering exists
                 # self._logger.warning(self.cloudv2.lasterror)
-                if "network peering already exists" in self.cloudv2.lasterror:
-                    self.vpc_peering = self.cloudv2._http_get(
+                if "network peering already exists" in self.rpcloud.lasterror:
+                    self.vpc_peering = self.rpcloud._http_get(
                         endpoint=self.current.network_endpoint)[0]
                     # State should be ready at this point
                     self._logger.warning(
@@ -1235,7 +1343,7 @@ class CloudCluster():
                             self.provider_cli.get_vpc_peering_connection(
                                 self.current.vpc_peering_id)
                 else:
-                    raise RuntimeError(self.cloudv2.lasterror)
+                    raise RuntimeError(self.rpcloud.lasterror)
             else:
                 self._logger.debug(f"Created VPC peering: '{resp}'")
                 self.vpc_peering = resp
@@ -1268,7 +1376,7 @@ class CloudCluster():
             self._logger.debug(f"body: '{_body}'")
 
             # Create peering
-            resp = self.cloudv2._http_post(
+            resp = self.rpcloud._http_post(
                 endpoint=self.current.network_endpoint, json=_body)
             self._logger.debug(f"Created VPC peering: '{resp}'")
             self.vpc_peering = resp
@@ -1278,6 +1386,58 @@ class CloudCluster():
             # that was created already above
             self.current.vpc_peering_id = self.provider_cli.create_vpc_peering(
                 self.current, facing_vpcs=False)
+        elif self.config.provider == PROVIDER_AZURE:
+            # TODO This part was not yet tested. Azure cloud cluster creation for Tier testing is blocked. Added this section based on AWS, but might need to update it
+            # Azure specific VPC peering process
+            _body = self._create_network_peering_payload_azure()
+            self._logger.debug(f"body: '{_body}'")
+
+            # Create peering
+            resp = self.rpcloud._http_post(
+                endpoint=self.current.network_endpoint, json=_body)
+            if resp is None:
+                # Check if such peering exists
+                if "network peering already exists" in self.rpcloud.lasterror:
+                    self.vpc_peering = self.rpcloud._http_get(
+                        endpoint=self.current.network_endpoint)[0]
+                    self._logger.warning(
+                        "Found Cloud VPC peering connection "
+                        f"'{self.vpc_peering['displayName']}', "
+                        f"state '{self.vpc_peering['state']}'")
+                    self.current.vpc_peering_id = \
+                        self.provider_cli.find_vpc_peering_connection(
+                            "active", self.current)
+                    if self.current.vpc_peering_id is None:
+                        raise RuntimeError("Azure VPC Peering connection "
+                                           f"not found: {self.current}")
+                    else:
+                        self.current.azure_vpc_peering = \
+                            self.provider_cli.get_vpc_peering_connection(
+                                self.current.vpc_peering_id)
+                else:
+                    raise RuntimeError(self.rpcloud.lasterror)
+            else:
+                self._logger.debug(f"Created VPC peering: '{resp}'")
+                self.vpc_peering = resp
+
+                # 3. Wait for "pending acceptance"
+                self._wait_peering_status_cluster("pending acceptance")
+
+                # Find id of the correct peering VPC
+                self.current.vpc_peering_id = self.provider_cli.find_vpc_peering_connection(
+                    "pending-acceptance", self.current)
+
+                # 4. Accept it on Azure
+                self.current.azure_vpc_peering = self.provider_cli.accept_vpc_peering(
+                    self.current.vpc_peering_id)
+
+            # 5.
+            self._create_routes_to_ducktape()
+            self._create_routes_to_cluster()
+
+            # 6.
+            self._wait_peering_status_provider("active")
+            self._wait_peering_status_cluster("ready")
 
         return
 
@@ -1354,40 +1514,26 @@ class CloudCluster():
 
         return
 
-    def get_product(self) -> ProductInfo | None:
-        """ Get product information.
+    def get_tier(self) -> ThroughputTierInfo | None:
+        """ Get throughput tier information.
 
-        Returns dict with info of product, including advertised limits.
-        Returns none if product info for the tier is not found.
+        Returns dict with info of tier, including advertised limits.
+        Returns none if info for the tier is not found.
         """
 
-        if self.config.install_pack_ver == 'latest':
-            install_pack_ver = self._get_latest_install_pack_ver()
-        else:
-            install_pack_ver = self.config.install_pack_ver
-        params = {
-            'cloud_provider': self.config.provider,
-            'cluster_type': self.config.type,
-            'region': self.config.region,
-            'install_pack_version': install_pack_ver
-        }
-        products = self.cloudv2._http_get(
-            endpoint='/api/v1/clusters-resources/products', params=params)
-        for product in products:
-            if product[
-                    'redpandaConfigProfileName'] == self.config.config_profile_name:
-                return ProductInfo(
-                    max_ingress=int(product['advertisedMaxIngress']),
-                    max_egress=int(product['advertisedMaxEgress']),
-                    # note that despite the name advertisedMaxClientCount is actually
-                    # the advertised connection count, which is a much different value
-                    # (clients may make many connections to a single cluster)
-                    max_connection_count=int(
-                        product['advertisedMaxClientCount']),
-                    max_partition_count=int(
-                        product['advertisedMaxPartitionCount']))
+        tier_name = self._get_tier_name(self.config.config_profile_name)
+        tier = self.public_api._http_get(
+            endpoint=f'/v1beta2/tiers/{tier_name}')
 
-        return None
+        if 'throughput_tier' not in tier:
+            return None
+
+        tier = tier['throughput_tier']
+        return ThroughputTierInfo(
+            max_ingress=int(tier['max_ingress_bytes_per_second']),
+            max_egress=int(tier['max_egress_bytes_per_second']),
+            max_connections_count=int(tier['max_connections_count']),
+            max_partition_count=int(tier['max_partition_count']))
 
     def scale_cluster(self, nodes_count):
         """Scale out/in cluster to specified number of nodes.
@@ -1398,6 +1544,21 @@ class CloudCluster():
             'cluster_id': self.cluster_id,
             'nodes_count': str(nodes_count)
         }
-        return self.cloudv2._http_post(base_url=self.config.admin_api_url,
+        return self.rpcloud._http_post(base_url=self.config.admin_api_url,
                                        endpoint='/ScaleCluster',
+                                       json=payload)
+
+    def set_cluster_config_overrides(self, cluster_id, config_values):
+        """
+        Set configuration overrides for a specific Redpanda cloud cluster using Admin API
+
+        :param cluster_id: str - The ID of the Redpanda cluster to configure.
+        :param config_values: list of dict - A list of dictionaries with `name` and `value` keys.
+            Example: [{"name": "iceberg_enabled", "value": "true"}]
+        :return: Response object from the cloud admin API.
+        """
+        payload = {'cluster_id': cluster_id, 'values': config_values}
+
+        return self.cloudv2._http_post(base_url=self.config.admin_api_url,
+                                       endpoint='/SetClusterConfigOverrides',
                                        json=payload)

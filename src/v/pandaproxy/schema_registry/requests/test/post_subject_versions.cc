@@ -27,7 +27,7 @@ using parse_result
 SEASTAR_THREAD_TEST_CASE(test_post_subject_versions_parser) {
     const ss::sstring escaped_schema_def{
       R"({\"type\":\"record\",\"name\":\"test\",\"fields\":[{\"type\":\"string\",\"name\":\"field1\"},{\"type\":\"com.acme.Referenced\",\"name\":\"int\"}]})"};
-    const pps::unparsed_schema_definition expected_schema_def{
+    const pps::schema_definition expected_schema_def{
       R"({"type":"record","name":"test","fields":[{"type":"string","name":"field1"},{"type":"com.acme.Referenced","name":"int"}]})",
       pps::schema_type::avro,
       {{.name{"com.acme.Referenced"},
@@ -50,20 +50,21 @@ SEASTAR_THREAD_TEST_CASE(test_post_subject_versions_parser) {
 })"};
     const pps::subject sub{"test_subject"};
     const parse_result expected{
-      {sub, expected_schema_def}, std::nullopt, std::nullopt};
+      {sub, expected_schema_def.share()}, std::nullopt, std::nullopt};
 
-    auto result{ppj::rjson_parse(
+    auto result{ppj::impl::rjson_parse(
       payload.data(), pps::post_subject_versions_request_handler{sub})};
 
     // canonicalisation now requires a sharded_store, for now, minify.
-    // NOLINTBEGIN(bugprone-use-after-move)
+    auto [rsub, unparsed] = std::move(result.def).destructure();
+    auto [def, type, refs] = std::move(unparsed).destructure();
+
     result.def = {
-      std::move(result.def).sub(),
-      pps::unparsed_schema_definition{
-        ::json::minify(result.def.def().raw()()),
+      std::move(rsub),
+      pps::schema_definition{
+        pps::schema_definition::raw_string{::json::minify(std::move(def)())},
         pps::schema_type::avro,
-        std::move(result.def).def().refs()}};
-    // NOLINTEND(bugprone-use-after-move)
+        std::move(refs)}};
 
     BOOST_REQUIRE_EQUAL(expected.def, result.def);
     BOOST_REQUIRE_EQUAL(expected.id.has_value(), result.id.has_value());

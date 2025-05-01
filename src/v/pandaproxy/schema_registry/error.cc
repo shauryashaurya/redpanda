@@ -11,8 +11,13 @@
 
 #include "error.h"
 
+#include "bytes/iobuf_parser.h"
 #include "pandaproxy/error.h"
 #include "pandaproxy/schema_registry/error.h"
+#include "pandaproxy/schema_registry/errors.h"
+#include "pandaproxy/schema_registry/types.h"
+
+#include <ranges>
 
 namespace pandaproxy::schema_registry {
 
@@ -30,6 +35,8 @@ struct error_category final : std::error_category {
             return "Invalid schema";
         case error_code::schema_empty:
             return "Empty schema";
+        case error_code::schema_missing_reference:
+            return "Schema references a schema that doesn't exist";
         case error_code::schema_incompatible:
             return "Schema being registered is incompatible with an earlier "
                    "schema for subject";
@@ -53,7 +60,9 @@ struct error_category final : std::error_category {
         case error_code::compatibility_not_found:
             return "Subject does not have subject-level compatibility "
                    "configured";
-        case error_code::subject_version_operaton_not_permitted:
+        case error_code::mode_not_found:
+            return "Subject does not have subject-level mode configured";
+        case error_code::subject_version_operation_not_permitted:
             return "Overwrite new schema is not permitted.";
         case error_code::subject_version_has_references:
             return "One or more references exist to the schema";
@@ -69,6 +78,10 @@ struct error_category final : std::error_category {
             return "Invalid compatibility level. Valid values are NONE, "
                    "BACKWARD, FORWARD, FULL, BACKWARD_TRANSITIVE, "
                    "FORWARD_TRANSITIVE, and FULL_TRANSITIVE";
+        case error_code::mode_invalid:
+            return "Invalid mode. Valid values are READWRITE, READONLY";
+        case error_code::version_exhausted:
+            return "Versions exhausted, maximum 2147483647 reached";
         }
         return "(unrecognized error)";
     }
@@ -93,6 +106,8 @@ struct error_category final : std::error_category {
             return reply_error_code::subject_version_not_deleted; // 40407
         case error_code::compatibility_not_found:
             return reply_error_code::compatibility_not_found; // 40408
+        case error_code::mode_not_found:
+            return reply_error_code::mode_not_found; // 40409
         case error_code::subject_schema_invalid:
             return reply_error_code::internal_server_error; // 500
         case error_code::write_collision:
@@ -100,12 +115,13 @@ struct error_category final : std::error_category {
         case error_code::schema_invalid:
             return reply_error_code::unprocessable_entity;
         case error_code::schema_empty:
+        case error_code::schema_missing_reference:
             return reply_error_code::schema_empty; // 42201
         case error_code::schema_version_invalid:
             return reply_error_code::schema_version_invalid; // 42202
-        case error_code::subject_version_operaton_not_permitted:
+        case error_code::subject_version_operation_not_permitted:
             return reply_error_code::
-              subject_version_operaton_not_permitted; // 42205
+              subject_version_operation_not_permitted; // 42205
         case error_code::subject_version_has_references:
             return reply_error_code::subject_version_has_references; // 42206
         case error_code::subject_version_schema_id_already_exists:
@@ -117,6 +133,10 @@ struct error_category final : std::error_category {
             return reply_error_code::zookeeper_error; // 50001
         case error_code::compatibility_level_invalid:
             return reply_error_code::compatibility_level_invalid; // 42203
+        case error_code::mode_invalid:
+            return reply_error_code::mode_invalid; // 42204
+        case error_code::version_exhausted:
+            return reply_error_code::internal_server_error; // 500
         }
         return {};
     }
@@ -128,6 +148,31 @@ const error_category pps_error_category{};
 
 std::error_code make_error_code(error_code e) {
     return {static_cast<int>(e), pps_error_category};
+}
+
+error_info no_reference_found_for(
+  const subject_schema& schema, const subject& sub, schema_version ver) {
+    // fmt v8 doesn't support formatting for elements in a range
+    auto fmt_refs = schema.def().refs()
+                    | std::views::transform([](const auto& ref) {
+                          return fmt::format("{{{:e}}}", ref);
+                      });
+    iobuf_const_parser parser{schema.def().raw()};
+    return {
+      error_code::schema_missing_reference,
+      fmt::format(
+        "Invalid schema "
+        "{{subject={},version=0,id=-1,schemaType={},references=[{}],metadata="
+        "null,ruleSet=null,schema={}}} with refs [{}] of type {}, details: No "
+        "schema reference found for subject \"{}\" and version {}",
+        schema.sub()(),
+        to_string_view(schema.def().type()),
+        fmt::join(fmt_refs, ", "),
+        parser.read_string(parser.bytes_left()),
+        fmt::join(fmt_refs, ", "),
+        to_string_view(schema.type()),
+        sub(),
+        ver())};
 }
 
 } // namespace pandaproxy::schema_registry

@@ -16,7 +16,10 @@
 #include "model/record_batch_types.h"
 #include "model/timestamp.h"
 #include "model/validation.h"
-#include "serde/serde.h"
+#include "serde/rw/enum.h"
+#include "serde/rw/rw.h"
+#include "serde/rw/sstring.h"
+#include "serde/serde_exception.h"
 #include "strings/string_switch.h"
 #include "utils/to_string.h"
 
@@ -24,9 +27,12 @@
 #include <seastar/net/inet_address.hh>
 #include <seastar/net/ip.hh>
 
+#include <absl/container/flat_hash_map.h>
+#include <absl/strings/str_split.h>
 #include <fmt/ostream.h>
 
 #include <iostream>
+#include <optional>
 #include <type_traits>
 
 namespace model {
@@ -40,7 +46,7 @@ std::ostream& operator<<(std::ostream& os, timestamp ts) {
 }
 
 void read_nested(
-  iobuf_parser& in, timestamp& ts, size_t const bytes_left_limit) {
+  iobuf_parser& in, timestamp& ts, const size_t bytes_left_limit) {
     serde::read_nested(in, ts._v, bytes_left_limit);
 }
 
@@ -169,6 +175,10 @@ ss::sstring ntp::path() const {
     return ssx::sformat("{}/{}/{}", ns(), tp.topic(), tp.partition());
 }
 
+ss::sstring topic_namespace::path() const {
+    return ssx::sformat("{}/{}", ns(), tp());
+}
+
 std::filesystem::path ntp::topic_path() const {
     return fmt::format("{}/{}", ns(), tp.topic());
 }
@@ -176,13 +186,21 @@ std::filesystem::path ntp::topic_path() const {
 std::istream& operator>>(std::istream& i, compression& c) {
     ss::sstring s;
     i >> s;
-    c = string_switch<compression>(s)
-          .match_all("none", "uncompressed", compression::none)
-          .match("gzip", compression::gzip)
-          .match("snappy", compression::snappy)
-          .match("lz4", compression::lz4)
-          .match("zstd", compression::zstd)
-          .match("producer", compression::producer);
+    auto tmp = string_switch<std::optional<compression>>(s)
+                 .match_all("none", "uncompressed", compression::none)
+                 .match("gzip", compression::gzip)
+                 .match("snappy", compression::snappy)
+                 .match("lz4", compression::lz4)
+                 .match("zstd", compression::zstd)
+                 .match("producer", compression::producer)
+                 .default_match(std::nullopt);
+
+    if (tmp.has_value()) {
+        c = tmp.value();
+    } else {
+        i.setstate(std::ios_base::failbit);
+    }
+
     return i;
 }
 
@@ -270,10 +288,8 @@ std::ostream& operator<<(std::ostream& o, cleanup_policy_bitflags c) {
         return o;
     }
 
-    auto compaction = (c & model::cleanup_policy_bitflags::compaction)
-                      == model::cleanup_policy_bitflags::compaction;
-    auto deletion = (c & model::cleanup_policy_bitflags::deletion)
-                    == model::cleanup_policy_bitflags::deletion;
+    auto compaction = model::is_compaction_enabled(c);
+    auto deletion = model::is_deletion_enabled(c);
 
     if (compaction && deletion) {
         o << "compact,delete";
@@ -370,6 +386,22 @@ std::ostream& operator<<(std::ostream& o, record_batch_type bt) {
         return o << "batch_type::compaction_placeholder";
     case record_batch_type::role_management_cmd:
         return o << "batch_type::role_management_cmd";
+    case record_batch_type::client_quota:
+        return o << "batch_type::client_quota";
+    case record_batch_type::data_migration_cmd:
+        return o << "batch_type::data_migration_cmd";
+    case record_batch_type::group_fence_tx:
+        return o << "batch_type::group_fence_tx";
+    case record_batch_type::partition_properties_update:
+        return o << "batch_type::partition_properties_update";
+    case record_batch_type::datalake_coordinator:
+        return o << "batch_type::datalake_coordinator";
+    case record_batch_type::dl_placeholder:
+        return o << "batch_type::dl_placeholder";
+    case record_batch_type::dl_stm_command:
+        return o << "batch_type::dl_overlay";
+    case record_batch_type::datalake_translation_state:
+        return o << "datalake_translation_state";
     }
 
     return o << "batch_type::unknown{" << static_cast<int>(bt) << "}";
@@ -442,26 +474,6 @@ std::ostream& operator<<(std::ostream& o, const shadow_indexing_mode& si) {
     return o;
 }
 
-std::ostream& operator<<(std::ostream& o, leader_balancer_mode lbt) {
-    o << leader_balancer_mode_to_string(lbt);
-    return o;
-}
-
-std::istream& operator>>(std::istream& i, leader_balancer_mode& lbt) {
-    ss::sstring s;
-    i >> s;
-    lbt = string_switch<leader_balancer_mode>(s)
-            .match(
-              leader_balancer_mode_to_string(
-                leader_balancer_mode::random_hill_climbing),
-              leader_balancer_mode::random_hill_climbing)
-            .match(
-              leader_balancer_mode_to_string(
-                leader_balancer_mode::greedy_balanced_shards),
-              leader_balancer_mode::greedy_balanced_shards);
-    return i;
-}
-
 std::ostream& operator<<(std::ostream& o, const control_record_type& crt) {
     switch (crt) {
     case control_record_type::tx_abort:
@@ -484,6 +496,32 @@ std::ostream& operator<<(std::ostream& o, const batch_identity& bid) {
       bid.record_count,
       bid.last_seq);
     return o;
+}
+
+std::ostream& operator<<(std::ostream& o, fetch_read_strategy s) {
+    o << fetch_read_strategy_to_string(s);
+    return o;
+}
+
+std::istream& operator>>(std::istream& i, fetch_read_strategy& strat) {
+    ss::sstring s;
+    i >> s;
+    strat = string_switch<fetch_read_strategy>(s)
+              .match(
+                fetch_read_strategy_to_string(fetch_read_strategy::polling),
+                fetch_read_strategy::polling)
+              .match(
+                fetch_read_strategy_to_string(fetch_read_strategy::non_polling),
+                fetch_read_strategy::non_polling)
+              .match(
+                fetch_read_strategy_to_string(
+                  fetch_read_strategy::non_polling_with_debounce),
+                fetch_read_strategy::non_polling_with_debounce)
+              .match(
+                fetch_read_strategy_to_string(
+                  fetch_read_strategy::non_polling_with_pid),
+                fetch_read_strategy::non_polling_with_pid);
+    return i;
 }
 
 std::ostream& operator<<(std::ostream& o, write_caching_mode mode) {
@@ -544,9 +582,187 @@ std::istream& operator>>(std::istream& is, recovery_validation_mode& vm) {
                  "check_manifest_and_segment_metadata",
                  check_manifest_and_segment_metadata)
                .match("no_check", no_check);
-    } catch (std::runtime_error const&) {
+    } catch (const std::runtime_error&) {
         is.setstate(std::ios::failbit);
     }
+    return is;
+}
+
+iceberg_mode iceberg_mode::disabled
+  = iceberg_mode::make<iceberg_mode::variant::disabled>();
+iceberg_mode iceberg_mode::key_value
+  = iceberg_mode::make<iceberg_mode::variant::key_value>();
+iceberg_mode iceberg_mode::value_schema_id_prefix
+  = iceberg_mode::make<iceberg_mode::variant::value_schema_id_prefix>();
+
+void write(iobuf& out, const iceberg_mode& m) {
+    using serde::write;
+    write(out, m.kind());
+    if (m.kind() == iceberg_mode::variant::value_schema_latest) {
+        write(out, m.protobuf_full_name().value_or(""));
+        write(out, m.subject_name().value_or(""));
+    }
+}
+
+void read_nested(
+  iobuf_parser& in, iceberg_mode& m, const std::size_t bytes_left_limit) {
+    using serde::read_nested;
+    iceberg_mode::variant v = iceberg_mode::variant::disabled;
+    read_nested(in, v, bytes_left_limit);
+    switch (v) {
+    case iceberg_mode::variant::disabled:
+        m = iceberg_mode::disabled;
+        return;
+    case iceberg_mode::variant::key_value:
+        m = iceberg_mode::key_value;
+        return;
+    case iceberg_mode::variant::value_schema_id_prefix:
+        m = iceberg_mode::value_schema_id_prefix;
+        return;
+    case iceberg_mode::variant::value_schema_latest:
+        ss::sstring msg_name;
+        read_nested(in, msg_name, bytes_left_limit);
+        ss::sstring subject;
+        read_nested(in, subject, bytes_left_limit);
+        m = iceberg_mode::value_schema_latest(msg_name, subject);
+        return;
+    }
+    throw serde::serde_exception(
+      fmt::format("unknown iceberg_mode variant: {}", std::to_underlying(v)));
+}
+
+std::ostream& operator<<(std::ostream& os, const iceberg_mode& mode) {
+    switch (mode.kind()) {
+    case iceberg_mode::variant::disabled:
+        return os << "disabled";
+    case iceberg_mode::variant::key_value:
+        return os << "key_value";
+    case iceberg_mode::variant::value_schema_id_prefix:
+        return os << "value_schema_id_prefix";
+    case iceberg_mode::variant::value_schema_latest:
+        os << "value_schema_latest";
+        bool delimiter = false;
+        auto emit_delimiter = [&delimiter, &os]() {
+            os << (delimiter ? "," : ":");
+            delimiter = true;
+        };
+        if (auto protobuf_name = mode.protobuf_full_name()) {
+            emit_delimiter();
+            os << "protobuf_name=" << protobuf_name.value();
+        }
+        if (auto subject = mode.subject_name()) {
+            emit_delimiter();
+            os << "subject=" << subject.value();
+        }
+        return os;
+    }
+}
+
+namespace {
+// Parse configuration options for iceberg_mode's value_schema_latest, which
+// is a grammar like: `:(<name>=<value>)+`
+std::optional<absl::flat_hash_map<std::string, std::string>>
+parse_config_options(std::string_view str) {
+    if (str.empty()) {
+        return absl::flat_hash_map<std::string, std::string>{};
+    }
+    if (!absl::ConsumePrefix(&str, ":")) {
+        return std::nullopt;
+    }
+    if (str.empty()) {
+        return std::nullopt;
+    }
+    absl::flat_hash_map<std::string, std::string> result;
+    for (std::string_view pair : absl::StrSplit(str, ",")) {
+        auto [it, inserted] = result.insert(
+          absl::StrSplit(pair, absl::MaxSplits("=", 1)));
+        // Don't allow duplicates
+        if (!inserted) {
+            return std::nullopt;
+        }
+        // Don't allow empty keys or values
+        if (it->first.empty() || it->second.empty()) {
+            return std::nullopt;
+        }
+    }
+    return result;
+}
+} // namespace
+
+std::istream& operator>>(std::istream& is, iceberg_mode& mode) {
+    ss::sstring s;
+    is >> s;
+    if (s == "disabled") {
+        mode = iceberg_mode::disabled;
+    } else if (s == "key_value") {
+        mode = iceberg_mode::key_value;
+    } else if (s == "value_schema_id_prefix") {
+        mode = iceberg_mode::value_schema_id_prefix;
+    } else if (s.starts_with("value_schema_latest")) {
+        s = s.substr(std::strlen("value_schema_latest"));
+        auto options = parse_config_options(s);
+        if (!options.has_value()) {
+            is.setstate(std::ios::failbit);
+            return is;
+        }
+        std::string_view protobuf_name;
+        std::string_view subject;
+        for (const auto& [key, value] : options.value()) {
+            if (key == "protobuf_name") {
+                protobuf_name = value;
+            } else if (key == "subject") {
+                subject = value;
+            } else {
+                is.setstate(std::ios::failbit);
+                return is;
+            }
+        }
+        mode = iceberg_mode::value_schema_latest(protobuf_name, subject);
+    } else {
+        is.setstate(std::ios::failbit);
+    }
+    return is;
+}
+
+std::ostream&
+operator<<(std::ostream& os, const iceberg_invalid_record_action& a) {
+    switch (a) {
+    case iceberg_invalid_record_action::drop:
+        return os << "drop";
+    case iceberg_invalid_record_action::dlq_table:
+        return os << "dlq_table";
+    }
+}
+
+std::istream& operator>>(std::istream& is, iceberg_invalid_record_action& a) {
+    using enum iceberg_invalid_record_action;
+    ss::sstring s;
+    is >> s;
+    try {
+        a = string_switch<iceberg_invalid_record_action>(s)
+              .match("drop", drop)
+              .match("dlq_table", dlq_table);
+    } catch (const std::runtime_error&) {
+        is.setstate(std::ios::failbit);
+    }
+    return is;
+}
+
+std::ostream& operator<<(std::ostream& os, const fips_mode_flag& f) {
+    return os << to_string_view(f);
+}
+
+std::istream& operator>>(std::istream& is, fips_mode_flag& f) {
+    ss::sstring s;
+    is >> s;
+    f = string_switch<fips_mode_flag>(s)
+          .match(
+            to_string_view(fips_mode_flag::disabled), fips_mode_flag::disabled)
+          .match(
+            to_string_view(fips_mode_flag::enabled), fips_mode_flag::enabled)
+          .match(
+            to_string_view(fips_mode_flag::permissive),
+            fips_mode_flag::permissive);
     return is;
 }
 

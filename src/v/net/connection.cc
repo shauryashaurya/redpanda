@@ -13,11 +13,13 @@
 #include "net/exceptions.h"
 #include "net/types.h"
 #include "ssx/abort_source.h"
+#include "strings/utf8.h"
 
 #include <seastar/core/future.hh>
 #include <seastar/net/tls.hh>
 
-#include <gnutls/gnutls.h>
+#include <exception>
+#include <system_error>
 
 namespace net {
 
@@ -27,23 +29,27 @@ namespace net {
  * indirectly as errors from the TLS layer.
  */
 bool is_reconnect_error(const std::system_error& e) {
-    auto v = e.code().value();
+    const auto v = e.code().value();
+    static const std::array ss_tls_reconnect_errors{
+      ss::tls::ERROR_PUSH,
+      ss::tls::ERROR_PULL,
+      ss::tls::ERROR_UNEXPECTED_PACKET,
+      ss::tls::ERROR_INVALID_SESSION,
+      ss::tls::ERROR_UNSUPPORTED_VERSION,
+      ss::tls::ERROR_NO_CIPHER_SUITES,
+      ss::tls::ERROR_PREMATURE_TERMINATION,
+      ss::tls::ERROR_DECRYPTION_FAILED,
+      ss::tls::ERROR_MAC_VERIFY_FAILED,
+      ss::tls::ERROR_WRONG_VERSION_NUMBER,
+      ss::tls::ERROR_HTTP_REQUEST,
+      ss::tls::ERROR_HTTPS_PROXY_REQUEST};
 
     if (e.code().category() == ss::tls::error_category()) {
-        switch (v) {
-        case GNUTLS_E_PUSH_ERROR:
-        case GNUTLS_E_PULL_ERROR:
-        case GNUTLS_E_UNEXPECTED_PACKET:
-        case GNUTLS_E_INVALID_SESSION:
-        case GNUTLS_E_UNSUPPORTED_VERSION_PACKET:
-        case GNUTLS_E_NO_CIPHER_SUITES:
-        case GNUTLS_E_PREMATURE_TERMINATION:
-        case GNUTLS_E_DECRYPTION_FAILED:
-            return true;
-        default:
-            return false;
-        }
-    } else {
+        return absl::c_any_of(
+          ss_tls_reconnect_errors, [v](int ec) { return v == ec; });
+    } else if (
+      e.code().category() == std::system_category()
+      || e.code().category() == std::generic_category()) {
         switch (v) {
         case ECONNREFUSED:
         case ENETUNREACH:
@@ -61,6 +67,9 @@ bool is_reconnect_error(const std::system_error& e) {
         default:
             return false;
         }
+    } else {
+        // We don't know what the error category is at this point
+        return false;
     }
     __builtin_unreachable();
 }
@@ -74,8 +83,8 @@ bool is_reconnect_error(const std::system_error& e) {
  */
 std::optional<ss::sstring> is_disconnect_exception(std::exception_ptr e) {
     try {
-        rethrow_exception(e);
-    } catch (std::system_error& e) {
+        std::rethrow_exception(e);
+    } catch (const std::system_error& e) {
         if (is_reconnect_error(e)) {
             return e.code().message();
         }
@@ -85,10 +94,11 @@ std::optional<ss::sstring> is_disconnect_exception(std::exception_ptr e) {
         // Happens on unclean client disconnect, when io_iterator_consumer
         // gets fewer bytes than it wanted
         return "short read";
-    } catch (const net::parsing_exception&) {
+    } catch (const net::parsing_exception& e) {
         // Happens on unclean client disconnect, typically wrapping
-        // an out_of_range
-        return "parse error";
+        // an out_of_range.
+        // Also raised from the kafka protocol layer on bad header
+        return ssx::sformat("parse error: {}", e.what());
     } catch (const invalid_request_error& e) {
         if (std::strlen(e.what())) {
             return fmt::format("invalid request: {}", e.what());
@@ -115,7 +125,7 @@ std::optional<ss::sstring> is_disconnect_exception(std::exception_ptr e) {
 
 bool is_auth_error(std::exception_ptr e) {
     try {
-        rethrow_exception(e);
+        std::rethrow_exception(e);
     } catch (const authentication_exception& e) {
         return true;
     } catch (...) {
@@ -123,6 +133,16 @@ bool is_auth_error(std::exception_ptr e) {
     }
 
     __builtin_unreachable();
+}
+
+bool is_invalid_character_error(std::exception_ptr e) {
+    try {
+        std::rethrow_exception(e);
+    } catch (const invalid_character_exception&) {
+        return true;
+    } catch (...) {
+        return false;
+    }
 }
 
 connection::connection(

@@ -12,29 +12,14 @@
 
 #include "random/generators.h"
 
-#include <seastar/core/sstring.hh>
-
 namespace random_generators {
 
-bytes get_bytes(size_t n) {
-    auto b = ss::uninitialized_string<bytes>(n);
-    std::generate_n(b.begin(), n, [] { return get_int<bytes::value_type>(); });
-    return b;
-}
-
 bytes get_crypto_bytes(size_t n, bool use_private_rng) {
-    auto b = ss::uninitialized_string<bytes>(n);
+    bytes b(bytes::initialized_later{}, n);
     std::generate_n(b.begin(), n, [use_private_rng] {
         return get_int_secure<bytes::value_type>(use_private_rng);
     });
     return b;
-}
-
-iobuf make_iobuf(size_t n) {
-    const auto b = gen_alphanum_string(n);
-    iobuf io;
-    io.append(b.data(), n);
-    return io;
 }
 
 } // namespace random_generators

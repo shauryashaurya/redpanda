@@ -24,7 +24,7 @@
 namespace pandaproxy::schema_registry {
 
 struct post_subject_versions_request {
-    canonical_schema schema;
+    subject_schema schema;
 };
 
 template<typename Encoding = ::json::UTF8<>>
@@ -36,6 +36,8 @@ class post_subject_versions_request_handler
         schema,
         id,
         version,
+        metadata,
+        ruleset,
         schema_type,
         references,
         reference,
@@ -47,16 +49,16 @@ class post_subject_versions_request_handler
 
     struct mutable_schema {
         subject sub{invalid_subject};
-        unparsed_schema_definition::raw_string def;
+        schema_definition::raw_string def;
         schema_type type{schema_type::avro};
-        unparsed_schema_definition::references refs;
+        schema_definition::references refs;
     };
     mutable_schema _schema;
 
 public:
     using Ch = typename json::base_handler<Encoding>::Ch;
     struct rjson_parse_result {
-        unparsed_schema def;
+        subject_schema def;
         std::optional<schema_id> id;
         std::optional<schema_version> version;
     };
@@ -74,6 +76,8 @@ public:
                                      .match("schema", state::schema)
                                      .match("id", state::id)
                                      .match("version", state::version)
+                                     .match("metadata", state::metadata)
+                                     .match("ruleSet", state::ruleset)
                                      .match("schemaType", state::schema_type)
                                      .match("references", state::references)
                                      .default_match(std::nullopt)};
@@ -97,6 +101,8 @@ public:
         case state::schema:
         case state::id:
         case state::version:
+        case state::metadata:
+        case state::ruleset:
         case state::schema_type:
         case state::references:
         case state::reference_name:
@@ -107,42 +113,44 @@ public:
         return false;
     }
 
-    bool Uint(int i) {
+    bool Null() {
         switch (_state) {
-        case state::id: {
-            result.id = schema_id{i};
+        case state::metadata:
+        case state::ruleset:
             _state = state::record;
             return true;
-        }
-        case state::version: {
-            result.version = schema_version{i};
-            _state = state::record;
-            return true;
-        }
-        case state::reference_version: {
-            _schema.refs.back().version = schema_version{i};
-            _state = state::reference;
-            return true;
-        }
         case state::empty:
         case state::record:
         case state::schema:
+        case state::id:
+        case state::version:
         case state::schema_type:
         case state::references:
         case state::reference:
         case state::reference_name:
         case state::reference_subject:
-            return false;
+        case state::reference_version:
+            break;
         }
         return false;
+    }
+
+    bool Int(int i) { return set_integer_value(i); }
+
+    bool Uint(unsigned i) {
+        if (i > std::numeric_limits<int>::max()) {
+            return false;
+        }
+        return set_integer_value(static_cast<int>(i));
     }
 
     bool String(const Ch* str, ::json::SizeType len, bool) {
         auto sv = std::string_view{str, len};
         switch (_state) {
         case state::schema: {
-            _schema.def = unparsed_schema_definition::raw_string{
-              ss::sstring{sv}};
+            iobuf buf;
+            buf.append(sv.data(), sv.size());
+            _schema.def = schema_definition::raw_string{std::move(buf)};
             _state = state::record;
             return true;
         }
@@ -168,6 +176,8 @@ public:
         case state::record:
         case state::id:
         case state::version:
+        case state::metadata:
+        case state::ruleset:
         case state::references:
         case state::reference:
         case state::reference_version:
@@ -191,6 +201,8 @@ public:
         case state::schema:
         case state::id:
         case state::version:
+        case state::metadata:
+        case state::ruleset:
         case state::schema_type:
         case state::reference:
         case state::reference_name:
@@ -220,6 +232,8 @@ public:
         case state::schema:
         case state::id:
         case state::version:
+        case state::metadata:
+        case state::ruleset:
         case state::schema_type:
         case state::references:
         case state::reference_name:
@@ -235,14 +249,48 @@ public:
     bool EndArray(::json::SizeType) {
         return std::exchange(_state, state::record) == state::references;
     }
+
+private:
+    bool set_integer_value(int i) {
+        switch (_state) {
+        case state::id: {
+            result.id = schema_id{i};
+            _state = state::record;
+            return true;
+        }
+        case state::version: {
+            result.version = schema_version{i};
+            _state = state::record;
+            return true;
+        }
+        case state::reference_version: {
+            _schema.refs.back().version = schema_version{i};
+            _state = state::reference;
+            return true;
+        }
+        case state::empty:
+        case state::record:
+        case state::schema:
+        case state::metadata:
+        case state::ruleset:
+        case state::schema_type:
+        case state::references:
+        case state::reference:
+        case state::reference_name:
+        case state::reference_subject:
+            return false;
+        }
+        return false;
+    }
 };
 
 struct post_subject_versions_response {
     schema_id id;
 };
 
-inline void rjson_serialize(
-  ::json::Writer<::json::StringBuffer>& w,
+template<typename Buffer>
+void rjson_serialize(
+  ::json::Writer<Buffer>& w,
   const schema_registry::post_subject_versions_response& res) {
     w.StartObject();
     w.Key("id");

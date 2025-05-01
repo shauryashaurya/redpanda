@@ -15,8 +15,8 @@
 #include "cloud_storage/cache_service.h"
 #include "cluster/node/local_monitor.h"
 #include "cluster/partition_manager.h"
-#include "prometheus/prometheus_sanitize.h"
-#include "storage/disk_log_impl.h"
+#include "datalake/datalake_manager.h"
+#include "metrics/prometheus_sanitize.h"
 #include "utils/human.h"
 
 #include <seastar/core/metrics_registration.hh>
@@ -92,12 +92,34 @@ ss::future<> disk_space_manager::stop() {
         _storage_node->local().unregister_disk_notification(
           node::disk_type::data, _data_disk_nid);
     }
+    _as.request_abort();
     _control_sem.broken();
     co_await _gate.close();
 }
 
 ss::future<> disk_space_manager::run_loop() {
     vassert(ss::this_shard_id() == run_loop_core, "Run on wrong core");
+
+    // Always wait for the trim interval after startup to ensure that
+    // partitions are fully started. Known sources of skew early in the node
+    // startup phase:
+    // 1. controller_backend::start() doesn't wait for the first reconciliation
+    // round, so not all partitions may yet exist in the partition manager.
+    // 2. Even though partition::start() waits for STMs to apply local snapshots
+    // (and therefore have a recent-enough state), some STMs don't return
+    // a sensible max_collectible_offset until later. For example:
+    //   * rm_stm waits until it is replayed up to raft committed index
+    //   * archival_metadata_stm waits until the state is marked "clean"
+    //     (i.e. until the corresponding manifest is uploaded to the cloud).
+    //     Moreover, because the snapshot stores only the boolean "dirty" flag,
+    //     we can't reliably restore the "last clean at" offset just from the
+    //     snapshot.
+    try {
+        co_await ss::sleep_abortable(
+          config::shard_local_cfg().retention_local_trim_interval(), _as);
+    } catch (ss::sleep_aborted&) {
+        co_return;
+    }
 
     while (!_gate.is_closed()) {
         try {
@@ -122,7 +144,7 @@ ss::future<> disk_space_manager::run_loop() {
             co_await manage_data_disk(_target_size);
         } catch (...) {
             vlog(
-              stlog.info,
+              rlog.info,
               "Recoverable error running space management loop: {}",
               std::current_exception());
         }
@@ -278,19 +300,10 @@ eviction_policy::collect_reclaimable_offsets() {
     /*
      * retention settings mirror settings found in housekeeping()
      */
-    const auto collection_threshold = [this] {
-        const auto& lm = _storage->local().log_mgr();
-        if (!lm.config().log_retention().has_value()) {
-            return model::timestamp(0);
-        }
-        const auto now = model::timestamp::now().value();
-        const auto retention = lm.config().log_retention().value().count();
-        return model::timestamp(now - retention);
-    };
-
+    const auto collection_ts
+      = _storage->local().log_mgr().lowest_ts_to_retain();
     gc_config cfg(
-      collection_threshold(),
-      _storage->local().log_mgr().config().retention_bytes());
+      collection_ts, _storage->local().log_mgr().config().retention_bytes());
 
     /*
      * in smallish batches partitions are queried for their reclaimable
@@ -312,7 +325,7 @@ eviction_policy::collect_reclaimable_offsets() {
             .handle_exception_type([](const ss::gate_closed_exception&) {})
             .handle_exception([ntp = p->ntp()](std::exception_ptr e) {
                 vlog(
-                  rlog.debug,
+                  rlog.warn,
                   "Error collecting reclaimable offsets from {}: {}",
                   ntp,
                   e);
@@ -495,13 +508,34 @@ size_t eviction_policy::evict_until_active_segment(
       });
 }
 
+ss::future<storage::usage_report> disk_space_manager::disk_usage() {
+    /*
+     * log and kvstore usage.
+     */
+    auto report = co_await _storage->local().disk_usage();
+
+    /*
+     * datalake scratch space usage. from the perspective of space management
+     * the data used by datalake is not reclaimable. it is reported in the
+     * report as more "log data" the same way that kvstore data is reported.
+     */
+    const auto datalake_usage
+      = co_await datalake::datalake_manager::disk_usage();
+    vlog(rlog.debug, "Datalake usage: {}", human::bytes(datalake_usage));
+
+    _probe.set_total_datalake_usage(datalake_usage);
+    report.usage.data += datalake_usage;
+
+    co_return report;
+}
+
 ss::future<> disk_space_manager::manage_data_disk(uint64_t target_size) {
     /*
      * query log storage usage across all cores
      */
     storage::usage_report usage;
     try {
-        usage = co_await _storage->local().disk_usage();
+        usage = co_await disk_usage();
     } catch (...) {
         vlog(
           rlog.info,
@@ -566,10 +600,10 @@ ss::future<> disk_space_manager::manage_data_disk(uint64_t target_size) {
      * generally we may want to consider a smoother function as well as
      * dynamically adjusting the control loop frequency.
      */
-    const auto target_excess = static_cast<uint64_t>(
+    const auto adjusted_target_excess = static_cast<uint64_t>(
       real_target_excess
       * config::shard_local_cfg().retention_local_trim_overage_coeff());
-    _probe.set_target_excess(target_excess);
+    _probe.set_target_excess(adjusted_target_excess);
 
     /*
      * when log storage has exceeded the target usage, then there are some knobs
@@ -589,43 +623,44 @@ ss::future<> disk_space_manager::manage_data_disk(uint64_t target_size) {
      * targets for cloud-enabled topics, removing data that has been backed up
      * into the cloud.
      */
-    if (target_excess > usage.reclaim.retention) {
+    if (adjusted_target_excess > usage.reclaim.retention) {
         vlog(
           rlog.info,
           "Log storage usage {} > target size {} by {} (adjusted {}). Garbage "
-          "collection expected to recover {}. Overriding tiered storage "
-          "retention to recover {}. Total estimated available to recover {}",
+          "collection expected to remove {}. Space management of tiered "
+          "storage topics to remove {}. Total estimated available to remove "
+          "{}",
           human::bytes(usage.usage.total()),
           human::bytes(target_size),
           human::bytes(real_target_excess),
-          human::bytes(target_excess),
+          human::bytes(adjusted_target_excess),
           human::bytes(usage.reclaim.retention),
-          human::bytes(target_excess - usage.reclaim.retention),
+          human::bytes(adjusted_target_excess - usage.reclaim.retention),
           human::bytes(usage.reclaim.available));
 
         auto schedule = co_await _policy.create_new_schedule();
         if (schedule.sched_size > 0) {
             auto estimate = _policy.evict_until_local_retention(
-              schedule, target_excess);
+              schedule, adjusted_target_excess);
             _probe.set_reclaim_local(estimate);
 
-            if (estimate < target_excess) {
+            if (estimate < adjusted_target_excess) {
                 const auto amount = _policy.evict_until_low_space_non_hinted(
-                  schedule, target_excess - estimate);
+                  schedule, adjusted_target_excess - estimate);
                 _probe.set_reclaim_low_non_hinted(amount);
                 estimate += amount;
             }
 
-            if (estimate < target_excess) {
+            if (estimate < adjusted_target_excess) {
                 const auto amount = _policy.evict_until_low_space_hinted(
-                  schedule, target_excess - estimate);
+                  schedule, adjusted_target_excess - estimate);
                 _probe.set_reclaim_low_hinted(amount);
                 estimate += amount;
             }
 
-            if (estimate < target_excess) {
+            if (estimate < adjusted_target_excess) {
                 const auto amount = _policy.evict_until_active_segment(
-                  schedule, target_excess - estimate);
+                  schedule, adjusted_target_excess - estimate);
                 _probe.set_reclaim_active_segment(amount);
                 estimate += amount;
             }
@@ -644,17 +679,20 @@ ss::future<> disk_space_manager::manage_data_disk(uint64_t target_size) {
               rlog.info, "Scheduling {} for reclaim", human::bytes(estimate));
             co_await _policy.install_schedule(std::move(schedule));
         } else {
-            vlog(rlog.info, "No partitions eligible for reclaim were found");
+            vlog(
+              rlog.info,
+              "No tiered storage partitions were found, unable to reclaim");
         }
     } else {
         vlog(
           rlog.info,
           "Log storage usage {} > target size {} by {} (adjusted {}). Garbage "
-          "collection expected to recover {}.",
+          "collection expected to remove {}. No additional space management "
+          "required",
           human::bytes(usage.usage.total()),
           human::bytes(target_size),
           human::bytes(real_target_excess),
-          human::bytes(target_excess),
+          human::bytes(adjusted_target_excess),
           human::bytes(usage.reclaim.retention));
     }
 
@@ -696,6 +734,11 @@ void disk_space_manager::probe::setup_metrics() {
       [this]() { return _total_usage; },
       sm::description(
         "Total amount of disk usage under control of space management.")));
+
+    defs.emplace_back(sm::make_gauge(
+      "datalake_disk_usage_bytes",
+      [this]() { return _total_datalake_usage; },
+      sm::description("Total amount of disk usage by datalake.")));
 
     defs.emplace_back(sm::make_gauge(
       "retention_reclaimable_bytes",

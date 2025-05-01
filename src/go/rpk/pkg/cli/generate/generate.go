@@ -25,6 +25,7 @@ func NewCommand(fs afero.Fs, p *config.Params) *cobra.Command {
 	cmd.AddCommand(
 		newAppCmd(fs, p),
 		newGrafanaDashboardCmd(p),
+		newLicenseCommand(fs, p),
 		newPrometheusConfigCmd(fs, p),
 		newShellCompletionCommand(),
 	)
@@ -39,7 +40,7 @@ type fileSpec struct {
 }
 
 func validFiles(fileMap map[string]*fileSpec) func(*cobra.Command, []string, string) ([]string, cobra.ShellCompDirective) {
-	return func(cmd *cobra.Command, _ []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+	return func(_ *cobra.Command, _ []string, _ string) ([]string, cobra.ShellCompDirective) {
 		opts := make([]string, 0, len(fileMap))
 		for k, v := range fileMap {
 			// Cobra provides support for completion descriptions:

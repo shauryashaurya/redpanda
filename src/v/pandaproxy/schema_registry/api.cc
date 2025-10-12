@@ -63,6 +63,7 @@ ss::future<> api::start() {
       _node_id, _sg, std::ref(_client), std::ref(*_store));
     co_await _service.start(
       config::to_yaml(_cfg, config::redact_secrets::no),
+      config::to_yaml(_client_cfg, config::redact_secrets::no),
       _sg,
       _max_memory,
       std::ref(_client),
@@ -76,9 +77,10 @@ ss::future<> api::start() {
 
 ss::future<> api::stop() {
     vlog(srlog.debug, "Stopping schema registry API...");
-    co_await _client.stop();
+    co_await _client.invoke_on_all(&kafka::client::client::stop);
     co_await _service.stop();
     co_await _sequencer.stop();
+    co_await _client.stop();
     co_await _schema_id_cache.stop();
     co_await _schema_id_validation_probe.stop();
     if (_store) {
@@ -93,4 +95,13 @@ ss::future<> api::restart() {
     co_await start();
 }
 
+const configuration& api::get_config() const { return _cfg; }
+
+const kafka::client::configuration& api::get_client_config() const {
+    return _client_cfg;
+}
+
+bool api::has_ephemeral_credentials() const {
+    return _service.local().has_ephemeral_credentials();
+}
 } // namespace pandaproxy::schema_registry

@@ -9,8 +9,9 @@
  */
 #include "iceberg/conversion/values_protobuf.h"
 
+#include "absl/time/time.h"
 #include "bytes/iobuf.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "iceberg/conversion/conversion_outcome.h"
 #include "iceberg/conversion/protobuf_utils.h"
 #include "iceberg/values.h"
@@ -20,7 +21,6 @@
 #include <seastar/util/log.hh>
 #include <seastar/util/variant_utils.hh>
 
-#include <absl/time/time.h>
 #include <fmt/core.h>
 
 namespace iceberg {
@@ -30,9 +30,10 @@ namespace {
 
 value_conversion_exception
 type_conversion_error(const pb::FieldDescriptor& fd) {
-    return value_conversion_exception(fmt::format(
-      "Protocol buffers type '{}' conversion is not supported",
-      fd.type_name()));
+    return value_conversion_exception(
+      fmt::format(
+        "Protocol buffers type '{}' conversion is not supported",
+        fd.type_name()));
 }
 
 template<typename BaseT, typename IcebergT, typename DefaultF>
@@ -128,7 +129,7 @@ ss::future<optional_value_outcome> convert_repeated(
 
     return ss::visit(
              std::move(list_variant),
-             [&field_descriptor, &stack](auto& list) {
+             [&field_descriptor, &stack](auto list) {
                  return convert_repeated_elements(
                    std::move(list), field_descriptor, stack);
              })
@@ -169,7 +170,7 @@ ss::future<optional_value_outcome> convert_map(
                 *field_descriptor.message_type()->map_key(),
                 stack);
           },
-          [&field_descriptor, &stack](auto& value) {
+          [&field_descriptor, &stack](auto value) {
               return single_field_to_value(
                 std::move(value),
                 *field_descriptor.message_type()->map_key(),
@@ -181,9 +182,10 @@ ss::future<optional_value_outcome> convert_map(
         }
 
         if (!key_result.value().has_value()) {
-            co_return value_conversion_exception(fmt::format(
-              "Map key must exist. Map field {}",
-              field_descriptor.DebugString()));
+            co_return value_conversion_exception(
+              fmt::format(
+                "Map key must exist. Map field {}",
+                field_descriptor.DebugString()));
         }
 
         optional_value_outcome value_result = co_await ss::visit(
@@ -191,7 +193,7 @@ ss::future<optional_value_outcome> convert_map(
           [](std::monostate) {
               return ssx::now<optional_value_outcome>(std::nullopt);
           },
-          [&field_descriptor, &stack](auto& value) {
+          [&field_descriptor, &stack](auto value) {
               return single_field_to_value(
                 std::move(value),
                 *field_descriptor.message_type()->map_value(),
@@ -202,9 +204,10 @@ ss::future<optional_value_outcome> convert_map(
             co_return value_result.error();
         }
 
-        ret->kvs.push_back(iceberg::kv_value{
-          .key = std::move(*key_result.value()),
-          .val = std::move(value_result.value())});
+        ret->kvs.push_back(
+          iceberg::kv_value{
+            .key = std::move(*key_result.value()),
+            .val = std::move(value_result.value())});
     }
 
     co_return ret;
@@ -344,14 +347,16 @@ ss::future<optional_value_outcome> message_to_value(
     }
 
     if (is_recursive_type(descriptor, stack)) {
-        co_return value_conversion_exception(fmt::format(
-          "Recursive message types are not supported. Descriptor: {}",
-          descriptor.DebugString()));
+        co_return value_conversion_exception(
+          fmt::format(
+            "Recursive message types are not supported. Descriptor: {}",
+            descriptor.DebugString()));
     }
     if (stack.size() >= max_recursion_depth) {
-        co_return value_conversion_exception(fmt::format(
-          "Reached maximum recursion depth. Descriptor: {}",
-          descriptor.DebugString()));
+        co_return value_conversion_exception(
+          fmt::format(
+            "Reached maximum recursion depth. Descriptor: {}",
+            descriptor.DebugString()));
     }
 
     stack.push_back(&descriptor);
@@ -396,9 +401,10 @@ deserialize_protobuf(iobuf buffer, const pb::Descriptor& type_descriptor) {
         co_return co_await proto_parsed_message_to_value(
           std::move(msg_ptr), type_descriptor);
     } catch (...) {
-        co_return value_outcome(value_conversion_exception(fmt::format(
-          "exception thrown while parsing protobuf - {}",
-          std::current_exception())));
+        co_return value_outcome(value_conversion_exception(
+          fmt::format(
+            "exception thrown while parsing protobuf - {}",
+            std::current_exception())));
     }
 }
 

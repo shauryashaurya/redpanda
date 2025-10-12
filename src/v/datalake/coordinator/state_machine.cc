@@ -167,7 +167,7 @@ ss::future<> coordinator_stm::apply_raft_snapshot(const iobuf& snapshot_buf) {
     state_ = std::move(snapshot.topics);
 }
 
-ss::future<iobuf> coordinator_stm::take_snapshot() {
+ss::future<iobuf> coordinator_stm::take_raft_snapshot() {
     iobuf snapshot_buf;
     co_await serde::write_async(snapshot_buf, make_snapshot());
     co_return std::move(snapshot_buf);
@@ -191,8 +191,9 @@ ss::future<> coordinator_stm::maybe_write_snapshot() {
       _log.debug,
       "creating snapshot at offset: {}",
       snapshot.last_included_offset);
-    co_await _raft->write_snapshot(raft::write_snapshot_cfg(
-      snapshot.last_included_offset, std::move(snapshot.data)));
+    co_await _raft->write_snapshot(
+      raft::write_snapshot_cfg(
+        snapshot.last_included_offset, std::move(snapshot.data)));
 }
 
 void coordinator_stm::write_snapshot_async() {

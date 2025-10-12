@@ -9,9 +9,11 @@
 
 #include "cluster/tm_stm.h"
 
+#include "absl/container/btree_set.h"
+#include "cluster/snapshot.h"
 #include "cluster/tm_stm_types.h"
 #include "cluster/types.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "kafka/protocol/types.h"
 #include "model/record.h"
 #include "raft/errc.h"
@@ -20,8 +22,6 @@
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
 #include <seastar/util/bool_class.hh>
-
-#include <absl/container/btree_set.h>
 
 #include <cstdint>
 #include <optional>
@@ -52,15 +52,11 @@ model::record_batch tm_stm::serialize_tx(tx_metadata tx) {
     return std::move(b).build();
 }
 
-tm_stm::tm_stm(
-  ss::logger& logger,
-  raft::consensus* c,
-  ss::sharded<features::feature_table>& feature_table)
+tm_stm::tm_stm(ss::logger& logger, raft::consensus* c)
   : raft::persisted_stm<>(tm_stm_snapshot, logger, c)
   , _sync_timeout(config::shard_local_cfg().tm_sync_timeout_ms.value())
   , _transactional_id_expiration(
       config::shard_local_cfg().transactional_id_expiration_ms.bind())
-  , _feature_table(feature_table)
   , _ctx_log(logger, ssx::sformat("[{}]", _raft->ntp())) {}
 
 ss::future<> tm_stm::start() { co_await raft::persisted_stm<>::start(); }
@@ -370,16 +366,14 @@ ss::future<tm_stm::op_status> tm_stm::update_tx_producer(
   kafka::transactional_id tx_id,
   std::chrono::milliseconds transaction_timeout_ms,
   model::producer_identity pid,
-  model::producer_identity last_pid,
-  model::producer_identity rolled_pid) {
+  model::producer_identity last_pid) {
     vlog(
       _ctx_log.trace,
       "[tx_id={}] Registering existing transaction with new pid: {}, previous "
-      "pid: {}, rolled_pid: {}",
+      "pid: {}",
       tx_id,
       pid,
-      last_pid,
-      rolled_pid);
+      last_pid);
 
     auto tx_opt = co_await get_tx(tx_id);
     if (!tx_opt.has_value()) {
@@ -397,11 +391,9 @@ ss::future<tm_stm::op_status> tm_stm::update_tx_producer(
     tx.last_update_ts = clock_type::now();
 
     auto r = co_await update_tx(std::move(tx), expected_term);
-
     if (!r.has_value()) {
         co_return tm_stm::op_status::unknown;
     }
-    _pid_tx_id.erase(rolled_pid);
     co_return tm_stm::op_status::success;
 }
 
@@ -580,9 +572,19 @@ ss::future<tm_stm::op_status> tm_stm::add_group(
     co_return tm_stm::op_status::success;
 }
 void tm_stm::upsert_transaction(tx_metadata tx) {
+    vlog(
+      _ctx_log.trace,
+      "[tx_id={}] upserting transaction: {}, transactions: {} pid_map: {}",
+      tx.id,
+      tx,
+      _transactions.size(),
+      _pid_tx_id.size());
     auto [tx_it, inserted] = _transactions.try_emplace(tx.id, tx);
-    _pid_tx_id[tx.pid] = tx.id;
+    // erase any existing mappings
     _pid_tx_id.erase(tx.last_pid);
+    _pid_tx_id.erase(tx_it->second.tx.pid);
+    // Update the latest tx_id to pid mapping
+    _pid_tx_id[tx.pid] = tx.id;
     if (!inserted) {
         tx_it->second.tx = std::move(tx);
     }
@@ -590,8 +592,8 @@ void tm_stm::upsert_transaction(tx_metadata tx) {
     _transactions_lru.push_back(tx_it->second);
 }
 
-fragmented_vector<tx_metadata> tm_stm::get_transactions_list() const {
-    fragmented_vector<tx_metadata> ret;
+chunked_vector<tx_metadata> tm_stm::get_transactions_list() const {
+    chunked_vector<tx_metadata> ret;
     ret.reserve(_transactions.size());
     for (const auto& [_, wrapper] : _transactions) {
         ret.push_back(wrapper.tx);
@@ -732,7 +734,7 @@ tm_stm::apply_tm_update(model::record_batch_header hdr, model::record_batch b) {
     // now this is fine as there was no validation on apply in the first place
     // before the refactoring happened. We will add validation after we will
     // make sure the transaction FSM transitions are all valid
-    upsert_transaction(tx);
+    upsert_transaction(std::move(tx));
 
     return ss::now();
 }
@@ -871,10 +873,6 @@ ss::future<> tm_stm::apply_raft_snapshot(const iobuf&) {
       });
 }
 
-tm_stm_factory::tm_stm_factory(
-  ss::sharded<features::feature_table>& feature_table)
-  : _feature_table(feature_table) {}
-
 bool tm_stm_factory::is_applicable_for(const storage::ntp_config& cfg) const {
     const auto& ntp = cfg.ntp();
     return ntp.ns == model::kafka_internal_namespace
@@ -885,8 +883,7 @@ void tm_stm_factory::create(
   raft::state_machine_manager_builder& builder,
   raft::consensus* raft,
   const cluster::stm_instance_config&) {
-    auto tm_stm = builder.create_stm<cluster::tm_stm>(
-      txlog, raft, _feature_table);
+    auto tm_stm = builder.create_stm<cluster::tm_stm>(txlog, raft);
     raft->log()->stm_manager()->add_stm(tm_stm);
 }
 

@@ -12,6 +12,8 @@
 #include "kafka/server/rm_group_frontend.h"
 #include "model/tests/randoms.h"
 #include "redpanda/tests/fixture.h"
+#include "storage/types.h"
+#include "test_utils/async.h"
 #include "test_utils/scoped_config.h"
 #include "test_utils/test.h"
 
@@ -37,10 +39,7 @@ struct group_manager_fixture
   , public seastar_test {
     ss::future<> SetUpAsync() override {
         test_cfg.get("group_topic_partitions").set_value(1);
-        co_await kafka::try_create_consumer_group_topic(
-          app.coordinator_ntp_mapper.local(),
-          app.controller->get_topics_frontend().local(),
-          1);
+        co_await app.group_initializer.local().assure_topic_exists();
         co_await wait_for_leader(offsets_ntp);
         // Wait until the partitions are registered.
         RPTEST_REQUIRE_EVENTUALLY_CORO(10s, [this] {
@@ -86,8 +85,7 @@ struct group_manager_fixture
 
     ss::future<> force_roll_group_partition_log() {
         auto log = app.storage.local().log_mgr().get(offsets_ntp);
-        co_await consumer_offsets_log()->force_roll(
-          seastar::default_priority_class());
+        co_await consumer_offsets_log()->force_roll();
     }
 
     auto group_tx_stm() {
@@ -118,10 +116,8 @@ struct group_manager_fixture
 
         RPTEST_REQUIRE_EVENTUALLY_CORO(10s, [log] {
             auto lstats = log->offsets();
-            storage::log_reader_config cfg(
-              lstats.start_offset,
-              lstats.committed_offset,
-              ss::default_priority_class());
+            auto cfg = storage::local_log_reader_config(
+              lstats.start_offset, lstats.committed_offset);
             return log->make_reader(std::move(cfg)).then([](auto reader) {
                 return std::move(reader).for_each_ref(
                   version_fence_finder{}, model::no_timeout);
@@ -212,7 +208,7 @@ struct offset_commit_op : executable_op {
 
     ss::future<> execute(group_manager_fixture* fixture) override {
         vlog(logger.trace, "Executing offset_commit_op: {}", req);
-        auto result = co_await fixture->tx_offset_commit(req);
+        auto result = co_await fixture->tx_offset_commit(std::move(req));
         ASSERT_FALSE_CORO(result.data.errored());
     }
     kafka::txn_offset_commit_request req;
@@ -288,7 +284,8 @@ random_ops generate_workload(workload_parameters params) {
               {.partition_index = model::partition_id{0},
                .committed_offset = model::offset{j}});
             offset_req.data.topics.push_back(std::move(topic_data));
-            group_ops.emplace(ss::make_shared<offset_commit_op>(offset_req));
+            group_ops.emplace(
+              ss::make_shared<offset_commit_op>(std::move(offset_req)));
 
             auto commit_group_tx
               = params.tx_workload_type == workload_parameters::commit_only
@@ -349,14 +346,16 @@ ss::future<> run_workload(
         }
         return log->apply_segment_ms().then([&] {
             return log
-              ->housekeeping(storage::housekeeping_config{
-                model::timestamp::max(),
-                std::nullopt,
-                log->stm_manager()->max_removable_local_log_offset(),
-                std::nullopt,
-                ss::default_priority_class(),
-                dummy_as,
-              })
+              ->housekeeping(
+                storage::housekeeping_config{
+                  model::timestamp::max(),
+                  std::nullopt,
+                  log->stm_manager()->max_removable_local_log_offset(),
+                  std::nullopt,
+                  std::nullopt,
+                  std::chrono::milliseconds{0},
+                  dummy_as,
+                })
               .handle_exception_type(
                 [](const storage::segment_closed_exception&) {});
         });
@@ -372,7 +371,7 @@ ss::future<> run_workload(
     vlog(logger.info, "Finished workload, validating... {}", params);
     // Wait until all segments are compacted and only two remain
     co_await log->flush();
-    co_await log->force_roll(ss::default_priority_class());
+    co_await log->force_roll();
     RPTEST_REQUIRE_EVENTUALLY_CORO(30s, [&]() {
         return housekeeping().then(
           [log]() { return log->segment_count() == 2; });
@@ -398,10 +397,8 @@ ss::future<> run_workload(
     };
 
     auto lstats = log->offsets();
-    storage::log_reader_config cfg(
-      lstats.start_offset,
-      lstats.committed_offset,
-      ss::default_priority_class());
+    auto cfg = storage::local_log_reader_config(
+      lstats.start_offset, lstats.committed_offset);
     auto reader = co_await log->make_reader(cfg);
     co_await reader.for_each_ref(batch_validator{}, model::no_timeout);
 }

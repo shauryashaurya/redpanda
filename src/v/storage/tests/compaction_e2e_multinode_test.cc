@@ -7,6 +7,7 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0
 
+#include "absl/container/btree_map.h"
 #include "base/vlog.h"
 #include "cluster/members_frontend.h"
 #include "cluster/tests/cluster_test_fixture.h"
@@ -19,11 +20,8 @@
 #include "model/timestamp.h"
 #include "storage/tests/manual_mixin.h"
 #include "test_utils/async.h"
+#include "test_utils/boost_fixture.h"
 #include "test_utils/scoped_config.h"
-
-#include <seastar/core/io_priority_class.hh>
-
-#include <absl/container/btree_map.h>
 
 using namespace tests;
 
@@ -55,6 +53,7 @@ FIXTURE_TEST(replicate_after_compaction, compaction_multinode_test) {
 
     kafka_produce_transport producer(rp->make_kafka_client().get());
     producer.start().get();
+    auto deferred_close = ss::defer([&producer] { producer.stop().get(); });
 
     // []: batch
     // {}: segment
@@ -70,7 +69,7 @@ FIXTURE_TEST(replicate_after_compaction, compaction_multinode_test) {
     auto [_, first_partition] = get_leader(ntp);
     auto first_log = first_partition->log();
     first_log->flush().get();
-    first_log->force_roll(ss::default_priority_class()).get();
+    first_log->force_roll().get();
     BOOST_REQUIRE_EQUAL(first_log->segment_count(), 2);
     ss::abort_source as;
     storage::housekeeping_config conf(
@@ -78,7 +77,8 @@ FIXTURE_TEST(replicate_after_compaction, compaction_multinode_test) {
       std::nullopt,
       first_log->stm_manager()->max_removable_local_log_offset(),
       std::nullopt,
-      ss::default_priority_class(),
+      std::nullopt,
+      std::chrono::milliseconds{0},
       as);
     first_log->housekeeping(conf).get();
 
@@ -115,10 +115,12 @@ FIXTURE_TEST(replicate_after_compaction, compaction_multinode_test) {
     // {[0 1 2 3]} {[4 5]} {[0 1 2 3 4 5]}
     kafka_produce_transport new_producer(new_rp->make_kafka_client().get());
     new_producer.start().get();
+    auto new_deferred_close = ss::defer(
+      [&new_producer] { new_producer.stop().get(); });
     new_producer.produce_to_partition(topic, pid, kv_t::sequence(0, 5)).get();
     auto new_log = new_partition->log();
     new_log->flush().get();
-    new_log->force_roll(ss::default_priority_class()).get();
+    new_log->force_roll().get();
 
     // The segments should maintain their last records.
     // {[3]} {[5]} {[0 1 2 3 4 5]}
@@ -127,7 +129,8 @@ FIXTURE_TEST(replicate_after_compaction, compaction_multinode_test) {
       std::nullopt,
       new_log->stm_manager()->max_removable_local_log_offset(),
       std::nullopt,
-      ss::default_priority_class(),
+      std::nullopt,
+      std::chrono::milliseconds{0},
       as);
     new_log->housekeeping(conf2).get();
 
@@ -190,17 +193,18 @@ FIXTURE_TEST(compact_transactions_and_replicate, compaction_multinode_test) {
 
     exec.execute(std::move(ops)).get();
     first_partition->log()->flush().get();
-    first_partition->log()->force_roll(ss::default_priority_class()).get();
+    first_partition->log()->force_roll().get();
 
     first_log->flush().get();
-    first_log->force_roll(ss::default_priority_class()).get();
+    first_log->force_roll().get();
     ss::abort_source as;
     storage::housekeeping_config conf(
       model::timestamp::min(),
       std::nullopt,
       first_log->stm_manager()->max_removable_local_log_offset(),
       std::nullopt,
-      ss::default_priority_class(),
+      std::nullopt,
+      std::chrono::milliseconds{0},
       as);
     first_log->housekeeping(conf).get();
 
@@ -222,14 +226,15 @@ FIXTURE_TEST(compact_transactions_and_replicate, compaction_multinode_test) {
 
     auto new_log = new_partition->log();
     new_log->flush().get();
-    new_log->force_roll(ss::default_priority_class()).get();
+    new_log->force_roll().get();
 
     storage::housekeeping_config conf2(
       model::timestamp::min(),
       std::nullopt,
       new_log->stm_manager()->max_removable_local_log_offset(),
       std::nullopt,
-      ss::default_priority_class(),
+      std::nullopt,
+      std::chrono::milliseconds{0},
       as);
     new_log->housekeeping(conf2).get();
     exec.validate(new_log, 2).get();

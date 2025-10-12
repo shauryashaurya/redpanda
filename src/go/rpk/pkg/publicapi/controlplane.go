@@ -17,8 +17,10 @@ import (
 	"sync"
 	"time"
 
+	"buf.build/gen/go/redpandadata/cloud/connectrpc/go/redpanda/api/byocplugin/v1alpha1/byocpluginv1alpha1connect"
 	"buf.build/gen/go/redpandadata/cloud/connectrpc/go/redpanda/api/controlplane/v1/controlplanev1connect"
 	"buf.build/gen/go/redpandadata/cloud/connectrpc/go/redpanda/api/iam/v1/iamv1connect"
+	byocpluginv1alpha1 "buf.build/gen/go/redpandadata/cloud/protocolbuffers/go/redpanda/api/byocplugin/v1alpha1"
 	controlplanev1 "buf.build/gen/go/redpandadata/cloud/protocolbuffers/go/redpanda/api/controlplane/v1"
 	iamv1 "buf.build/gen/go/redpandadata/cloud/protocolbuffers/go/redpanda/api/iam/v1"
 	"connectrpc.com/connect"
@@ -27,6 +29,7 @@ import (
 // CloudClientSet holds the respective service clients to interact with
 // the control plane endpoints of the Public API.
 type CloudClientSet struct {
+	// Controlplane
 	Region           controlplanev1connect.RegionServiceClient
 	Cluster          controlplanev1connect.ClusterServiceClient
 	Network          controlplanev1connect.NetworkServiceClient
@@ -35,6 +38,7 @@ type CloudClientSet struct {
 	Serverless       controlplanev1connect.ServerlessClusterServiceClient
 	Operations       controlplanev1connect.OperationServiceClient
 	ServerlessRegion controlplanev1connect.ServerlessRegionServiceClient
+	BYOCPlugin       byocpluginv1alpha1connect.BYOCPluginServiceClient
 
 	m         sync.RWMutex
 	authToken string
@@ -72,6 +76,7 @@ func NewCloudClientSet(host, authToken string, opts ...connect.ClientOption) *Cl
 	ccs.Serverless = controlplanev1connect.NewServerlessClusterServiceClient(httpCl, host, opts...)
 	ccs.Operations = controlplanev1connect.NewOperationServiceClient(httpCl, host, opts...)
 	ccs.ServerlessRegion = controlplanev1connect.NewServerlessRegionServiceClient(httpCl, host, opts...)
+	ccs.BYOCPlugin = byocpluginv1alpha1connect.NewBYOCPluginServiceClient(httpCl, host, opts...)
 	return ccs
 }
 
@@ -254,4 +259,28 @@ func Paginate[T any](
 	}
 
 	return nil, fmt.Errorf("pagination exceeded %d pages", maxPages)
+}
+
+func OSToBYOCPluginOS(os string) byocpluginv1alpha1.OS {
+	switch os {
+	case "linux":
+		return byocpluginv1alpha1.OS_OS_LINUX
+	case "darwin":
+		return byocpluginv1alpha1.OS_OS_DARWIN
+	case "windows":
+		return byocpluginv1alpha1.OS_OS_WINDOWS
+	default:
+		return byocpluginv1alpha1.OS_OS_UNSPECIFIED
+	}
+}
+
+func ArchToBYOCPluginArch(arch string) byocpluginv1alpha1.Arch {
+	switch arch {
+	case "amd64":
+		return byocpluginv1alpha1.Arch_ARCH_AMD64
+	case "arm64":
+		return byocpluginv1alpha1.Arch_ARCH_ARM64
+	default:
+		return byocpluginv1alpha1.Arch_ARCH_UNSPECIFIED
+	}
 }

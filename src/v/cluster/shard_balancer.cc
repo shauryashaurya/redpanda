@@ -573,7 +573,8 @@ ss::future<> shard_balancer::do_balance(mutex::units& lock) {
       [&](const model::ntp& ntp, const shard_placement_target&) {
           ntps.push_back(ntp);
       });
-    std::shuffle(ntps.begin(), ntps.end(), random_generators::internal::gen);
+    std::shuffle(
+      ntps.begin(), ntps.end(), random_generators::global().engine());
 
     ntp2target_t new_targets;
     co_await ssx::async_for_each(
@@ -597,9 +598,10 @@ ss::future<> shard_balancer::do_balance(mutex::units& lock) {
     co_await _storage.kvs().put(
       storage::kvstore::key_space::shard_placement,
       state_kvstore_key(),
-      serde::to_iobuf(persisted_state{
-        .last_rebalance_core_count = ss::smp::count,
-      }));
+      serde::to_iobuf(
+        persisted_state{
+          .last_rebalance_core_count = ss::smp::count,
+        }));
 }
 
 ss::future<> shard_balancer::set_target(

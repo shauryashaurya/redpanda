@@ -121,12 +121,12 @@ func TestParseSeeds(t *testing.T) {
 		{
 			name:           "it should fail for empty addresses",
 			arg:            []string{""},
-			expectedErrMsg: "Couldn't parse seed '': empty address",
+			expectedErrMsg: "unable to parse seed '': empty address",
 		},
 		{
 			name:           "it should fail if the host is empty",
 			arg:            []string{" :1234"},
-			expectedErrMsg: "Couldn't parse seed ' :1234': invalid host \" :1234\" does not match \"host\", nor \"host:port\", nor \"scheme://host:port\"",
+			expectedErrMsg: "unable to parse seed ' :1234': invalid host \" :1234\" does not match \"host\", nor \"host:port\", nor \"scheme://host:port\"",
 		},
 	}
 
@@ -760,13 +760,13 @@ func TestStartCommand(t *testing.T) {
 		args: []string{
 			"-s", "goodhost.com:54897,:33145",
 		},
-		expectedErrMsg: "Couldn't parse seed ':33145': invalid host \":33145\" does not match \"host\", nor \"host:port\", nor \"scheme://host:port\"",
+		expectedErrMsg: "unable to parse seed ':33145': invalid host \":33145\" does not match \"host\", nor \"host:port\", nor \"scheme://host:port\"",
 	}, {
 		name: "it should fail if the port isnt an int",
 		args: []string{
 			"-s", "host:port",
 		},
-		expectedErrMsg: "Couldn't parse seed 'host:port': invalid host \"host:port\" does not match \"host\", nor \"host:port\", nor \"scheme://host:port\"",
+		expectedErrMsg: "unable to parse seed 'host:port': invalid host \"host:port\" does not match \"host\", nor \"host:port\", nor \"scheme://host:port\"",
 	}, {
 		name: "it should parse the --rpc-addr and persist it",
 		args: []string{
@@ -1748,11 +1748,12 @@ func Test_buildRedpandaFlags(t *testing.T) {
 						ReadBandwidth:  3,
 						WriteIops:      4,
 						WriteBandwidth: 5,
+						Duplex:         true,
 					}, nil
 				},
 			},
 			exp: map[string]string{
-				"io-properties": `{"disks":[{"mountpoint":"/mnt/","read_iops":2,"read_bandwidth":3,"write_iops":4,"write_bandwidth":5}]}`,
+				"io-properties": `{"disks":[{"mountpoint":"/mnt/","read_iops":2,"read_bandwidth":3,"write_iops":4,"write_bandwidth":5,"duplex":true}]}`,
 				// These 2 are false because of the empty config
 				"overprovisioned": "false",
 				"lock-memory":     "false",

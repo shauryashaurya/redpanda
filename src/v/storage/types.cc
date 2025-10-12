@@ -9,12 +9,13 @@
 
 #include "storage/types.h"
 
+#include "base/format_to.h"
 #include "base/vlog.h"
 #include "storage/compacted_index.h"
 #include "storage/logger.h"
 #include "storage/ntp_config.h"
+#include "storage/offset_translator_state.h"
 #include "utils/human.h"
-#include "utils/to_string.h"
 
 #include <fmt/core.h>
 #include <fmt/ostream.h>
@@ -46,47 +47,25 @@ std::optional<kafka::offset> stm_manager::lowest_pinned_data_offset() const {
     return result;
 }
 
-std::ostream& operator<<(std::ostream& o, const disk& d) {
-    fmt::print(
-      o,
-      "{{path: {}, free: {}, total: {}, alert: {}, fsid: {}}}",
-      d.path,
-      human::bytes(d.free),
-      human::bytes(d.total),
-      d.alert,
-      d.fsid);
-    return o;
-}
-
-std::ostream& operator<<(std::ostream& o, const log_reader_config& cfg) {
-    o << "{start_offset:" << cfg.start_offset
-      << ", max_offset:" << cfg.max_offset << ", min_bytes:" << cfg.min_bytes
-      << ", max_bytes:" << cfg.max_bytes << ", type_filter:";
-    if (cfg.type_filter) {
-        o << *cfg.type_filter;
-    } else {
-        o << "nullopt";
-    }
-    o << ", first_timestamp:";
-    if (cfg.first_timestamp) {
-        o << *cfg.first_timestamp;
-    } else {
-        o << "nullopt";
-    }
-    o << ", bytes_consumed:" << cfg.bytes_consumed;
-    o << ", over_budget:" << cfg.over_budget;
-    o << ", strict_max_bytes:" << cfg.strict_max_bytes;
-    o << ", skip_batch_cache:" << cfg.skip_batch_cache;
-    o << ", abortable:" << cfg.abort_source.has_value();
-    o << ", aborted:"
-      << (cfg.abort_source.has_value()
-            ? cfg.abort_source.value().get().abort_requested()
-            : false);
-
-    if (cfg.client_address.has_value()) {
-        o << ", client_address:" << cfg.client_address.value();
-    }
-    return o << "}";
+fmt::iterator local_log_reader_config::format_to(fmt::iterator it) const {
+    return fmt::format_to(
+      it,
+      "start_offset:{}, max_offset:{}, max_bytes:{}, "
+      "strict_max_bytes:{}, type_filter: {}, first_timestamp:{}, "
+      "bytes_consumed:{}, over_budget:{}, skip_batch_cache:{}, "
+      "skip_readers_cache:{}, abortable:{}, client_address:{}",
+      start_offset,
+      max_offset,
+      max_bytes,
+      strict_max_bytes,
+      type_filter,
+      timestamp,
+      bytes_consumed,
+      over_budget,
+      skip_batch_cache,
+      skip_readers_cache,
+      abort_source.has_value(),
+      client_address);
 }
 
 std::ostream& operator<<(std::ostream& o, const append_result& a) {
@@ -104,8 +83,9 @@ std::ostream& operator<<(std::ostream& o, const append_result& a) {
       a.byte_size);
     return o;
 }
-std::ostream& operator<<(std::ostream& o, const timequery_result& a) {
-    return o << "{offset:" << a.offset << ", time:" << a.time << "}";
+std::ostream& operator<<(std::ostream& o, const timequery_result& r) {
+    return o << "{term:" << r.term << ", offset:" << r.offset
+             << ", time:" << r.time << "}";
 }
 std::ostream& operator<<(std::ostream& o, const timequery_config& a) {
     o << "{min_offset: " << a.min_offset << ", max_offset: " << a.max_offset
@@ -129,7 +109,9 @@ operator<<(std::ostream& o, const ntp_config::default_overrides& v) {
       "remote_delete: {}, segment_ms: {}, "
       "initial_retention_local_target_bytes: {}, "
       "initial_retention_local_target_ms: {}, write_caching: {}, flush_ms: {}, "
-      "flush_bytes: {} iceberg_mode: {}, remote_allow_gaps: {} }}",
+      "flush_bytes: {}, iceberg_mode: {}, remote_allow_gaps: {}, "
+      "delete_retention_ms: {}, min_cleanable_dirty_ratio: {}, "
+      "min_compaction_lag_ms: {}, max_compaction_lag_ms: {} }}",
       v.compaction_strategy,
       v.cleanup_policy_bitflags,
       v.segment_size,
@@ -146,7 +128,11 @@ operator<<(std::ostream& o, const ntp_config::default_overrides& v) {
       v.flush_ms,
       v.flush_bytes,
       v.iceberg_mode,
-      v.remote_allow_gaps);
+      v.remote_allow_gaps,
+      v.delete_retention_ms,
+      v.min_cleanable_dirty_ratio,
+      v.min_compaction_lag_ms,
+      v.max_compaction_lag_ms);
 
     if (config::shard_local_cfg().development_enable_cloud_topics()) {
         fmt::print(o, ", cloud_topic_enabled: {}", v.cloud_topic_enabled);
@@ -216,18 +202,6 @@ std::ostream& operator<<(std::ostream& os, const gc_config& cfg) {
       cfg.eviction_time,
       cfg.max_bytes.value_or(-1));
     return os;
-}
-
-std::ostream& operator<<(std::ostream& o, const compaction_config& c) {
-    fmt::print(
-      o,
-      "{{max_removable_local_log_offset:{}, "
-      "should_sanitize:{}, "
-      "tombstone_retention_ms:{}}}",
-      c.max_removable_local_log_offset,
-      c.sanitizer_config,
-      c.tombstone_retention_ms);
-    return o;
 }
 
 std::ostream& operator<<(std::ostream& os, const housekeeping_config& cfg) {

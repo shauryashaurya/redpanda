@@ -26,7 +26,106 @@ using namespace std::chrono_literals;
 
 namespace kafka {
 
-static bool config_property_requested(
+model::compression metadata_cache_adapter::get_default_compression() const {
+    return _metadata_cache.get_default_compression();
+}
+model::cleanup_policy_bitflags
+metadata_cache_adapter::get_default_cleanup_policy_bitflags() const {
+    return _metadata_cache.get_default_cleanup_policy_bitflags();
+}
+size_t
+metadata_cache_adapter::get_default_compacted_topic_segment_size() const {
+    return _metadata_cache.get_default_compacted_topic_segment_size();
+}
+size_t metadata_cache_adapter::get_default_segment_size() const {
+    return _metadata_cache.get_default_segment_size();
+}
+std::optional<std::chrono::milliseconds>
+metadata_cache_adapter::get_default_retention_duration() const {
+    return _metadata_cache.get_default_retention_duration();
+}
+std::optional<size_t>
+metadata_cache_adapter::get_default_retention_bytes() const {
+    return _metadata_cache.get_default_retention_bytes();
+}
+model::timestamp_type
+metadata_cache_adapter::get_default_timestamp_type() const {
+    return _metadata_cache.get_default_timestamp_type();
+}
+uint32_t metadata_cache_adapter::get_default_batch_max_bytes() const {
+    return _metadata_cache.get_default_batch_max_bytes();
+}
+model::shadow_indexing_mode
+metadata_cache_adapter::get_default_shadow_indexing_mode() const {
+    return _metadata_cache.get_default_shadow_indexing_mode();
+}
+std::optional<size_t>
+metadata_cache_adapter::get_default_retention_local_target_bytes() const {
+    return _metadata_cache.get_default_retention_local_target_bytes();
+}
+std::chrono::milliseconds
+metadata_cache_adapter::get_default_retention_local_target_ms() const {
+    return _metadata_cache.get_default_retention_local_target_ms();
+}
+std::optional<std::chrono::milliseconds>
+metadata_cache_adapter::get_default_segment_ms() const {
+    return _metadata_cache.get_default_segment_ms();
+}
+std::optional<std::chrono::milliseconds>
+metadata_cache_adapter::get_default_delete_retention_ms() const {
+    return _metadata_cache.get_default_delete_retention_ms();
+}
+bool metadata_cache_adapter::get_default_record_key_schema_id_validation()
+  const {
+    return _metadata_cache.get_default_record_key_schema_id_validation();
+}
+pandaproxy::schema_registry::subject_name_strategy
+metadata_cache_adapter::get_default_record_key_subject_name_strategy() const {
+    return _metadata_cache.get_default_record_key_subject_name_strategy();
+}
+bool metadata_cache_adapter::get_default_record_value_schema_id_validation()
+  const {
+    return _metadata_cache.get_default_record_value_schema_id_validation();
+}
+pandaproxy::schema_registry::subject_name_strategy
+metadata_cache_adapter::get_default_record_value_subject_name_strategy() const {
+    return _metadata_cache.get_default_record_value_subject_name_strategy();
+}
+std::optional<size_t>
+metadata_cache_adapter::get_default_initial_retention_local_target_bytes()
+  const {
+    return _metadata_cache.get_default_initial_retention_local_target_bytes();
+}
+std::optional<std::chrono::milliseconds>
+metadata_cache_adapter::get_default_initial_retention_local_target_ms() const {
+    return _metadata_cache.get_default_initial_retention_local_target_ms();
+}
+std::chrono::milliseconds
+metadata_cache_adapter::get_default_iceberg_target_lag_ms() const {
+    return _metadata_cache.get_default_iceberg_target_lag_ms();
+}
+std::optional<double>
+metadata_cache_adapter::get_default_min_cleanable_dirty_ratio() const {
+    return _metadata_cache.get_default_min_cleanable_dirty_ratio();
+}
+std::chrono::milliseconds
+metadata_cache_adapter::get_default_min_compaction_lag_ms() const {
+    return _metadata_cache.get_default_min_compaction_lag_ms();
+}
+std::chrono::milliseconds
+metadata_cache_adapter::get_default_max_compaction_lag_ms() const {
+    return _metadata_cache.get_default_max_compaction_lag_ms();
+}
+std::chrono::milliseconds
+metadata_cache_adapter::get_default_message_timestamp_before_max_ms() const {
+    return _metadata_cache.get_default_message_timestamp_before_max_ms();
+}
+std::chrono::milliseconds
+metadata_cache_adapter::get_default_message_timestamp_after_max_ms() const {
+    return _metadata_cache.get_default_message_timestamp_after_max_ms();
+}
+
+bool config_property_requested(
   const config_key_t& configuration_keys,
   const std::string_view property_name) {
     return !configuration_keys.has_value()
@@ -141,34 +240,37 @@ static void add_broker_config(
          * If value was overriden, include override
          */
         if (src == describe_configs_source::static_broker_config) {
-            synonyms.push_back(describe_configs_synonym{
-              .name = ss::sstring(property.name()),
-              .value = describe_f(property.value()),
-              .source = static_cast<int8_t>(
-                describe_configs_source::static_broker_config),
-            });
+            synonyms.push_back(
+              describe_configs_synonym{
+                .name = ss::sstring(property.name()),
+                .value = describe_f(property.value()),
+                .source = static_cast<int8_t>(
+                  describe_configs_source::static_broker_config),
+              });
         }
         /**
          * If property is required it has no default
          */
         if (!property.is_required()) {
-            synonyms.push_back(describe_configs_synonym{
-              .name = ss::sstring(property.name()),
-              .value = describe_f(property.default_value()),
-              .source = static_cast<int8_t>(
-                describe_configs_source::default_config),
-            });
+            synonyms.push_back(
+              describe_configs_synonym{
+                .name = ss::sstring(property.name()),
+                .value = describe_f(property.default_value()),
+                .source = static_cast<int8_t>(
+                  describe_configs_source::default_config),
+              });
         }
     }
 
-    result.push_back(config_response{
-      .name = ss::sstring(name),
-      .value = describe_f(property.value()),
-      .config_source = src,
-      .synonyms = std::move(synonyms),
-      .config_type = property_config_type<T>(),
-      .documentation = documentation,
-    });
+    result.push_back(
+      config_response{
+        .name = ss::sstring(name),
+        .value = describe_f(property.value()),
+        .config_source = src,
+        .synonyms = std::move(synonyms),
+        .config_type = property_config_type<T>(),
+        .documentation = documentation,
+      });
 }
 
 template<typename T, typename Func>
@@ -209,28 +311,31 @@ static void add_topic_config(
     if (include_synonyms) {
         synonyms.reserve(2);
         if (overrides) {
-            synonyms.push_back(describe_configs_synonym{
-              .name = ss::sstring(override_name),
-              .value = describe_f(*overrides),
-              .source = static_cast<int8_t>(describe_configs_source::topic),
-            });
+            synonyms.push_back(
+              describe_configs_synonym{
+                .name = ss::sstring(override_name),
+                .value = describe_f(*overrides),
+                .source = static_cast<int8_t>(describe_configs_source::topic),
+              });
         }
-        synonyms.push_back(describe_configs_synonym{
-          .name = ss::sstring(default_name),
-          .value = describe_f(default_value),
-          .source = static_cast<int8_t>(
-            describe_configs_source::default_config),
-        });
+        synonyms.push_back(
+          describe_configs_synonym{
+            .name = ss::sstring(default_name),
+            .value = describe_f(default_value),
+            .source = static_cast<int8_t>(
+              describe_configs_source::default_config),
+          });
     }
 
-    result.push_back(config_response{
-      .name = ss::sstring(override_name),
-      .value = describe_f(overrides.value_or(default_value)),
-      .config_source = src,
-      .synonyms = std::move(synonyms),
-      .config_type = property_config_type<T>(),
-      .documentation = documentation,
-    });
+    result.push_back(
+      config_response{
+        .name = ss::sstring(override_name),
+        .value = describe_f(overrides.value_or(default_value)),
+        .config_source = src,
+        .synonyms = std::move(synonyms),
+        .config_type = property_config_type<T>(),
+        .documentation = documentation,
+      });
 }
 /**
  * Special overload for topic configuration which does not have the default per
@@ -252,28 +357,31 @@ static void add_topic_config(
     if (include_synonyms) {
         synonyms.reserve(2);
         if (overrides) {
-            synonyms.push_back(describe_configs_synonym{
-              .name = ss::sstring(override_name),
-              .value = describe_f(*overrides),
-              .source = static_cast<int8_t>(describe_configs_source::topic),
-            });
+            synonyms.push_back(
+              describe_configs_synonym{
+                .name = ss::sstring(override_name),
+                .value = describe_f(*overrides),
+                .source = static_cast<int8_t>(describe_configs_source::topic),
+              });
         }
-        synonyms.push_back(describe_configs_synonym{
-          .name = ss::sstring(override_name),
-          .value = std::nullopt,
-          .source = static_cast<int8_t>(
-            describe_configs_source::default_config),
-        });
+        synonyms.push_back(
+          describe_configs_synonym{
+            .name = ss::sstring(override_name),
+            .value = std::nullopt,
+            .source = static_cast<int8_t>(
+              describe_configs_source::default_config),
+          });
     }
 
-    result.push_back(config_response{
-      .name = ss::sstring(override_name),
-      .value = describe_f(overrides),
-      .config_source = src,
-      .synonyms = std::move(synonyms),
-      .config_type = property_config_type<T>(),
-      .documentation = documentation,
-    });
+    result.push_back(
+      config_response{
+        .name = ss::sstring(override_name),
+        .value = describe_f(overrides),
+        .config_source = src,
+        .synonyms = std::move(synonyms),
+        .config_type = property_config_type<T>(),
+        .documentation = documentation,
+      });
 }
 
 /**
@@ -487,7 +595,7 @@ static inline std::optional<ss::sstring> maybe_make_documentation(
 }
 
 config_response_container_t make_topic_configs(
-  const cluster::metadata_cache& metadata_cache,
+  const metadata_cache_info& metadata_cache,
   const cluster::topic_properties& topic_properties,
   const config_key_t& config_keys,
   bool include_synonyms,
@@ -1034,6 +1142,32 @@ config_response_container_t make_topic_configs(
     add_topic_config_if_requested(
       config_keys,
       result,
+      topic_property_min_compaction_lag_ms,
+      metadata_cache.get_default_min_compaction_lag_ms(),
+      topic_property_min_compaction_lag_ms,
+      topic_properties.min_compaction_lag_ms,
+      include_synonyms,
+      maybe_make_documentation(
+        include_documentation,
+        config::shard_local_cfg().min_compaction_lag_ms.desc()),
+      describe_as_string<std::chrono::milliseconds>);
+
+    add_topic_config_if_requested(
+      config_keys,
+      result,
+      topic_property_max_compaction_lag_ms,
+      metadata_cache.get_default_max_compaction_lag_ms(),
+      topic_property_max_compaction_lag_ms,
+      topic_properties.max_compaction_lag_ms,
+      include_synonyms,
+      maybe_make_documentation(
+        include_documentation,
+        config::shard_local_cfg().max_compaction_lag_ms.desc()),
+      describe_as_string<std::chrono::milliseconds>);
+
+    add_topic_config_if_requested(
+      config_keys,
+      result,
       config::shard_local_cfg().cloud_storage_enable_remote_allow_gaps.name(),
       config::shard_local_cfg().cloud_storage_enable_remote_allow_gaps(),
       topic_property_remote_allow_gaps,
@@ -1044,6 +1178,32 @@ config_response_container_t make_topic_configs(
         config::shard_local_cfg()
           .cloud_storage_enable_remote_allow_gaps.desc()),
       &describe_as_string<bool>);
+
+    add_topic_config_if_requested(
+      config_keys,
+      result,
+      topic_property_message_timestamp_before_max_ms,
+      metadata_cache.get_default_message_timestamp_before_max_ms(),
+      topic_property_message_timestamp_before_max_ms,
+      topic_properties.message_timestamp_before_max_ms,
+      include_synonyms,
+      maybe_make_documentation(
+        include_documentation,
+        config::shard_local_cfg().log_message_timestamp_before_max_ms.desc()),
+      describe_as_string<std::chrono::milliseconds>);
+
+    add_topic_config_if_requested(
+      config_keys,
+      result,
+      topic_property_message_timestamp_after_max_ms,
+      metadata_cache.get_default_message_timestamp_after_max_ms(),
+      topic_property_message_timestamp_after_max_ms,
+      topic_properties.message_timestamp_after_max_ms,
+      include_synonyms,
+      maybe_make_documentation(
+        include_documentation,
+        config::shard_local_cfg().log_message_timestamp_after_max_ms.desc()),
+      describe_as_string<std::chrono::milliseconds>);
 
     return result;
 }

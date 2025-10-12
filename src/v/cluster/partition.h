@@ -12,6 +12,7 @@
 #pragma once
 
 #include "cloud_storage/fwd.h"
+#include "cloud_topics/level_zero/stm/ctp_stm.h"
 #include "cluster/archival/archival_metadata_stm.h"
 #include "cluster/archival/fwd.h"
 #include "cluster/fwd.h"
@@ -26,13 +27,12 @@
 #include "storage/translating_reader.h"
 #include "storage/types.h"
 #include "utils/notification_list.h"
-#include "utils/rwlock.h"
 
 #include <seastar/core/shared_ptr.hh>
 
-namespace experimental::cloud_topics {
-class dl_stm_api;
-};
+namespace cloud_topics {
+class state_accessors;
+}; // namespace cloud_topics
 
 namespace cluster {
 class partition_manager;
@@ -52,12 +52,12 @@ public:
     partition(
       consensus_ptr r,
       ss::sharded<cloud_storage::remote>&,
-      ss::sharded<cloud_storage::cache>&,
+      ss::sharded<cloud_io::cache>&,
       ss::lw_shared_ptr<const archival::configuration>,
       ss::sharded<features::feature_table>&,
       ss::sharded<archival::upload_housekeeping_service>&,
-      std::optional<cloud_storage_clients::bucket_name> read_replica_bucket
-      = std::nullopt);
+      std::optional<cloud_storage_clients::bucket_name> read_replica_bucket,
+      ss::sharded<cloud_topics::state_accessors>* ct_state);
 
     ~partition() = default;
 
@@ -100,8 +100,8 @@ public:
      * the minimum of the max offset requested and the committed index of the
      * underlying raft group.
      */
-    ss::future<model::record_batch_reader> make_reader(
-      storage::log_reader_config config,
+    ss::future<model::record_batch_reader> make_local_reader(
+      storage::local_log_reader_config config,
       std::optional<model::timeout_clock::time_point> debounce_deadline
       = std::nullopt);
     ss::future<result<model::offset, std::error_code>>
@@ -215,8 +215,6 @@ public:
 
     ss::shared_ptr<cluster::rm_stm> rm_stm();
 
-    ss::shared_ptr<experimental::cloud_topics::dl_stm_api> dl_stm_api();
-
     size_t size_bytes() const;
 
     size_t reclaimable_size_bytes() const;
@@ -228,7 +226,7 @@ public:
     const storage::ntp_config& get_ntp_config() const;
     ss::shared_ptr<cluster::tm_stm> tm_stm();
 
-    ss::future<fragmented_vector<model::tx_range>>
+    ss::future<chunked_vector<model::tx_range>>
     aborted_transactions(model::offset from, model::offset to);
 
     ss::future<std::vector<model::tx_range>>
@@ -271,7 +269,7 @@ public:
 
     /// Create a reader that will fetch data from remote storage
     ss::future<storage::translating_reader> make_cloud_reader(
-      storage::log_reader_config config,
+      cloud_storage::cloud_log_reader_config config,
       std::optional<model::timeout_clock::time_point> deadline = std::nullopt);
 
     std::optional<model::offset> kafka_start_offset_override() const;
@@ -397,9 +395,19 @@ public:
     bool started() const noexcept { return _started; }
     void mark_started() noexcept { _started = true; }
 
-private:
-    ss::future<result<ssx::rwlock_unit>> hold_writes_enabled();
+    // Acquire a shared lock for producing to the partition.
+    ss::future<result<ss::rwlock::holder>> hold_writes_enabled();
 
+    // Returns a pointer to cloud topics state accessors if available on the
+    // cluster, or nullptr otherwise.
+    ss::sharded<cloud_topics::state_accessors>*
+    get_cloud_topics_state() noexcept;
+
+    // If this is a cloud topics partition then the max GC eligible epoch (if
+    // any) is returned.
+    std::optional<int64_t> cloud_topic_max_gc_eligible_epoch() const;
+
+private:
     ss::future<>
     replicate_unsafe_reset(cloud_storage::partition_manifest manifest);
 
@@ -424,13 +432,14 @@ private:
     ss::shared_ptr<cluster::rm_stm> _rm_stm;
     ss::shared_ptr<archival_metadata_stm> _archival_meta_stm;
     ss::shared_ptr<partition_properties_stm> _partition_properties_stm;
-    ss::shared_ptr<experimental::cloud_topics::dl_stm_api> _dl_stm_api;
+    ss::sharded<cloud_topics::state_accessors>* _cloud_topics_state;
+    ss::shared_ptr<cloud_topics::ctp_stm> _ctp_stm;
     ss::abort_source _as;
     partition_probe _probe;
     ss::sharded<features::feature_table>& _feature_table;
     ss::lw_shared_ptr<const archival::configuration> _archival_conf;
     ss::sharded<cloud_storage::remote>& _cloud_storage_api;
-    ss::sharded<cloud_storage::cache>& _cloud_storage_cache;
+    ss::sharded<cloud_io::cache>& _cloud_storage_cache;
     ss::shared_ptr<cloud_storage::partition_probe> _cloud_storage_probe;
     ss::shared_ptr<cloud_storage::async_manifest_view>
       _cloud_storage_manifest_view;
@@ -443,7 +452,6 @@ private:
 
     std::optional<cloud_storage_clients::bucket_name> _read_replica_bucket{
       std::nullopt};
-    bool _remote_delete_enabled{storage::ntp_config::default_remote_delete};
 
     // Populated for partition 0 only, used by cloud storage uploads
     // to generate topic manifests.
@@ -458,7 +466,7 @@ private:
 
     // acquire shared ("read") for produce,
     // exclusive ("write") for enabling/disabling writes
-    ssx::rwlock _produce_lock;
+    ss::rwlock _produce_lock;
 
     notification_list<flush_hook, partition_flush_hook_id> _flush_hooks;
     partition_flush_hook_id _archiver_flush_subscription

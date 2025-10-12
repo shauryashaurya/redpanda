@@ -38,6 +38,8 @@
 #include "raft/timeout_jitter.h"
 #include "raft/transfer_leadership.h"
 #include "raft/types.h"
+#include "raft/voter_priority_tracker.h"
+#include "ssx/condition_variable.h"
 #include "ssx/semaphore.h"
 #include "storage/log.h"
 #include "storage/snapshot.h"
@@ -92,6 +94,8 @@ public:
     };
     enum class vote_state { follower, candidate, leader };
     using leader_cb_t = ss::noncopyable_function<void(leadership_status)>;
+    using remake_cb_t
+      = ss::noncopyable_function<ss::future<std::error_code>(group_id)>;
 
     consensus(
       model::node_id,
@@ -103,13 +107,14 @@ public:
       config::binding<std::chrono::milliseconds> disk_timeout,
       config::binding<bool> enable_longest_log_detection,
       consensus_client_protocol,
+      remake_cb_t,
       leader_cb_t,
       storage::api&,
       std::optional<std::reference_wrapper<coordinated_recovery_throttle>>,
       recovery_memory_quota&,
       recovery_scheduler&,
       features::feature_table&,
-      std::optional<voter_priority> = std::nullopt,
+      bool is_ready_for_leader_election = true,
       keep_snapshotted_log = keep_snapshotted_log::no);
 
     /// Initial call. Allow for internal state recovery
@@ -179,6 +184,10 @@ public:
     // previous term are behind committed index
     bool is_leader() const {
         return is_elected_leader() && _term == _confirmed_term;
+    }
+    // If this node is not yet a voter, it is a learner.
+    bool is_learner() const {
+        return !_configuration_manager.get_latest().is_voter(_self);
     }
     bool is_candidate() const { return _vstate == vote_state::candidate; }
     std::optional<model::node_id> get_leader_id() const {
@@ -291,7 +300,7 @@ public:
     replicate_stages replicate_in_stages(
       model::term_id, model::record_batch, replicate_options);
     ss::future<model::record_batch_reader> make_reader(
-      storage::log_reader_config,
+      storage::local_log_reader_config,
       std::optional<clock_type::time_point> = std::nullopt);
 
     model::offset get_latest_configuration_offset() const;
@@ -348,8 +357,9 @@ public:
             if (term > _term) {
                 _term = term;
                 _voted_for = {};
-                do_step_down(fmt::format(
-                  "external_stepdown with term {} - {}", term, ctx));
+                do_step_down(
+                  fmt::format(
+                    "external_stepdown with term {} - {}", term, ctx));
             }
         });
     }
@@ -385,7 +395,7 @@ public:
 
     model::offset dirty_offset() const { return _log->offsets().dirty_offset; }
 
-    ss::condition_variable& commit_index_updated() {
+    ssx::condition_variable& commit_index_updated() {
         return _commit_index_updated;
     }
 
@@ -416,6 +426,8 @@ public:
     ss::future<> write_last_applied(model::offset);
 
     model::offset read_last_applied() const;
+
+    ss::future<> truncate_state(model::offset);
 
     probe& get_probe() { return *_probe; };
 
@@ -482,22 +494,21 @@ public:
      * Prevent the current node from becoming a leader for this group. If the
      * node is the leader then this only takes affect if leadership is lost.
      */
-    void block_new_leadership() {
-        _node_priority_override = raft::zero_voter_priority;
-    }
+    void block_new_leadership() { _priority_tracker.set_min_voter_priority(); }
 
     /**
      * Resets node priority only if it was not blocked
      */
-    void reset_node_priority() {
-        if (_node_priority_override == raft::min_voter_priority) {
-            unblock_new_leadership();
-        }
+    void mark_ready_for_leader_election() {
+        _priority_tracker.mark_ready_for_leader_election();
     }
+
     /*
      * Allow the current node to become a leader for this group.
      */
-    void unblock_new_leadership() { _node_priority_override.reset(); }
+    void unblock_new_leadership() {
+        _priority_tracker.reset_voter_priority_override();
+    }
 
     const follower_stats& get_follower_stats() const { return _fstats; }
 
@@ -550,6 +561,17 @@ public:
           "toggle_append_entries_error_injection block={}",
           inject_error);
         _inject_error_in_append_entries = inject_error;
+    }
+
+    // Function invoked on leader side to clear state on learner node.
+    ss::future<remake_learner_state_reply> remake_learner_state(vnode target);
+
+    // Function invoked on learner side to clear local state.
+    ss::future<remake_learner_state_reply>
+      do_remake_learner_state(remake_learner_state_request);
+
+    const configuration_manager& config_manager() const {
+        return _configuration_manager;
     }
 
 private:
@@ -689,7 +711,7 @@ private:
     void maybe_promote_to_voter(vnode);
 
     ss::future<model::record_batch_reader>
-      do_make_reader(storage::log_reader_config);
+      do_make_reader(storage::local_log_reader_config);
 
     bytes last_applied_key() const {
         return raft::details::serialize_group_key(
@@ -699,9 +721,6 @@ private:
     void maybe_update_last_visible_index(model::offset);
     void maybe_update_majority_replicated_index();
     void do_update_majority_replicated_index(model::offset new_value);
-
-    voter_priority next_target_priority();
-    voter_priority get_node_priority(vnode) const;
 
     template<typename Reply>
     result<Reply> validate_reply_target_node(
@@ -810,6 +829,8 @@ private:
 
     std::optional<model::offset>
       adjust_learner_initial_offset(std::optional<model::offset>);
+
+    const std::vector<vnode>& all_replicas() const;
     // args
     vnode _self;
     raft::group_id _group;
@@ -819,6 +840,7 @@ private:
     config::binding<std::chrono::milliseconds> _disk_timeout;
     config::binding<bool> _enable_longest_log_detection;
     consensus_client_protocol _client_protocol;
+    remake_cb_t _remake_notification;
     leader_cb_t _leader_notification;
 
     // consensus state
@@ -889,7 +911,7 @@ private:
     event_manager _event_manager;
     std::unique_ptr<probe> _probe;
     mutable ctx_log _ctxlog;
-    ss::condition_variable _commit_index_updated;
+    ssx::condition_variable _commit_index_updated;
 
     std::chrono::milliseconds _replicate_append_timeout;
     std::chrono::milliseconds _recovery_append_timeout;
@@ -910,8 +932,7 @@ private:
     configuration_manager _configuration_manager;
     model::offset _majority_replicated_index;
     model::offset _visibility_upper_bound_index;
-    voter_priority _target_priority = voter_priority::max();
-    std::optional<voter_priority> _node_priority_override;
+    voter_priority_tracker _priority_tracker;
     keep_snapshotted_log _keep_snapshotted_log;
 
     // used to track currently installed snapshot

@@ -11,6 +11,9 @@
 
 #include "pandaproxy/schema_registry/json.h"
 
+#include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
+#include "absl/container/inlined_vector.h"
 #include "json/chunked_buffer.h"
 #include "json/chunked_input_stream.h"
 #include "json/document.h"
@@ -22,6 +25,7 @@
 #include "pandaproxy/schema_registry/errors.h"
 #include "pandaproxy/schema_registry/sharded_store.h"
 #include "pandaproxy/schema_registry/types.h"
+#include "re2/re2.h"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/shared_ptr.hh>
@@ -30,9 +34,6 @@
 #include <seastar/util/defer.hh>
 #include <seastar/util/variant_utils.hh>
 
-#include <absl/container/flat_hash_map.h>
-#include <absl/container/flat_hash_set.h>
-#include <absl/container/inlined_vector.h>
 #include <boost/graph/adjacency_list.hpp>
 #include <boost/graph/max_cardinality_matching.hpp>
 #include <boost/math/special_functions/ulp.hpp>
@@ -47,7 +48,6 @@
 #include <jsoncons_ext/jsonschema/json_schema_factory.hpp>
 #include <jsoncons_ext/jsonschema/jsonschema.hpp>
 #include <rapidjson/error/en.h>
-#include <re2/re2.h>
 
 #include <exception>
 #include <filesystem>
@@ -187,6 +187,10 @@ struct json_schema_definition::impl {
     ss::sstring name;
     schema_definition::references refs;
 };
+
+const json::Document& document(const json_schema_definition::impl& impl) {
+    return impl.ctx.doc;
+}
 
 bool operator==(
   const json_schema_definition& lhs, const json_schema_definition& rhs) {
@@ -542,9 +546,10 @@ constexpr auto parse_json_type(const json::Value& v) {
     auto sv = as_string_view(v);
     auto type = from_string_view(sv);
     if (!type) {
-        throw as_exception(error_info{
-          error_code::schema_invalid,
-          fmt::format("Invalid JSON Schema type: '{}'", sv)});
+        throw as_exception(
+          error_info{
+            error_code::schema_invalid,
+            fmt::format("Invalid JSON Schema type: '{}'", sv)});
     }
     return *type;
 }
@@ -747,13 +752,14 @@ json::Pointer to_json_pointer(std::string_view sv) {
     auto candidate = json::Pointer{sv.data(), sv.size()};
     if (auto ec = candidate.GetParseErrorCode();
         ec != rapidjson::kPointerParseErrorNone) {
-        throw as_exception(error_info{
-          error_code::schema_invalid,
-          fmt::format(
-            "invalid fragment '{}' error {} at {}",
-            sv,
-            ec,
-            candidate.GetParseErrorOffset())});
+        throw as_exception(
+          error_info{
+            error_code::schema_invalid,
+            fmt::format(
+              "invalid fragment '{}' error {} at {}",
+              sv,
+              ec,
+              candidate.GetParseErrorOffset())});
     }
 
     return candidate;
@@ -766,13 +772,14 @@ resolve_pointer(const json::Pointer& p, const json::Value& root) {
     auto unresolved_token = size_t{0};
     auto* value = p.Get(root, &unresolved_token);
     if (value == nullptr) {
-        throw as_exception(error_info{
-          error_code::schema_invalid,
-          fmt::format(
-            "object not found for pointer '{}' unresolved token at index "
-            "{}",
-            pjp{p},
-            unresolved_token)});
+        throw as_exception(
+          error_info{
+            error_code::schema_invalid,
+            fmt::format(
+              "object not found for pointer '{}' unresolved token at index "
+              "{}",
+              pjp{p},
+              unresolved_token)});
     }
 
     return *value;
@@ -806,9 +813,10 @@ resolve_reference(schema_context& ctx, const json::Value& candidate) {
         auto* lookup_p = ctx.find_bundled(id_uri);
         if (lookup_p == nullptr) {
             // TODO use a better error code
-            throw as_exception(error_info{
-              error_code::schema_invalid,
-              fmt::format("schema pointer not found for uri '{}'", id_uri)});
+            throw as_exception(
+              error_info{
+                error_code::schema_invalid,
+                fmt::format("schema pointer not found for uri '{}'", id_uri)});
         }
         const auto& [schema_pointer, dialect] = *lookup_p;
 
@@ -832,16 +840,19 @@ resolve_reference(schema_context& ctx, const json::Value& candidate) {
             // this requirement could be relaxed but it requires to keep track
             // of the dialect for each json::Value
             if (dialect != ctx.dialect()) {
-                throw as_exception(error_info{
-                  error_code::schema_invalid,
-                  fmt::format("schema dialect mismatch for uri '{}'", id_uri)});
+                throw as_exception(
+                  error_info{
+                    error_code::schema_invalid,
+                    fmt::format(
+                      "schema dialect mismatch for uri '{}'", id_uri)});
             }
 
             return merge_references(references_objects);
         }
     }
-    throw std::runtime_error(fmt::format(
-      "max traversals reached for uri {} '{}'", id_uri, pjp{fragment_p}));
+    throw std::runtime_error(
+      fmt::format(
+        "max traversals reached for uri {} '{}'", id_uri, pjp{fragment_p}));
 }
 
 // helper to convert a boolean to a schema, and to traverse $refs
@@ -855,10 +866,11 @@ json_const_object get_schema(schema_context& ctx, const json::Value& v) {
         // {}/{"not":{}}
         return v.GetBool() ? get_true_schema() : get_false_schema();
     }
-    throw as_exception(error_info{
-      error_code::schema_invalid,
-      fmt::format(
-        "Invalid JSON Schema, should be object or boolean: '{}'", pj{v})});
+    throw as_exception(
+      error_info{
+        error_code::schema_invalid,
+        fmt::format(
+          "Invalid JSON Schema, should be object or boolean: '{}'", pj{v})});
 }
 
 // helper to retrieve the object value for a key, or an empty object if the key
@@ -880,10 +892,11 @@ get_object_or_empty(const json::Value& v, std::string_view key) {
         // {}/{"not":{}}
         return it->value.GetBool() ? get_true_schema() : get_false_schema();
     }
-    throw as_exception(error_info{
-      error_code::schema_invalid,
-      fmt::format(
-        "Invalid JSON Schema, should be object or boolean: '{}'", pj{v})});
+    throw as_exception(
+      error_info{
+        error_code::schema_invalid,
+        fmt::format(
+          "Invalid JSON Schema, should be object or boolean: '{}'", pj{v})});
 }
 
 // helper to retrieve the array value for a key, or an empty array if the key
@@ -971,12 +984,13 @@ json_compatibility_result is_numeric_property_value_superset(
         // representation. this cannot be caught with this, and it would require
         // some sort of decimal type
         if (!it->value.IsLosslessDouble()) {
-            throw as_exception(invalid_schema(fmt::format(
-              R"(is_numeric_property_value_superset-{} not implemented for type {}. input: older: '{}', newer: '{}')",
-              prop_name,
-              it->value.GetType(),
-              pj{older},
-              pj{newer})));
+            throw as_exception(invalid_schema(
+              fmt::format(
+                R"(is_numeric_property_value_superset-{} not implemented for type {}. input: older: '{}', newer: '{}')",
+                prop_name,
+                it->value.GetType(),
+                pj{older},
+                pj{newer})));
         }
 
         return it->value.GetDouble();
@@ -1231,8 +1245,9 @@ json_compatibility_result is_numeric_superset(
         json_compatibility_result added_err) -> json_compatibility_result {
         auto get_value = [=](const json::Value& v)
           -> std::variant<std::monostate, bool, double> {
-            auto it = v.FindMember(json::Value{
-              prop_name.data(), rapidjson::SizeType(prop_name.size())});
+            auto it = v.FindMember(
+              json::Value{
+                prop_name.data(), rapidjson::SizeType(prop_name.size())});
             if (it == v.MemberEnd()) {
                 return std::monostate{};
             }
@@ -1243,10 +1258,11 @@ json_compatibility_result is_numeric_superset(
                 return it->value.GetDouble();
             }
             // v could not be decodes as a double, likely a malformed json
-            throw as_exception(invalid_schema(fmt::format(
-              R"(is_numeric_superset-{} not implemented for types other than "boolean" and "number". input: '{}')",
-              prop_name,
-              pj{v})));
+            throw as_exception(invalid_schema(
+              fmt::format(
+                R"(is_numeric_superset-{} not implemented for types other than "boolean" and "number". input: '{}')",
+                prop_name,
+                pj{v})));
         };
 
         return std::visit(
@@ -1281,11 +1297,12 @@ json_compatibility_result is_numeric_superset(
                 return json_compatibility_result{};
             },
             [&](auto, auto) -> json_compatibility_result {
-                throw as_exception(invalid_schema(fmt::format(
-                  R"(is_numeric_superset-{} not implemented for mixed types: older: '{}', newer: '{}')",
-                  prop_name,
-                  pj{older},
-                  pj{newer})));
+                throw as_exception(invalid_schema(
+                  fmt::format(
+                    R"(is_numeric_superset-{} not implemented for mixed types: older: '{}', newer: '{}')",
+                    prop_name,
+                    pj{older},
+                    pj{newer})));
             }),
           get_value(older),
           get_value(newer));
@@ -1731,10 +1748,11 @@ json_compatibility_result is_object_dependencies_superset(
             }
             return;
         } else {
-            throw as_exception(invalid_schema(fmt::format(
-              "dependencies can only be an array or an object for valid "
-              "schemas but it was: {}",
-              pj{o})));
+            throw as_exception(invalid_schema(
+              fmt::format(
+                "dependencies can only be an array or an object for valid "
+                "schemas but it was: {}",
+                pj{o})));
         }
     });
 
@@ -2252,9 +2270,10 @@ void collect_bundled_schemas_and_fix_refs(
     if (!maybe_new_dialect.has_value()) {
         // stop scanning this tree, we might be in a bundled schema but we
         // don't know the dialect.
-        throw as_exception(invalid_schema(fmt::format(
-          "bundled schema without a known dialect: '{}'",
-          this_obj["$schema"].as_string_view())));
+        throw as_exception(invalid_schema(
+          fmt::format(
+            "bundled schema without a known dialect: '{}'",
+            this_obj["$schema"].as_string_view())));
     }
 
     const auto id_it = this_obj.find(id_keyword(maybe_new_dialect.value()));
@@ -2267,9 +2286,10 @@ void collect_bundled_schemas_and_fix_refs(
               maybe_new_dialect.value(), this_obj);
             validation.has_error()) {
             // stop exploring this branch, the schema is invalid
-            throw as_exception(invalid_schema(fmt::format(
-              "bundled schema is invalid. {}",
-              validation.assume_error().message())));
+            throw as_exception(invalid_schema(
+              fmt::format(
+                "bundled schema is invalid. {}",
+                validation.assume_error().message())));
         }
 
         // it's a validated schema. we can register this as a bundled schema and

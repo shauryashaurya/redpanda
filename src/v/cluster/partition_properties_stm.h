@@ -12,7 +12,7 @@
 #pragma once
 
 #include "cluster/state_machine_registry.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "model/fundamental.h"
 #include "raft/persisted_stm.h"
 #include "serde/envelope.h"
@@ -34,7 +34,7 @@ public:
       storage::kvstore& kvstore,
       config::binding<std::chrono::milliseconds> sync_timeout);
 
-    ss::future<iobuf> take_snapshot(model::offset) final;
+    ss::future<iobuf> take_raft_snapshot(model::offset) final;
 
     // Updates partition properties to disable writes;
     // returns the offset of the blocking message

@@ -11,15 +11,15 @@
 
 #include "serde/parquet/column_writer.h"
 
+#include "absl/numeric/int128.h"
 #include "compression/compression.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "hashing/crc32.h"
 #include "serde/parquet/column_stats_collector.h"
 #include "serde/parquet/encoding.h"
 
+#include <seastar/core/coroutine.hh>
 #include <seastar/util/variant_utils.hh>
-
-#include <absl/numeric/int128.h>
 
 #include <limits>
 #include <stdexcept>
@@ -82,7 +82,7 @@ public:
 
         ss::visit(
           std::move(val),
-          [this, &value_memory_usage](value_type& v) {
+          [this, &value_memory_usage](value_type v) {
               if constexpr (!std::is_trivially_copyable_v<value_type>) {
                   value_memory_usage = v.val.size_bytes();
               } else {
@@ -91,14 +91,15 @@ public:
               _current_page_stats.record_value(v);
               _value_buffer.add_value(std::move(v));
           },
-          [this](null_value&) {
+          [this](null_value) {
               // null values are valid, but are not encoded in the actual data,
               // they are encoded in the defintion levels.
               _current_page_stats.record_null();
           },
-          [](auto& v) {
-              throw std::runtime_error(fmt::format(
-                "invalid value for column: {:.32}", value(std::move(v))));
+          [](auto v) {
+              throw std::runtime_error(
+                fmt::format(
+                  "invalid value for column: {:.32}", value(std::move(v))));
           });
         _rep_levels.push_back(rl);
         _def_levels.push_back(dl);
@@ -122,8 +123,9 @@ public:
                                         + encoded_rep_levels.size_bytes()
                                         + encoded_data.size_bytes();
         if (uncompressed_page_size > std::numeric_limits<int32_t>::max()) {
-            throw std::runtime_error(fmt::format(
-              "page size limit exceeded: {} bytes", uncompressed_page_size));
+            throw std::runtime_error(
+              fmt::format(
+                "page size limit exceeded: {} bytes", uncompressed_page_size));
         }
         if (_opts.compress) {
             encoded_data = co_await compression::stream_compressor::compress(
@@ -179,11 +181,12 @@ public:
         _current_page_stats.reset();
         _total_memory_usage += static_cast<int32_t>(
           full_page_data.size_bytes());
-        _flushed_pages.push_back(data_page{
-          .header = std::move(header),
-          .serialized_header_size = header_size,
-          .serialized = std::move(full_page_data),
-        });
+        _flushed_pages.push_back(
+          data_page{
+            .header = std::move(header),
+            .serialized_header_size = header_size,
+            .serialized = std::move(full_page_data),
+          });
     }
 
     int64_t memory_usage() const override {
@@ -264,8 +267,9 @@ template class buffered_column_writer<
 
 std::unique_ptr<column_writer::impl>
 make_impl(const schema_element&, std::monostate, options) {
-    throw std::runtime_error("invariant error: cannot make a column writer "
-                             "from an intermediate value");
+    throw std::runtime_error(
+      "invariant error: cannot make a column writer "
+      "from an intermediate value");
 }
 std::unique_ptr<column_writer::impl>
 make_impl(const schema_element& e, bool_type, options opts) {
@@ -323,8 +327,9 @@ make_impl(const schema_element& e, byte_array_type t, options opts) {
 } // namespace
 
 column_writer::column_writer(const schema_element& col, options opts)
-  : _impl(std::visit(
-      [&col, opts](auto x) { return make_impl(col, x, opts); }, col.type)) {}
+  : _impl(
+      std::visit(
+        [&col, opts](auto x) { return make_impl(col, x, opts); }, col.type)) {}
 
 column_writer::column_writer(column_writer&&) noexcept = default;
 column_writer& column_writer::operator=(column_writer&&) noexcept = default;

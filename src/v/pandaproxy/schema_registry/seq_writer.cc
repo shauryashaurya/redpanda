@@ -111,6 +111,13 @@ struct batch_builder : public storage::record_batch_builder {
 ss::future<> seq_writer::read_sync() {
     auto offsets = co_await _client.local().list_offsets(
       model::schema_registry_internal_tp);
+    if (
+      offsets.data.topics.size() != 1
+      || offsets.data.topics[0].partitions.size() != 1) {
+        throw kafka::exception(
+          kafka::error_code::unknown_server_error,
+          "Malformed ListOffsets Kafka response for internal topic");
+    }
 
     auto max_offset = offsets.data.topics[0].partitions[0].offset;
     co_await wait_for(max_offset - model::offset{1});
@@ -217,7 +224,8 @@ void seq_writer::advance_offset_inner(model::offset offset) {
 
 ss::future<std::optional<schema_id>> seq_writer::do_write_subject_version(
   stored_schema schema, model::offset write_at) {
-    co_await check_mutable(schema.schema.sub());
+    const auto& sub = schema.schema.sub();
+    co_await check_mutable(sub);
 
     // Check if store already contains this data: if
     // so, we do no I/O and return the schema ID.
@@ -382,6 +390,36 @@ ss::future<std::optional<bool>> seq_writer::do_write_mode(
         if (e.code() != error_code::mode_not_found) {
             throw;
         }
+    }
+
+    if (m == mode::import && !f) {
+        auto make_exception = []() {
+            return as_exception(
+              error_info{
+                error_code::subject_version_operation_not_permitted,
+                "Schema Registry can only move to import mode if empty"});
+        };
+        if (!sub && co_await _store.has_subjects(include_deleted::yes)) {
+            throw make_exception();
+        }
+        if (sub) {
+            try {
+                auto versions = co_await _store.get_versions(
+                  *sub, include_deleted::yes);
+                if (!versions.empty()) {
+                    throw make_exception();
+                }
+            } catch (const exception& e) {
+                if (e.code() != error_code::subject_not_found) {
+                    throw;
+                }
+                // Subject not found is OK - treat as empty
+            }
+        }
+
+        // TODO: relax the above restrictions to
+        // 1. Allow soft-deleted schemas to exist, but
+        // 2. Hard delete them before moving to import mode
     }
 
     batch_builder rb(write_at, sub);

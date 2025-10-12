@@ -14,10 +14,14 @@
 #include "datalake/logger.h"
 #include "datalake/schema_identifier.h"
 #include "datalake/schema_registry.h"
+#include "iceberg/conversion/ir_json.h"
+#include "iceberg/conversion/json_schema/frontend.h"
 #include "iceberg/conversion/schema_avro.h"
+#include "iceberg/conversion/schema_json.h"
 #include "iceberg/conversion/schema_protobuf.h"
 #include "iceberg/datatypes.h"
 #include "metrics/prometheus_sanitize.h"
+#include "pandaproxy/schema_registry/json.h"
 #include "pandaproxy/schema_registry/protobuf.h"
 #include "pandaproxy/schema_registry/types.h"
 #include "schema/registry.h"
@@ -57,7 +61,6 @@ checked<resolved_type, type_resolver::errc> translate_avro_schema(
                 .schema = resolved_schema(std::cref(avro_schema), std::move(schema)),
                 .id = { .schema_id = id, .protobuf_offsets = std::nullopt, },
                 .type = std::move(result.value()),
-                .type_name = avro_schema.root()->name().fullname(),
               };
     } catch (...) {
         vlog(
@@ -86,12 +89,59 @@ checked<resolved_type, type_resolver::errc> translate_protobuf_schema(
           .id
           = {.schema_id = id, .protobuf_offsets = std::move(protobuf_offsets)},
           .type = std::move(type),
-          .type_name = d->name(),
         };
     } catch (...) {
         vlog(
           datalake_log.error,
           "Protobuf schema translation failed: {}",
+          std::current_exception());
+        return type_resolver::errc::translation_error;
+    }
+}
+
+checked<resolved_type, type_resolver::errc> translate_json_schema(
+  const ppsr::json_schema_definition& json_def, ppsr::schema_id id) {
+    try {
+        auto& doc = document(json_def());
+        auto fc = iceberg::conversion::json_schema::frontend{};
+        // todo figure out
+        // todo is this cached anywhere?
+        auto json_schema = fc.compile(
+          doc, "https://example.com/schema.json", std::nullopt);
+        auto iceberg_ir = iceberg::type_to_ir(json_schema);
+        if (iceberg_ir.has_error()) {
+            vlog(
+              datalake_log.error,
+              "JSON schema translation to Iceberg IR failed: {}",
+              iceberg_ir.error());
+            return type_resolver::errc::translation_error;
+        }
+
+        auto root_struct = iceberg::type_to_iceberg(iceberg_ir.value());
+        if (root_struct.has_error()) {
+            vlog(
+              datalake_log.error,
+              "JSON schema translation to Iceberg type failed: {}",
+              root_struct.error());
+            return type_resolver::errc::translation_error;
+        }
+
+        return resolved_type{
+          .schema = resolved_schema(
+            ss::make_shared<iceberg::json_conversion_ir>(
+              std::move(iceberg_ir.value()))),
+          .id = {.schema_id = id, .protobuf_offsets = std::nullopt},
+          .type = std::move(root_struct.value())};
+    } catch (iceberg::conversion::json_schema::unsupported_feature_error& e) {
+        vlog(
+          datalake_log.warn,
+          "JSON schema translation failed due to unsupported feature: {}",
+          e.what());
+        return type_resolver::errc::translation_error;
+    } catch (...) {
+        vlog(
+          datalake_log.error,
+          "JSON schema translation failed: {}",
           std::current_exception());
         return type_resolver::errc::translation_error;
     }
@@ -139,8 +189,14 @@ struct schema_translating_visitor {
     }
 
     checked<type_and_buf, type_resolver::errc>
-    operator()(const ppsr::json_schema_definition&) {
-        return type_resolver::errc::bad_input;
+    operator()(const ppsr::json_schema_definition& json_def) {
+        auto tr_res = translate_json_schema(json_def, id);
+        if (tr_res.has_error()) {
+            return tr_res.error();
+        }
+        return type_and_buf{
+          .type = std::move(tr_res.value()),
+          .parsable_buf = std::move(buf_no_id)};
     }
 };
 
@@ -171,8 +227,12 @@ struct from_identifier_visitor {
           schema);
     }
     checked<resolved_type, type_resolver::errc>
-    operator()(const ppsr::json_schema_definition&) {
-        return type_resolver::errc::bad_input;
+    operator()(const ppsr::json_schema_definition& json_def) {
+        if (ident.protobuf_offsets) {
+            return type_resolver::errc::bad_input;
+        }
+
+        return translate_json_schema(json_def, ident.schema_id);
     }
 };
 
@@ -261,6 +321,11 @@ void chunked_schema_cache::setup_metrics() {
       });
 }
 
+resolved_schema::resolved_schema(ss::shared_ptr<iceberg::json_conversion_ir> ir)
+  : shared_schema_(std::move(ir))
+  , schema_(
+      *std::get<ss::shared_ptr<iceberg::json_conversion_ir>>(shared_schema_)) {}
+
 std::ostream& operator<<(std::ostream& o, const type_resolver::errc& e) {
     switch (e) {
     case type_resolver::errc::registry_error:
@@ -294,6 +359,22 @@ binary_type_resolver::resolve_identifier(schema_identifier) const {
 }
 
 ss::future<checked<type_and_buf, type_resolver::errc>>
+test_binary_type_resolver::resolve_buf_type(std::optional<iobuf> b) const {
+    if (injected_error_.has_value()) {
+        co_return *injected_error_;
+    }
+    co_return co_await binary_type_resolver::resolve_buf_type(std::move(b));
+}
+
+ss::future<checked<resolved_type, type_resolver::errc>>
+test_binary_type_resolver::resolve_identifier(schema_identifier id) const {
+    if (injected_error_.has_value()) {
+        co_return *injected_error_;
+    }
+    co_return co_await binary_type_resolver::resolve_identifier(std::move(id));
+}
+
+ss::future<checked<type_and_buf, type_resolver::errc>>
 record_schema_resolver::resolve_buf_type(std::optional<iobuf> b) const {
     if (!b.has_value()) {
         vlog(datalake_log.trace, "Ignoring tombstone value");
@@ -318,8 +399,9 @@ record_schema_resolver::resolve_buf_type(std::optional<iobuf> b) const {
     }
 
     auto shared_schema = schema_res.value();
-    co_return shared_schema->visit(schema_translating_visitor{
-      std::move(buf_no_id), schema_id, shared_schema});
+    co_return shared_schema->visit(
+      schema_translating_visitor{
+        std::move(buf_no_id), schema_id, shared_schema});
 }
 
 ss::future<checked<resolved_type, type_resolver::errc>>
@@ -396,32 +478,34 @@ latest_subject_schema_resolver::resolve_buf_type(std::optional<iobuf> b) const {
         co_return schema_res.error();
     }
     auto shared_schema = schema_res.value();
-    auto resolve_res = shared_schema->visit(ss::make_visitor(
-      [this, &latest_schema, &shared_schema](
-        const ppsr::protobuf_schema_definition& pb_def)
-        -> checked<resolved_type, type_resolver::errc> {
-          std::vector<int32_t> offsets;
-          if (const auto& explicit_name = protobuf_message_name_) {
-              auto res = compute_message_offsets(pb_def, *explicit_name);
-              if (res.has_error()) {
-                  return res.error();
-              }
-              offsets = std::move(res.value());
-          } else {
-              offsets = {0};
-          }
-          return translate_protobuf_schema(
-            pb_def, latest_schema.id, offsets, std::move(shared_schema));
-      },
-      [&latest_schema, &shared_schema](const ppsr::avro_schema_definition& def)
-        -> checked<resolved_type, type_resolver::errc> {
-          return translate_avro_schema(
-            def, latest_schema.id, std::move(shared_schema));
-      },
-      [](const ppsr::json_schema_definition&)
-        -> checked<resolved_type, type_resolver::errc> {
-          return type_resolver::errc::invalid_config;
-      }));
+    auto resolve_res = shared_schema->visit(
+      ss::make_visitor(
+        [this, &latest_schema, &shared_schema](
+          const ppsr::protobuf_schema_definition& pb_def)
+          -> checked<resolved_type, type_resolver::errc> {
+            std::vector<int32_t> offsets;
+            if (const auto& explicit_name = protobuf_message_name_) {
+                auto res = compute_message_offsets(pb_def, *explicit_name);
+                if (res.has_error()) {
+                    return res.error();
+                }
+                offsets = std::move(res.value());
+            } else {
+                offsets = {0};
+            }
+            return translate_protobuf_schema(
+              pb_def, latest_schema.id, offsets, std::move(shared_schema));
+        },
+        [&latest_schema,
+         &shared_schema](const ppsr::avro_schema_definition& def)
+          -> checked<resolved_type, type_resolver::errc> {
+            return translate_avro_schema(
+              def, latest_schema.id, std::move(shared_schema));
+        },
+        [&latest_schema](const ppsr::json_schema_definition& def)
+          -> checked<resolved_type, type_resolver::errc> {
+            return translate_json_schema(def, latest_schema.id);
+        }));
     if (resolve_res.has_error()) {
         co_return resolve_res.error();
     }
@@ -450,7 +534,6 @@ resolved_type resolved_type::copy() const {
       .schema = schema,
       .id = id,
       .type = iceberg::make_copy(type),
-      .type_name = type_name,
     };
 }
 } // namespace datalake

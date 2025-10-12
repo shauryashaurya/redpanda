@@ -10,7 +10,7 @@
 #include "cluster/partition_manager.h"
 
 #include "base/vlog.h"
-#include "cloud_storage/cache_service.h"
+#include "cloud_io/cache_service.h"
 #include "cloud_storage/partition_manifest.h"
 #include "cloud_storage/remote.h"
 #include "cloud_storage/remote_partition.h"
@@ -31,14 +31,12 @@
 #include "raft/fundamental.h"
 #include "raft/group_configuration.h"
 #include "raft/rpc_client_protocol.h"
-#include "resource_mgmt/io_priority.h"
 #include "ssx/async-clear.h"
 #include "storage/segment_utils.h"
 #include "storage/snapshot.h"
 #include "utils/retry_chain_node.h"
 
 #include <seastar/core/coroutine.hh>
-#include <seastar/core/io_priority_class.hh>
 #include <seastar/core/lowres_clock.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/shared_ptr.hh>
@@ -57,11 +55,12 @@ partition_manager::partition_manager(
   ss::sharded<raft::group_manager>& raft,
   ss::sharded<cloud_storage::partition_recovery_manager>& recovery_mgr,
   ss::sharded<cloud_storage::remote>& cloud_storage_api,
-  ss::sharded<cloud_storage::cache>& cloud_storage_cache,
+  ss::sharded<cloud_io::cache>& cloud_storage_cache,
   ss::lw_shared_ptr<const archival::configuration> archival_conf,
   ss::sharded<features::feature_table>& feature_table,
   ss::sharded<archival::upload_housekeeping_service>& upload_hks,
-  config::binding<std::chrono::milliseconds> partition_shutdown_timeout)
+  config::binding<std::chrono::milliseconds> partition_shutdown_timeout,
+  ss::sharded<cloud_topics::state_accessors>* cloud_topics_state)
   : _storage(storage.local())
   , _raft_manager(raft)
   , _partition_recovery_mgr(recovery_mgr)
@@ -70,7 +69,8 @@ partition_manager::partition_manager(
   , _archival_conf(std::move(archival_conf))
   , _feature_table(feature_table)
   , _upload_hks(upload_hks)
-  , _partition_shutdown_timeout(std::move(partition_shutdown_timeout)) {
+  , _partition_shutdown_timeout(std::move(partition_shutdown_timeout))
+  , _cloud_topics_state(cloud_topics_state) {
     _leader_notify_handle
       = _raft_manager.local().register_leadership_notification(
         [this](
@@ -250,8 +250,27 @@ ss::future<consensus_ptr> partition_manager::manage(
               dl_result.ot_state);
 
             // Initialize archival snapshot
-            co_await archival_metadata_stm::make_snapshot(
-              ntp_cfg, manifest, max_offset);
+            /*
+             [segment 1] [segment 2] [segment 3]
+                       ^                 ^
+                       |                 |
+                   last_offset      in-sync offset
+
+            Here the ISO is no longer correct because
+            it belongs to the old cluster. We're using last uploaded
+            offset to set up the snapshot.
+            */
+            if (max_offset != model::offset(0)) {
+                vlog(
+                  clusterlog.info,
+                  "Creating snapshot for {} partition, "
+                  "min_offset: {}, max_offset: {}",
+                  ntp_cfg.ntp(),
+                  min_offset,
+                  max_offset);
+                co_await archival_metadata_stm::make_snapshot(
+                  ntp_cfg, manifest, model::prev_offset(max_offset));
+            }
         }
     }
     auto translator_batch_types = raft::offset_translator_batch_types(
@@ -282,7 +301,8 @@ ss::future<consensus_ptr> partition_manager::manage(
       _archival_conf,
       _feature_table,
       _upload_hks,
-      read_replica_bucket);
+      read_replica_bucket,
+      _cloud_topics_state);
 
     _ntp_table.emplace(log->config().ntp(), p);
     _raft_table.emplace(group, p);
@@ -374,13 +394,18 @@ partition_manager::do_shutdown(ss::lw_shared_ptr<partition> partition) {
     try {
         auto ntp = partition->ntp();
         shutdown_state.update(partition_shutdown_stage::stopping_raft);
+        vlog(clusterlog.debug, "shutdown partition {} - stopping raft", ntp);
         xst_state.raft = co_await _raft_manager.local().shutdown(
           partition->raft());
         _unmanage_watchers.notify(ntp, model::topic_partition_view(ntp.tp));
         shutdown_state.update(partition_shutdown_stage::stopping_partition);
+        vlog(
+          clusterlog.debug, "shutdown partition {} - stopping partition", ntp);
         co_await partition->stop();
         shutdown_state.update(partition_shutdown_stage::stopping_storage);
+        vlog(clusterlog.debug, "shutdown partition {} - stopping log", ntp);
         co_await _storage.log_mgr().shutdown(partition->ntp());
+        vlog(clusterlog.debug, "shutdown partition {} - stopped", ntp);
     } catch (...) {
         vassert(
           false,
@@ -390,7 +415,6 @@ partition_manager::do_shutdown(ss::lw_shared_ptr<partition> partition) {
           *this,
           std::current_exception());
     }
-
     co_return xst_state;
 }
 
@@ -401,10 +425,11 @@ partition_manager::remove(const model::ntp& ntp, partition_removal_mode mode) {
     auto partition = get(ntp);
 
     if (!partition) {
-        throw std::invalid_argument(fmt::format(
-          "Can not remove partition. NTP {} is not present in partition "
-          "manager",
-          ntp));
+        throw std::invalid_argument(
+          fmt::format(
+            "Can not remove partition. NTP {} is not present in partition "
+            "manager",
+            ntp));
     }
     vlog(clusterlog.debug, "removing partition {}", ntp);
     partition_shutdown_state shutdown_state(partition);
@@ -439,11 +464,12 @@ partition_manager::shutdown(const model::ntp& ntp) {
     auto partition = get(ntp);
     if (!partition) {
         return ss::make_exception_future<xshard_transfer_state>(
-          std::invalid_argument(fmt::format(
-            "Can not shutdown partition. NTP {} is not present in "
-            "partition "
-            "manager",
-            ntp)));
+          std::invalid_argument(
+            fmt::format(
+              "Can not shutdown partition. NTP {} is not present in "
+              "partition "
+              "manager",
+              ntp)));
     }
     // remove partition from ntp & raft tables
     _ntp_table.erase(ntp);

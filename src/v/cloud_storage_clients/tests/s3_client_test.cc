@@ -18,7 +18,7 @@
 #include "http/tests/utils.h"
 #include "net/dns.h"
 #include "net/types.h"
-#include "test_utils/fixture.h"
+#include "test_utils/boost_fixture.h"
 #include "utils/base64.h"
 #include "utils/unresolved_address.h"
 
@@ -124,6 +124,8 @@ static constexpr auto no_such_config_payload = R"xml(
 </Error>
 )xml";
 
+static constexpr auto unexpected_payload = "unexpected!";
+
 void set_routes(ss::httpd::routes& r) {
     using namespace ss::httpd;
     using reply = ss::http::reply;
@@ -145,6 +147,15 @@ void set_routes(ss::httpd::routes& r) {
           return error_payload;
       },
       "xml");
+    auto unexpected_put_response = new flexible_function_handler(
+      [](
+        [[maybe_unused]] const_req req,
+        reply& reply,
+        [[maybe_unused]] ss::sstring& type) {
+          reply.set_status(reply::status_type::bad_request);
+          return unexpected_payload;
+      },
+      "txt");
     auto get_response = new function_handler(
       [](const_req req) {
           BOOST_REQUIRE(!req.get_header("x-amz-content-sha256").empty());
@@ -199,7 +210,7 @@ void set_routes(ss::httpd::routes& r) {
     auto unexpected_error_response = new function_handler(
       []([[maybe_unused]] const_req req, reply& reply) {
           reply.set_status(reply::status_type::internal_server_error);
-          return "unexpected!";
+          return unexpected_payload;
       },
       "txt");
     auto key_not_found_response = new flexible_function_handler(
@@ -314,6 +325,8 @@ void set_routes(ss::httpd::routes& r) {
     r.add(operation_type::PUT, url("/test-error"), erroneous_put_response);
     r.add(operation_type::GET, url("/test"), get_response);
     r.add(operation_type::GET, url("/test-error"), erroneous_get_response);
+    r.add(
+      operation_type::PUT, url("/test-unexpected"), unexpected_put_response);
     r.add(operation_type::DELETE, url("/test"), empty_delete_response);
     r.add(
       operation_type::DELETE, url("/test-error"), erroneous_delete_response);
@@ -346,9 +359,10 @@ static cloud_storage_clients::s3_configuration transport_configuration() {
     net::unresolved_address server_addr(httpd_host_name, httpd_port_number);
     cloud_storage_clients::s3_configuration conf;
     conf.uri = cloud_storage_clients::access_point_uri(httpd_host_name);
-    conf.access_key = cloud_roles::public_key_str("acess-key");
+    conf.access_key = cloud_roles::public_key_str("access-key");
     conf.secret_key = cloud_roles::private_key_str("secret-key");
     conf.region = cloud_roles::aws_region_name("us-east-1");
+    conf.service = cloud_roles::aws_service_name("s3");
     conf.url_style = cloud_storage_clients::s3_url_style::virtual_host;
     conf.server_addr = server_addr;
     conf._probe = ss::make_shared<cloud_storage_clients::client_probe>(
@@ -362,11 +376,13 @@ static cloud_storage_clients::s3_configuration transport_configuration() {
 static ss::lw_shared_ptr<cloud_roles::apply_credentials>
 make_credentials(const cloud_storage_clients::s3_configuration& cfg) {
     return ss::make_lw_shared(
-      cloud_roles::make_credentials_applier(cloud_roles::aws_credentials{
-        cfg.access_key.value(),
-        cfg.secret_key.value(),
-        std::nullopt,
-        cfg.region}));
+      cloud_roles::make_credentials_applier(
+        cloud_roles::aws_credentials{
+          cfg.access_key.value(),
+          cfg.secret_key.value(),
+          std::nullopt,
+          cfg.region,
+          cloud_roles::aws_service_name{"s3"}}));
 }
 
 /// Create server and client, server is initialized with default
@@ -427,6 +443,27 @@ SEASTAR_TEST_CASE(test_put_object_failure) {
         BOOST_REQUIRE(!result);
         BOOST_REQUIRE_EQUAL(
           result.error(), cloud_storage_clients::error_outcome::retry);
+        server->stop().get();
+    });
+}
+
+SEASTAR_TEST_CASE(test_put_object_unexpected) {
+    return ss::async([] {
+        auto conf = transport_configuration();
+        auto [server, client] = started_client_and_server(conf);
+        iobuf payload;
+        payload.append(expected_payload, expected_payload_size);
+        auto payload_stream = make_iobuf_input_stream(std::move(payload));
+        const auto result
+          = client
+              ->put_object(
+                cloud_storage_clients::bucket_name("test-bucket"),
+                cloud_storage_clients::object_key("test-unexpected"),
+                expected_payload_size,
+                std::move(payload_stream),
+                100ms)
+              .get();
+        BOOST_REQUIRE(!result);
         server->stop().get();
     });
 }

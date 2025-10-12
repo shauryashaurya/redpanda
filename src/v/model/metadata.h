@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "absl/hash/hash.h"
 #include "base/seastarx.h"
 #include "base/units.h"
 #include "model/fundamental.h"
@@ -26,7 +27,6 @@
 
 #include <seastar/core/sstring.hh>
 
-#include <absl/hash/hash.h>
 #include <bits/stdint-intn.h>
 #include <boost/functional/hash.hpp>
 
@@ -322,6 +322,10 @@ struct topic_namespace_view {
 
     bool operator<(const topic_namespace_view& other) const {
         return std::make_tuple(ns, tp) < std::make_tuple(other.ns, other.tp);
+    }
+
+    bool operator==(const topic_namespace_view& other) const {
+        return std::tie(ns, tp) == std::tie(other.ns, other.tp);
     }
 
     const model::ns& ns;
@@ -624,7 +628,7 @@ public:
     // protobuf full name.
     static iceberg_mode value_schema_latest(
       std::string_view protobuf_full_name, std::string_view subject_name) {
-        return {latest_protobuf_value_t{}, protobuf_full_name, subject_name};
+        return {value_schema_latest_t{}, protobuf_full_name, subject_name};
     }
 
     // Returns the kind of iceberg mode is being used.
@@ -634,10 +638,10 @@ public:
 
     // Returns the protobuf message's full name if specified.
     //
-    // Throws is variant() != variant::latest_protobuf_value
+    // Throws is variant() != variant::value_schema_latest
     std::optional<ss::sstring> protobuf_full_name() const {
         const auto& name
-          = std::get<latest_protobuf_value_impl>(_impl).message_full_name;
+          = std::get<value_schema_latest_impl>(_impl).message_full_name;
         if (name.empty()) {
             return std::nullopt;
         }
@@ -646,10 +650,10 @@ public:
 
     // Returns the subject name if specified.
     //
-    // Throws is variant() != variant::latest_protobuf_value
+    // Throws is variant() != variant::value_schema_latest
     std::optional<ss::sstring> subject_name() const {
         const auto& subject
-          = std::get<latest_protobuf_value_impl>(_impl).subject_name;
+          = std::get<value_schema_latest_impl>(_impl).subject_name;
         if (subject.empty()) {
             return std::nullopt;
         }
@@ -672,13 +676,13 @@ private:
         return m;
     }
 
-    struct latest_protobuf_value_t {};
+    struct value_schema_latest_t {};
     iceberg_mode(
-      latest_protobuf_value_t,
+      value_schema_latest_t,
       std::string_view protobuf_full_name,
       std::string_view subject_name)
       : _impl(
-          std::in_place_type<latest_protobuf_value_impl>,
+          std::in_place_type<value_schema_latest_impl>,
           ss::sstring(protobuf_full_name),
           ss::sstring(subject_name)) {}
 
@@ -691,17 +695,17 @@ private:
     struct value_schema_id_prefix_impl {
         bool operator==(const value_schema_id_prefix_impl&) const = default;
     };
-    struct latest_protobuf_value_impl {
+    struct value_schema_latest_impl {
         ss::sstring message_full_name;
         ss::sstring subject_name;
-        bool operator==(const latest_protobuf_value_impl&) const = default;
+        bool operator==(const value_schema_latest_impl&) const = default;
     };
 
     std::variant<
       disabled_impl,
       key_value_impl,
       value_schema_id_prefix_impl,
-      latest_protobuf_value_impl>
+      value_schema_latest_impl>
       _impl;
 };
 
@@ -718,6 +722,32 @@ enum class iceberg_invalid_record_action : uint8_t {
 
 std::ostream& operator<<(std::ostream&, const iceberg_invalid_record_action&);
 std::istream& operator>>(std::istream&, iceberg_invalid_record_action&);
+
+enum class kafka_batch_validation_mode : uint8_t {
+    legacy = 0,
+    relaxed = 1,
+    strict = 2,
+};
+
+constexpr const char*
+kafka_batch_validation_mode_to_string(const kafka_batch_validation_mode& m) {
+    switch (m) {
+    case kafka_batch_validation_mode::legacy:
+        return "legacy";
+    case kafka_batch_validation_mode::relaxed:
+        return "relaxed";
+    case kafka_batch_validation_mode::strict:
+        return "strict";
+    }
+}
+
+std::optional<kafka_batch_validation_mode>
+kafka_batch_validation_mode_from_string(std::string_view s);
+
+std::ostream&
+operator<<(std::ostream& o, const kafka_batch_validation_mode& mode);
+
+std::istream& operator>>(std::istream& i, kafka_batch_validation_mode& mode);
 
 } // namespace model
 

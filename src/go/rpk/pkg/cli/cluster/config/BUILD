@@ -9,6 +9,7 @@ go_library(
         "get.go",
         "import.go",
         "lint.go",
+        "list.go",
         "reset.go",
         "set.go",
         "status.go",
@@ -28,6 +29,7 @@ go_library(
         "@com_github_spf13_cobra//:cobra",
         "@in_gopkg_yaml_v3//:yaml_v3",
         "@org_golang_google_genproto_googleapis_rpc//errdetails",
+        "@org_golang_google_protobuf//encoding/protojson",
         "@org_golang_google_protobuf//proto",
         "@org_golang_google_protobuf//types/known/anypb",
         "@org_golang_google_protobuf//types/known/fieldmaskpb",
@@ -41,7 +43,9 @@ go_test(
     size = "small",
     srcs = [
         "edit_test.go",
+        "get_test.go",
         "import_test.go",
+        "list_test.go",
         "set_test.go",
     ],
     embed = [":config"],
@@ -49,5 +53,6 @@ go_test(
         "@com_github_stretchr_testify//assert",
         "@com_github_stretchr_testify//require",
         "@in_gopkg_yaml_v3//:yaml_v3",
+        "@org_golang_google_protobuf//types/known/structpb",
     ],
 )

@@ -10,8 +10,9 @@
  */
 
 #pragma once
+#include "absl/container/flat_hash_map.h"
 #include "cluster/types.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "kafka/protocol/schemata/create_topics_request.h"
 #include "kafka/protocol/schemata/create_topics_response.h"
 #include "kafka/protocol/topic_properties.h"
@@ -21,7 +22,6 @@
 #include "model/namespace.h"
 #include "utils/absl_sstring_hash.h"
 
-#include <absl/container/flat_hash_map.h>
 #include <boost/algorithm/string.hpp>
 #include <boost/lexical_cast.hpp>
 
@@ -123,6 +123,18 @@ inline constexpr std::string_view topic_property_iceberg_target_lag_ms
 inline constexpr std::string_view topic_property_min_cleanable_dirty_ratio
   = "min.cleanable.dirty.ratio";
 
+inline constexpr std::string_view topic_property_min_compaction_lag_ms
+  = "min.compaction.lag.ms";
+
+inline constexpr std::string_view topic_property_max_compaction_lag_ms
+  = "max.compaction.lag.ms";
+
+inline constexpr std::string_view topic_property_message_timestamp_before_max_ms
+  = "message.timestamp.before.max.ms";
+
+inline constexpr std::string_view topic_property_message_timestamp_after_max_ms
+  = "message.timestamp.after.max.ms";
+
 // Kafka topic properties that is not relevant for Redpanda
 // Or cannot be altered with kafka alter handler
 inline constexpr std::array<std::string_view, 20> allowlist_topic_noop_confs = {
@@ -133,10 +145,8 @@ inline constexpr std::array<std::string_view, 20> allowlist_topic_noop_confs = {
   "segment.index.bytes",
   "segment.jitter.ms",
   "min.insync.replicas",
-  "min.compaction.lag.ms",
   "message.timestamp.difference.max.ms",
   "message.format.version",
-  "max.compaction.lag.ms",
   "leader.replication.throttled.replicas",
   "index.interval.bytes",
   "follower.replication.throttled.replicas",
@@ -168,6 +178,13 @@ config_map_t config_map(const std::vector<creatable_topic_configs>& config);
 
 cluster::custom_assignable_topic_configuration
 to_cluster_type(const creatable_topic& t);
+
+cluster::topic_configuration to_topic_config(
+  model::ns ns,
+  model::topic topic,
+  int32_t partition_count,
+  int16_t replication_factor,
+  const config_map_t& config_map);
 
 std::vector<kafka::creatable_topic_configs> report_topic_configs(
   const cluster::metadata_cache& metadata_cache,

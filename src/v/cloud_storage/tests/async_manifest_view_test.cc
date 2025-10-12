@@ -19,12 +19,11 @@
 #include "model/metadata.h"
 #include "model/timeout_clock.h"
 #include "model/timestamp.h"
-#include "test_utils/fixture.h"
+#include "test_utils/boost_fixture.h"
 #include "utils/retry_chain_node.h"
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/file-types.hh>
-#include <seastar/core/io_priority_class.hh>
 #include <seastar/core/loop.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/core/timed_out_error.hh>
@@ -73,9 +72,6 @@ public:
       , ctxlog(test_log, rtc)
       , probe(manifest_ntp)
       , view(api, cache, stm_manifest, bucket, path_provider) {
-        stm_manifest.set_archive_start_offset(
-          model::offset{0}, model::offset_delta{0});
-        stm_manifest.set_archive_clean_offset(model::offset{0}, 0);
         view.start().get();
         base_timestamp = model::timestamp_clock::now() - storage_duration;
         last_timestamp = base_timestamp;
@@ -84,16 +80,19 @@ public:
     ~async_manifest_view_fixture() { view.stop().get(); }
 
     expectation spill_manifest(const spillover_manifest& spm, bool hydrate) {
+        if (stm_manifest.get_archive_start_offset() == model::offset{}) {
+            // Create archive lazily
+            stm_manifest.set_archive_start_offset(
+              model::offset{0}, model::offset_delta{0});
+            stm_manifest.set_archive_clean_offset(model::offset{0}, 0);
+        }
         stm_manifest.spillover(spm.make_manifest_metadata());
         // update cache
         auto path = spm.get_manifest_path(path_provider);
         if (hydrate) {
             auto stream = spm.serialize().get();
             auto reservation = cache.local().reserve_space(123, 1).get();
-            cache.local()
-              .put(
-                path, stream.stream, reservation, ss::default_priority_class())
-              .get();
+            cache.local().put(path, stream.stream, reservation).get();
             stream.stream.close().get();
         }
         // upload to the cloud
@@ -134,9 +133,7 @@ public:
         auto path = spm.get_manifest_path(path_provider);
         auto stream = spm.serialize().get();
         auto reservation = cache.local().reserve_space(123, 1).get();
-        cache.local()
-          .put(path, stream.stream, reservation, ss::default_priority_class())
-          .get();
+        cache.local().put(path, stream.stream, reservation).get();
         stream.stream.close().get();
     }
 
@@ -197,6 +194,13 @@ public:
     void trigger_spillover(int num_segments, bool hydrate = true) {
         BOOST_REQUIRE_GT(stm_manifest.size(), num_segments + 1);
 
+        if (stm_manifest.get_archive_start_offset() == model::offset{}) {
+            // Create empty archive
+            stm_manifest.set_archive_start_offset(
+              model::offset{0}, model::offset_delta{0});
+            stm_manifest.set_archive_clean_offset(model::offset{0}, 0);
+        }
+
         const auto so = model::next_offset(stm_manifest.get_last_offset());
         spillover_manifest spm(manifest_ntp, manifest_rev);
         for (const auto& meta : stm_manifest) {
@@ -213,10 +217,7 @@ public:
         if (hydrate) {
             auto stream = spm.serialize().get();
             auto reservation = cache.local().reserve_space(123, 1).get();
-            cache.local()
-              .put(
-                path, stream.stream, reservation, ss::default_priority_class())
-              .get();
+            cache.local().put(path, stream.stream, reservation).get();
             stream.stream.close().get();
         }
         // upload to the cloud
@@ -904,10 +905,13 @@ FIXTURE_TEST(test_async_manifest_view_after_gc, async_manifest_view_fixture) {
     // to the second segment in the second spillover manifest.
     BOOST_REQUIRE(spillover_start_offsets.size() == 3);
     const auto second_spill_start = spillover_start_offsets[0];
-    auto iter = std::next(std::find_if(
-      expected.begin(), expected.end(), [second_spill_start](const auto& meta) {
-          return meta.base_offset == second_spill_start;
-      }));
+    auto iter = std::next(
+      std::find_if(
+        expected.begin(),
+        expected.end(),
+        [second_spill_start](const auto& meta) {
+            return meta.base_offset == second_spill_start;
+        }));
     const auto second_seg_second_spill = *iter;
 
     stm_manifest.set_archive_start_offset(
@@ -1155,8 +1159,9 @@ FIXTURE_TEST(test_async_manifest_view_test_iter2, async_manifest_view_fixture) {
     auto cursor = std::move(maybe_cursor.value());
     cloud_storage::for_each_manifest(
       std::move(cursor),
-      [&actual](ssx::task_local_ptr<const cloud_storage::partition_manifest>
-                  p) mutable {
+      [&actual](
+        ssx::task_local_ptr<const cloud_storage::partition_manifest>
+          p) mutable {
           for (const auto& m : *p) {
               actual.push_back(m);
           }
@@ -1253,4 +1258,45 @@ FIXTURE_TEST(
           })
           .get();
     }
+}
+
+FIXTURE_TEST(
+  test_async_manifest_view_get_term_last_offset_with_spillover_edge_case,
+  async_manifest_view_fixture) {
+    using t = model::term_id;
+    using o = model::offset;
+    int num_segments = 4;
+    std::vector<segment_meta> segs;
+    segs.reserve(num_segments);
+    int ts_step = 10;
+    int o_step = 10;
+    for (int i = 0; i < num_segments; ++i) {
+        segs.push_back(
+          segment_meta{
+            .size_bytes = 4097,
+            .base_offset = o{i * o_step},
+            .committed_offset = o{(i + 1) * o_step - 1},
+            .base_timestamp = model::timestamp{i * ts_step},
+            .max_timestamp = model::timestamp{i * ts_step + 1},
+            .segment_term = t{i}});
+    }
+    auto target_term = model::term_id{1};
+    // Populate 2 spillover manifests in map. The desired term,
+    // model::term_id{1}, is going to be the last entry in the spillover
+    // manifests, i.e there will be no higher term entry in
+    // `get_segment_term_column`, and the main manifest contains no segments
+    // with a lower term than the desired term:
+    // Main manifest: [2, 3]
+    // Spillover map: [[0], [1]]
+    // We should expect that when we fail to find a result in the spillover map
+    // via `get_spillover_upper_bound_by_term()`, we still fall back to
+    // searching the main manifest for the term's last offset.
+    add_segments_to_stm_manifest(segs);
+    trigger_spillover(1);
+    trigger_spillover(1);
+
+    auto offset = view.get_term_last_offset(target_term).get();
+    BOOST_REQUIRE(offset.has_value());
+    BOOST_REQUIRE(offset.value().has_value());
+    BOOST_REQUIRE_EQUAL(offset.value().value(), kafka::offset{19});
 }

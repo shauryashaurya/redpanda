@@ -9,15 +9,13 @@
 
 #include "cluster/log_eviction_stm.h"
 
-#include "bytes/iostream.h"
 #include "cluster/errc.h"
 #include "cluster/logger.h"
 #include "cluster/prefix_truncate_record.h"
 #include "model/fundamental.h"
 #include "raft/consensus.h"
-#include "raft/fundamental.h"
-#include "serde/rw/envelope.h"
-#include "serde/rw/iobuf.h"
+#include "serde/envelope.h"
+#include "ssx/future-util.h"
 
 #include <seastar/core/future-util.hh>
 #include <seastar/core/sleep.hh>
@@ -214,8 +212,9 @@ log_eviction_stm::do_write_raft_snapshot(model::offset truncation_point) {
           truncation_point);
         co_return;
     }
-    co_await _raft->write_snapshot(raft::write_snapshot_cfg(
-      snapshot_result.last_included_offset, std::move(snapshot_result.data)));
+    co_await _raft->write_snapshot(
+      raft::write_snapshot_cfg(
+        snapshot_result.last_included_offset, std::move(snapshot_result.data)));
 }
 
 kafka::offset log_eviction_stm::kafka_start_offset_override() {
@@ -469,6 +468,9 @@ log_eviction_stm_factory::log_eviction_stm_factory(storage::kvstore& kvstore)
 
 bool log_eviction_stm_factory::is_applicable_for(
   const storage::ntp_config& cfg) const {
+    if (cfg.cloud_topic_enabled()) {
+        return false;
+    }
     return !storage::deletion_exempt(cfg.ntp());
 }
 

@@ -12,8 +12,8 @@
 #pragma once
 #include "metrics/metrics.h"
 #include "model/fundamental.h"
+#include "storage/disk.h"
 #include "storage/fwd.h"
-#include "storage/types.h"
 
 #include <seastar/core/metrics_registration.hh>
 #include <seastar/core/shared_ptr.hh>
@@ -88,6 +88,10 @@ public:
 
     void add_compaction_removed_bytes(ssize_t bytes) {
         _compaction_removed_bytes += bytes;
+    }
+
+    void add_adjacent_segments_compacted(uint64_t num_segments_compacted) {
+        _num_adjacent_segments_compacted += num_segments_compacted;
     }
 
     void batch_write_error(const std::exception_ptr& e);
@@ -165,6 +169,7 @@ private:
     uint64_t _segments_marked_tombstone_free = 0;
     uint64_t _num_rounds_window_compaction = 0;
     uint64_t _num_chunked_compaction_runs = 0;
+    uint64_t _num_adjacent_segments_compacted = 0;
 
     ssize_t _dirty_segment_bytes = 0;
     ssize_t _closed_segment_bytes = 0;

@@ -14,7 +14,7 @@
 #include "base/vassert.h"
 #include "cluster/errc.h"
 #include "cluster/logger.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "model/fundamental.h"
 #include "model/namespace.h"
 #include "model/record_batch_types.h"
@@ -45,13 +45,16 @@ partition_properties_stm::partition_properties_stm(
       .writes_disabled = writes_disabled::no,
       .update_offset = model::offset{}}}) {}
 
-ss::future<iobuf> partition_properties_stm::take_snapshot(model::offset o) {
+ss::future<iobuf>
+partition_properties_stm::take_raft_snapshot(model::offset o) {
     if (o < _raft->start_offset()) {
-        throw std::invalid_argument(fmt::format(
-          "can not take raft snapshot at offset {} which is smaller than raft "
-          "start offset",
-          o,
-          _raft->start_offset()));
+        throw std::invalid_argument(
+          fmt::format(
+            "can not take raft snapshot at offset {} which is smaller than "
+            "raft "
+            "start offset",
+            o,
+            _raft->start_offset()));
     }
     vlog(
       _log.trace,
@@ -171,10 +174,12 @@ void partition_properties_stm::apply_record(
       r.offset_delta() + batch_begin_offset);
     bool differs = are_writes_disabled() != update.writes_disabled;
     if (differs) {
-        _state_snapshots.push_back(state_snapshot{
-          .writes_disabled = update.writes_disabled,
-          .update_offset = model::offset(r.offset_delta() + batch_begin_offset),
-        });
+        _state_snapshots.push_back(
+          state_snapshot{
+            .writes_disabled = update.writes_disabled,
+            .update_offset = model::offset(
+              r.offset_delta() + batch_begin_offset),
+          });
     }
 }
 
@@ -189,10 +194,11 @@ partition_properties_stm::apply_raft_snapshot(const iobuf& buffer) {
 
     vlog(_log.debug, "Applying raft snapshot {}", snapshot);
     _state_snapshots.clear();
-    _state_snapshots.push_back(state_snapshot{
-      .writes_disabled = snapshot.writes_disabled,
-      .update_offset = model::prev_offset(_raft->start_offset()),
-    });
+    _state_snapshots.push_back(
+      state_snapshot{
+        .writes_disabled = snapshot.writes_disabled,
+        .update_offset = model::prev_offset(_raft->start_offset()),
+      });
     co_return;
 }
 

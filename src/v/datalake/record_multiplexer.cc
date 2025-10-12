@@ -19,15 +19,33 @@
 #include "datalake/table_creator.h"
 #include "datalake/table_id_provider.h"
 #include "datalake/translation/translation_probe.h"
+#include "features/feature_table.h"
+#include "model/batch_compression.h"
 #include "model/metadata.h"
 #include "model/record.h"
-#include "storage/parser_utils.h"
+#include "model/timestamp.h"
 
 #include <seastar/core/loop.hh>
 
 namespace datalake {
 
 namespace {
+
+// Get the data location for the table. Some catalogs require using the property
+// `write.data.path`. Otherwise, it defaults to <table location>/data.
+iceberg::uri get_data_location(const schema_manager::table_info& table_info) {
+    static constexpr std::string_view write_data_path_prop = "write.data.path";
+
+    if (table_info.properties.has_value()) {
+        auto it = table_info.properties->find(write_data_path_prop);
+        if (it != table_info.properties->end()) {
+            return iceberg::uri(it->second);
+        }
+    }
+
+    return iceberg::uri(fmt::format("{}/data", table_info.location));
+}
+
 template<typename Func>
 requires requires(Func f, model::record_batch batch) {
     { f(std::move(batch)) } -> std::same_as<ss::future<ss::stop_iteration>>;
@@ -38,11 +56,17 @@ public:
       : _func(std::move(f)) {}
 
     ss::future<ss::stop_iteration> operator()(model::record_batch b) {
-        return _func(std::move(b));
+        auto batch_raw_size = b.size_bytes();
+        return _func(std::move(b))
+          .then([this, batch_raw_size](ss::stop_iteration si) {
+              _total_read_bytes += batch_raw_size;
+              return si;
+          });
     }
-    void end_of_stream() {}
+    uint64_t end_of_stream() { return _total_read_bytes; }
 
 private:
+    uint64_t _total_read_bytes{0};
     Func _func;
 };
 } // namespace
@@ -57,7 +81,8 @@ record_multiplexer::record_multiplexer(
   table_creator& table_creator,
   model::iceberg_invalid_record_action invalid_record_action,
   location_provider location_provider,
-  translation_probe& translation_probe)
+  translation_probe& translation_probe,
+  features::feature_table* features)
   : _log(datalake_log, fmt::format("{}", ntp))
   , _ntp(ntp)
   , _topic_revision(topic_revision)
@@ -68,14 +93,15 @@ record_multiplexer::record_multiplexer(
   , _table_creator(table_creator)
   , _invalid_record_action(invalid_record_action)
   , _location_provider(std::move(location_provider))
-  , _translation_probe(translation_probe) {}
+  , _translation_probe(translation_probe)
+  , _features(features) {}
 
 ss::future<> record_multiplexer::multiplex(
   model::record_batch_reader reader,
   kafka::offset start_offset,
   model::timeout_clock::time_point deadline,
   ss::abort_source& as) {
-    co_await std::move(reader).consume(
+    _reader_bytes_processed += co_await std::move(reader).consume(
       relaying_consumer{
         [this, start_offset, &as](model::record_batch b) mutable {
             return do_multiplex(std::move(b), start_offset, as);
@@ -88,12 +114,25 @@ ss::future<ss::stop_iteration> record_multiplexer::do_multiplex(
     const auto raw_size_bytes = batch.size_bytes();
     _translation_probe.increment_raw_bytes_processed(raw_size_bytes);
     if (batch.compressed()) {
-        batch = co_await storage::internal::decompress_batch(std::move(batch));
+        batch = co_await model::decompress_batch(batch);
     }
     const auto decompressed_size_bytes = batch.size_bytes();
     _translation_probe.increment_decompressed_bytes_processed(
       decompressed_size_bytes);
+    vlog(
+      _log.trace,
+      "processing batch: offset_range=[{},{}], records={}, "
+      "raw_bytes={}, decompressed_bytes={}",
+      batch.base_offset(),
+      batch.last_offset(),
+      batch.record_count(),
+      raw_size_bytes,
+      decompressed_size_bytes);
+
+    auto is_broker_time = batch.header().attrs.timestamp_type()
+                          == model::timestamp_type::append_time;
     auto first_timestamp = batch.header().first_timestamp.value();
+    auto max_timestamp = batch.header().max_timestamp;
     auto it = model::record_batch_iterator::create(batch);
     while (it.has_next()) {
         if (as.abort_requested()) {
@@ -103,8 +142,10 @@ ss::future<ss::stop_iteration> record_multiplexer::do_multiplex(
         auto record = it.next();
         auto key = record.share_key_opt();
         auto val = record.share_value_opt();
-        auto timestamp = model::timestamp{
-          first_timestamp + record.timestamp_delta()};
+        auto timestamp = is_broker_time
+                           ? max_timestamp
+                           : model::timestamp{
+                               first_timestamp + record.timestamp_delta()};
         kafka::offset offset{batch.base_offset()() + record.offset_delta()};
         if (offset < start_offset) {
             continue;
@@ -120,10 +161,17 @@ ss::future<ss::stop_iteration> record_multiplexer::do_multiplex(
         auto val_type_res = co_await _type_resolver.resolve_buf_type(
           std::move(val));
         if (val_type_res.has_error()) {
-            switch (val_type_res.error()) {
+            auto err = val_type_res.error();
+            vlog(
+              _log.warn,
+              "Error resolving type for record at offset {}, batch: {}: {}",
+              offset,
+              batch.header(),
+              err);
+            switch (err) {
             case type_resolver::errc::registry_error:
             case type_resolver::errc::invalid_config:
-                _error = writer_error::parquet_conversion_error;
+                _error = writer_error::retryable_type_resolution_error;
                 co_return ss::stop_iteration::yes;
             case type_resolver::errc::bad_input:
             case type_resolver::errc::translation_error:
@@ -153,14 +201,16 @@ ss::future<ss::stop_iteration> record_multiplexer::do_multiplex(
           timestamp,
           header_kvs);
         if (record_data_res.has_error()) {
-            switch (record_data_res.error()) {
+            auto err = record_data_res.error();
+            vlog(
+              _log.warn,
+              "Error translating data for record at offset {}, batch: {}: {}",
+              offset,
+              batch.header(),
+              err);
+            switch (err) {
             case record_translator::errc::unexpected_schema:
             case record_translator::errc::translation_error:
-                vlog(
-                  _log.debug,
-                  "Error translating data for record {}: {}",
-                  offset,
-                  record_data_res.error());
                 auto invalid_res = co_await handle_invalid_record(
                   translation_probe::invalid_record_cause::
                     failed_data_translation,
@@ -205,18 +255,26 @@ ss::future<ss::stop_iteration> record_multiplexer::do_multiplex(
                 case table_creator::errc::failed:
                     vlog(
                       _log.warn,
-                      "Error ensuring table schema for record {}",
-                      offset);
-                    [[fallthrough]];
+                      "Error ensuring table schema for record {}: {}",
+                      offset,
+                      e);
+                    _error = writer_error::unknown_error;
+                    break;
                 case table_creator::errc::shutting_down:
-                    _error = writer_error::parquet_conversion_error;
+                    _error = writer_error::shutting_down;
                 }
                 co_return ss::stop_iteration::yes;
             }
 
             auto table_id = table_id_provider::table_id(_ntp.tp.topic);
+            std::optional<std::reference_wrapper<iceberg::struct_type>>
+              desired_type;
+            if (!_features->is_active(
+                  features::feature::iceberg_schema_merging)) {
+                desired_type = std::make_optional(std::ref(record_type.type));
+            }
             auto load_res = co_await _schema_mgr.get_table_info(
-              table_id, record_type.type);
+              table_id, desired_type);
             if (load_res.has_error()) {
                 auto e = load_res.error();
                 switch (e) {
@@ -226,10 +284,11 @@ ss::future<ss::stop_iteration> record_multiplexer::do_multiplex(
                       _log.warn,
                       "Error getting table info for record {}: {}",
                       offset,
-                      load_res.error());
-                    [[fallthrough]];
+                      e);
+                    _error = writer_error::unknown_error;
+                    break;
                 case schema_manager::errc::shutting_down:
-                    _error = writer_error::parquet_conversion_error;
+                    _error = writer_error::shutting_down;
                 }
                 co_return ss::stop_iteration::yes;
             }
@@ -242,20 +301,20 @@ ss::future<ss::stop_iteration> record_multiplexer::do_multiplex(
                   _log.warn,
                   "expected to successfully fill field IDs for record {}",
                   offset);
-                _error = writer_error::parquet_conversion_error;
+                _error = writer_error::unknown_error;
                 co_return ss::stop_iteration::yes;
             }
 
-            auto table_remote_path = _location_provider.from_uri(
-              load_res.value().location);
-            if (!table_remote_path) {
+            auto data_location = get_data_location(load_res.value());
+            auto data_remote_path = _location_provider.from_uri(data_location);
+            if (!data_remote_path) {
                 vlog(
                   _log.warn,
                   "Error getting location prefix for {} while creating writer "
                   "at offset {}",
                   load_res.value().location,
                   offset);
-                _error = writer_error::parquet_conversion_error;
+                _error = writer_error::unknown_error;
                 co_return ss::stop_iteration::yes;
             }
 
@@ -266,7 +325,7 @@ ss::future<ss::stop_iteration> record_multiplexer::do_multiplex(
                 load_res.value().schema.schema_id,
                 std::move(record_type.type),
                 std::move(load_res.value().partition_spec),
-                std::move(table_remote_path.value())));
+                std::move(data_remote_path.value())));
             writer_iter = iter;
         }
 
@@ -297,6 +356,13 @@ ss::future<ss::stop_iteration> record_multiplexer::do_multiplex(
         }
         _result.value().last_offset = offset;
     }
+
+    vlog(
+      _log.trace,
+      "batch processing complete: last_offset={}, writers_active={}",
+      _result.has_value() ? _result.value().last_offset : kafka::offset{-1},
+      _writers.size());
+
     co_return ss::stop_iteration::no;
 }
 
@@ -304,8 +370,9 @@ ss::future<writer_error> record_multiplexer::flush_writers() {
     if (_error && !is_recoverable_error(_error.value())) {
         co_return *_error;
     }
-    auto result = co_await ss::coroutine::as_future(ss::max_concurrent_for_each(
-      _writers, 10, [](auto& entry) { return entry.second->flush(); }));
+    auto result = co_await ss::coroutine::as_future(
+      ss::max_concurrent_for_each(
+        _writers, 10, [](auto& entry) { return entry.second->flush(); }));
     if (result.failed()) {
         vlog(_log.warn, "Error flushing writers: {}", result.get_exception());
         _error = writer_error::flush_error;
@@ -315,20 +382,30 @@ ss::future<writer_error> record_multiplexer::flush_writers() {
 }
 
 ss::future<result<record_multiplexer::write_result, writer_error>>
-record_multiplexer::finish() && {
+record_multiplexer::finish(
+  record_multiplexer::finished_files& finished_files) && {
+    vlog(
+      _log.trace,
+      "starting multiplexer finish: writers={}, kafka_bytes_processed={}",
+      _writers.size(),
+      _reader_bytes_processed);
+
     auto writers = std::move(_writers);
     for (auto& [id, writer] : writers) {
         auto res = co_await std::move(*writer).finish();
         if (res.has_error()) {
+            vlog(_log.trace, "writer finish error: {}", res.error());
             _error = res.error();
             continue;
         }
         if (_result) {
             auto& files = res.value();
+            vlog(
+              _log.trace, "writer finished: files_created={})", files.size());
             std::move(
               files.begin(),
               files.end(),
-              std::back_inserter(_result->data_files));
+              std::back_inserter(finished_files.data_files));
         }
     }
     if (_invalid_record_writer) {
@@ -338,10 +415,14 @@ record_multiplexer::finish() && {
             _error = res.error();
         } else if (_result) {
             auto& files = res.value();
+            vlog(
+              _log.trace,
+              "invalid record writer finished: dlq_files_created={}",
+              files.size());
             std::move(
               files.begin(),
               files.end(),
-              std::back_inserter(_result->dlq_files));
+              std::back_inserter(finished_files.dlq_files));
         }
     }
     if (_error && !is_recoverable_error(_error.value())) {
@@ -351,6 +432,17 @@ record_multiplexer::finish() && {
         // no batches were processed.
         co_return writer_error::no_data;
     }
+    _result->kafka_bytes_processed = _reader_bytes_processed;
+
+    vlog(
+      _log.trace,
+      "multiplexer finish complete: offset_range=[{},{}], "
+      "total_records={}, kafka_bytes={}",
+      _result->start_offset,
+      _result->last_offset,
+      _result->last_offset() - _result->start_offset() + 1,
+      _result->kafka_bytes_processed);
+
     co_return std::move(*_result);
 }
 
@@ -416,17 +508,21 @@ record_multiplexer::handle_invalid_record(
 
             if (ensure_res.has_error()) {
                 auto e = ensure_res.error();
+
                 switch (e) {
                 case table_creator::errc::incompatible_schema:
-                    [[fallthrough]];
                 case table_creator::errc::failed:
-                    [[fallthrough]];
-                case table_creator::errc::shutting_down:
                     vlog(
                       _log.warn,
-                      "Error ensuring DLQ table schema for invalid record {}",
-                      offset);
-                    co_return writer_error::parquet_conversion_error;
+                      "Error ensuring DLQ table schema for invalid record {}: "
+                      "{}",
+                      offset,
+                      e);
+                    // Normally this is not possible, so we use blanket error
+                    // code.
+                    co_return writer_error::unknown_error;
+                case table_creator::errc::shutting_down:
+                    co_return writer_error::shutting_down;
                 }
             }
 
@@ -441,10 +537,10 @@ record_multiplexer::handle_invalid_record(
                       _log.warn,
                       "Error getting table info for record {}: {}",
                       offset,
-                      load_res.error());
-                    [[fallthrough]];
+                      e);
+                    co_return writer_error::unknown_error;
                 case schema_manager::errc::shutting_down:
-                    co_return writer_error::parquet_conversion_error;
+                    co_return writer_error::shutting_down;
                 }
             }
 
@@ -457,19 +553,19 @@ record_multiplexer::handle_invalid_record(
                   _log.warn,
                   "expected to successfully fill field IDs for record {}",
                   offset);
-                co_return writer_error::parquet_conversion_error;
+                co_return writer_error::unknown_error;
             }
 
-            auto table_remote_path = _location_provider.from_uri(
-              load_res.value().location);
-            if (!table_remote_path) {
+            auto data_location = get_data_location(load_res.value());
+            auto data_remote_path = _location_provider.from_uri(data_location);
+            if (!data_remote_path) {
                 vlog(
                   _log.warn,
                   "Error getting location prefix for {} while creating writer "
                   "at offset {}",
                   load_res.value().location,
                   offset);
-                co_return writer_error::parquet_conversion_error;
+                co_return writer_error::unknown_error;
             }
 
             _invalid_record_writer = std::make_unique<partitioning_writer>(
@@ -477,7 +573,7 @@ record_multiplexer::handle_invalid_record(
               load_res.value().schema.schema_id,
               std::move(record_type.type),
               std::move(load_res.value().partition_spec),
-              std::move(table_remote_path.value()));
+              std::move(data_remote_path.value()));
         }
 
         int64_t estimated_size = (key ? key->size_bytes() : 0)
@@ -497,11 +593,11 @@ record_multiplexer::handle_invalid_record(
           headers);
         if (record_data_res.has_error()) {
             vlog(
-              _log.debug,
+              _log.warn,
               "Error translating DLQ data for record {}: {}",
               offset,
               record_data_res.error());
-            co_return writer_error::parquet_conversion_error;
+            co_return writer_error::unknown_error;
         }
 
         if (!_result.has_value()) {

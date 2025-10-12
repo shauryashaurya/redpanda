@@ -10,6 +10,7 @@
 
 #include "gtest/gtest.h"
 #include "iceberg/conversion/schema_protobuf.h"
+#include "iceberg/conversion/tests/gmock_iceberg_matchers.h"
 #include "iceberg/conversion/tests/proto_definitions.h"
 #include "iceberg/conversion/values_protobuf.h"
 #include "iceberg/datatypes.h"
@@ -28,9 +29,11 @@
 #include <gtest/gtest.h>
 
 #include <memory>
+#include <optional>
 
 using namespace iceberg;
-using namespace testing;
+using namespace iceberg::testing;
+using namespace ::testing;
 
 MATCHER_P3(IsField, id, name, type, "") {
     *result_listener << fmt::format(
@@ -203,44 +206,6 @@ TEST(SchemaProtobuf, TestInvalidSchema) {
     }
 }
 
-using namespace iceberg;
-using namespace testing;
-
-template<typename ValueT>
-auto IcebergPrimitive(const auto& value) {
-    return VariantWith<primitive_value>(
-      VariantWith<ValueT>(Field(&ValueT::val, Eq(value))));
-}
-
-template<typename ValueT>
-auto OptionalIcebergPrimitive(const auto& value) {
-    return Optional(IcebergPrimitive<ValueT>(value));
-}
-
-template<typename... MatcherT>
-auto IcebergStruct(MatcherT... matchers) {
-    using struct_t = std::unique_ptr<struct_value>;
-    return Optional(VariantWith<struct_t>(Pointee(Field(
-      &struct_value::fields,
-      ElementsAre(std::forward<MatcherT>(matchers)...)))));
-}
-
-template<typename MatcherT>
-auto IcebergList(MatcherT matcher) {
-    return Optional(VariantWith<std::unique_ptr<list_value>>(
-      Pointee(Field(&list_value::elements, std::forward<MatcherT>(matcher)))));
-}
-
-template<typename MatcherT>
-auto IcebergMap(MatcherT matcher) {
-    return Optional(VariantWith<std::unique_ptr<map_value>>(
-      Pointee(Field(&map_value::kvs, std::forward<MatcherT>(matcher)))));
-}
-
-template<typename KeyMatcherT, typename ValueMatcherT>
-auto IcebergKeyValue(KeyMatcherT k_matcher, ValueMatcherT v_matcher) {
-    return FieldsAre(k_matcher, v_matcher);
-}
 template<typename Message>
 ss::future<iceberg::optional_value_outcome>
 serialize_and_convert(const Message& msg) {
@@ -259,7 +224,6 @@ TEST_CORO(values_protobuf, TestSimpleValueConversion) {
     message.set_email("test@redpanda.com");
     message.mutable_dept()->set_name("Redpanda test dept");
     message.mutable_dept()->set_id(1024);
-    message.set_test_coverage("test coverage");
 
     auto result = co_await serialize_and_convert(message);
 
@@ -278,7 +242,7 @@ TEST_CORO(values_protobuf, TestSimpleValueConversion) {
         IcebergStruct(
           OptionalIcebergPrimitive<int_value>(1024),
           OptionalIcebergPrimitive<string_value>("Redpanda test dept")),
-        OptionalIcebergPrimitive<string_value>("test coverage")));
+        Eq(std::nullopt)));
 }
 
 Partition
@@ -515,8 +479,9 @@ TEST_CORO(values_protobuf, TestSettingEmtpyNestedMessage) {
     // Nested message is empty so it fields are all defaults.
     EXPECT_THAT(
       field,
-      IcebergStruct(OptionalIcebergPrimitive<int_value>(
-        field_descriptor->default_value_int32())));
+      IcebergStruct(
+        OptionalIcebergPrimitive<int_value>(
+          field_descriptor->default_value_int32())));
 }
 
 TEST_CORO(values_protobuf, TestSettingDeeplyNestedMessages) {

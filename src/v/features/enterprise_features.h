@@ -11,10 +11,10 @@
 
 #pragma once
 
+#include "absl/container/flat_hash_set.h"
 #include "config/configuration.h"
 #include "config/property.h"
 
-#include <absl/container/flat_hash_set.h>
 #include <boost/range/iterator_range.hpp>
 
 #include <iosfwd>
@@ -33,6 +33,7 @@ enum class license_required_feature {
     fips,
     datalake_iceberg,
     leadership_pinning,
+    shadow_linking,
 };
 
 std::ostream& operator<<(std::ostream&, license_required_feature);
@@ -66,6 +67,7 @@ public:
     // | Cluster     | `enable_schema_id_validation`   | `redpanda`    |
     // | Cluster     | `enable_schema_id_validation`   | `compat`      |
     // | Cluster     | `iceberg_enabled`               | `true`        |
+    // | Cluster     | `enable_shadow_linking`         | `true`        |
     // | Node        | `fips_mode`                     | `enabled`     |
     // | Node        | `fips_mode`                     | `permissive`  |
     // +-------------+---------------------------------+---------------+

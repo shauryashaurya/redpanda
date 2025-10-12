@@ -11,6 +11,7 @@
 
 #include "pandaproxy/schema_registry/avro.h"
 
+#include "absl/container/flat_hash_set.h"
 #include "bytes/streambuf.h"
 #include "json/allocator.h"
 #include "json/chunked_input_stream.h"
@@ -29,7 +30,6 @@
 #include <seastar/coroutine/exception.hh>
 #include <seastar/util/defer.hh>
 
-#include <absl/container/flat_hash_set.h>
 #include <avro/Compiler.hh>
 #include <avro/Exception.hh>
 #include <avro/GenericDatum.hh>
@@ -594,9 +594,10 @@ make_avro_schema_definition(schema_getter& store, subject_schema schema) {
         ex = e;
     }
     co_return ss::coroutine::exception(
-      std::make_exception_ptr(as_exception(error_info{
-        error_code::schema_invalid,
-        fmt::format("Invalid schema {}", ex->what())})));
+      std::make_exception_ptr(as_exception(
+        error_info{
+          error_code::schema_invalid,
+          fmt::format("Invalid schema {}", ex->what())})));
 }
 
 result<schema_definition>
@@ -658,6 +659,16 @@ ss::future<subject_schema> make_canonical_avro_schema(
     co_return subject_schema{
       std::move(sub),
       sanitize_avro_schema_definition(std::move(schema)).value()};
+}
+
+ss::future<schema_definition> format_avro_schema_definition(
+  schema_getter&, schema_definition schema, output_format format) {
+    switch (format) {
+    case output_format::resolved:
+        throw as_exception(format_not_supported(format));
+    default:
+        co_return std::move(schema);
+    }
 }
 
 compatibility_result check_compatible(

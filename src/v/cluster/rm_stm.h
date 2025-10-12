@@ -11,15 +11,15 @@
 
 #pragma once
 
+#include "absl/container/flat_hash_map.h"
 #include "bytes/iobuf.h"
 #include "cluster/fwd.h"
 #include "cluster/producer_state.h"
 #include "cluster/rm_stm_types.h"
 #include "cluster/state_machine_registry.h"
-#include "cluster/topic_table.h"
 #include "cluster/tx_utils.h"
 #include "config/property.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "features/feature_table.h"
 #include "metrics/metrics.h"
 #include "model/fundamental.h"
@@ -28,19 +28,12 @@
 #include "raft/state_machine.h"
 #include "storage/snapshot.h"
 #include "utils/available_promise.h"
-#include "utils/mutex.h"
 #include "utils/prefix_logger.h"
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/shared_ptr.hh>
 
-#include <absl/container/btree_map.h>
-#include <absl/container/btree_set.h>
-#include <absl/container/flat_hash_map.h>
-#include <absl/container/node_hash_map.h>
-
 #include <string_view>
-#include <system_error>
 
 struct rm_stm_test_fixture;
 
@@ -155,7 +148,7 @@ public:
      * transactions this will return next offset to be applied to the the stm.
      */
     model::offset last_stable_offset();
-    ss::future<fragmented_vector<tx::tx_range>>
+    ss::future<chunked_vector<tx::tx_range>>
       aborted_transactions(model::offset, model::offset);
 
     /**
@@ -187,7 +180,7 @@ public:
         return storage::stm_type::user_topic_transactional;
     }
 
-    ss::future<fragmented_vector<model::tx_range>>
+    ss::future<chunked_vector<model::tx_range>>
     aborted_tx_ranges(model::offset from, model::offset to) override {
         return aborted_transactions(from, to);
     }
@@ -221,7 +214,9 @@ public:
 
     uint64_t get_local_snapshot_size() const override;
 
-    ss::future<iobuf> take_snapshot(model::offset) final { co_return iobuf{}; }
+    ss::future<iobuf> take_raft_snapshot(model::offset) final {
+        co_return iobuf{};
+    }
 
     const producers_t& get_producers() const { return _producers; }
 
@@ -238,7 +233,7 @@ protected:
 private:
     void setup_metrics();
     ss::future<> do_remove_persistent_state();
-    ss::future<fragmented_vector<tx::tx_range>>
+    ss::future<chunked_vector<tx::tx_range>>
       do_aborted_transactions(model::offset, model::offset);
 
     // Tells whether the producer is already known or is created
@@ -354,8 +349,8 @@ private:
 
     // Populated from state machine up calls.
     struct aborted_tx_state {
-        fragmented_vector<tx::tx_range> aborted;
-        fragmented_vector<tx::abort_index> abort_indexes;
+        chunked_vector<tx::tx_range> aborted;
+        chunked_vector<tx::abort_index> abort_indexes;
         tx::abort_snapshot last_abort_snapshot{.last = model::offset(-1)};
     };
 

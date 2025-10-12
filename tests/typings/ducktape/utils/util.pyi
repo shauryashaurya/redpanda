@@ -1,0 +1,14 @@
+from typing import Any, Callable
+
+from ducktape.errors import TimeoutError as TimeoutError
+
+def wait_until(
+    condition: Callable[[], Any],
+    timeout_sec: float,
+    backoff_sec: float = ...,
+    err_msg: str | Callable[[], str] = ...,
+    retry_on_exc: bool = ...,
+) -> None: ...
+def package_is_installed(package_name): ...
+def ducktape_version(): ...
+def load_function(func_module_path): ...

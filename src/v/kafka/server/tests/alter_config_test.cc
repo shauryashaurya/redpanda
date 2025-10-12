@@ -7,9 +7,10 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0
 
+#include "absl/container/flat_hash_map.h"
 #include "config/configuration.h"
 #include "config/leaders_preference.h"
-#include "container/fragmented_vector.h"
+#include "container/chunked_vector.h"
 #include "features/enterprise_feature_messages.h"
 #include "kafka/protocol/alter_configs.h"
 #include "kafka/protocol/create_topics.h"
@@ -23,15 +24,17 @@
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "model/namespace.h"
+#include "test_utils/boost_fixture.h"
 #include "test_utils/scoped_config.h"
 
 #include <seastar/core/loop.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/util/defer.hh>
 
-#include <absl/container/flat_hash_map.h>
 #include <boost/test/tools/context.hpp>
+#include <boost/test/unit_test.hpp>
 
+#include <functional>
 #include <optional>
 
 using namespace std::chrono_literals; // NOLINT
@@ -96,11 +99,12 @@ public:
         chunked_vector<kafka::incremental_alterable_config> cfg_list;
         cfg_list.reserve(operations.size());
         for (auto& [k, v] : operations) {
-            cfg_list.push_back(kafka::incremental_alterable_config{
-              .name = k,
-              .config_operation = static_cast<int8_t>(v.second),
-              .value = v.first,
-            });
+            cfg_list.push_back(
+              kafka::incremental_alterable_config{
+                .name = k,
+                .config_operation = static_cast<int8_t>(v.second),
+                .value = v.first,
+              });
         }
 
         return kafka::incremental_alter_configs_resource{
@@ -617,7 +621,7 @@ FIXTURE_TEST(
     auto client = make_kafka_client().get();
     client.connect().get();
     auto resp = client.dispatch(std::move(req), kafka::api_version(1)).get();
-    client.stop().then([&client] { client.shutdown(); }).get();
+    client.stop().get();
     auto broker_id = std::to_string(resp.data.brokers[0].node_id());
 
     std::vector<ss::sstring> all_properties = {
@@ -751,7 +755,10 @@ FIXTURE_TEST(
       "delete.retention.ms",
       "min.cleanable.dirty.ratio",
       "redpanda.remote.allowgaps",
-    };
+      "min.compaction.lag.ms",
+      "max.compaction.lag.ms",
+      "message.timestamp.before.max.ms",
+      "message.timestamp.after.max.ms"};
 
     // All properties_request
     auto all_describe_resp = describe_configs(test_tp);
@@ -1353,11 +1360,9 @@ FIXTURE_TEST(test_iceberg_property, alter_config_test_fixture) {
     {
         // Altering iceberg configuration on an internal topic should fail
         // create an internal topic
-        BOOST_REQUIRE(kafka::try_create_consumer_group_topic(
-                        app.coordinator_ntp_mapper.local(),
-                        app.controller->get_topics_frontend().local(),
-                        1)
-                        .get());
+        BOOST_REQUIRE(
+          app.group_initializer.local().assure_topic_exists().get());
+
         // enable authorization on it, to be able to make alter requests.
         config.get("kafka_nodelete_topics")
           .set_value(std::vector<ss::sstring>{});

@@ -11,8 +11,10 @@
 #include "base/vassert.h"
 #include "bytes/bytes.h"
 #include "config/mock_property.h"
+#include "container/chunked_circular_buffer.h"
 #include "finjector/stress_fiber.h"
 #include "model/fundamental.h"
+#include "model/limits.h"
 #include "model/namespace.h"
 #include "model/record.h"
 #include "model/record_batch_reader.h"
@@ -23,6 +25,8 @@
 #include "model/timestamp.h"
 #include "random/generators.h"
 #include "reflection/adl.h"
+#include "resource_mgmt/memory_groups.h"
+#include "ssx/future-util.h"
 #include "storage/batch_cache.h"
 #include "storage/disk_log_impl.h"
 #include "storage/log_housekeeping_meta.h"
@@ -31,8 +35,8 @@
 #include "storage/ntp_config.h"
 #include "storage/record_batch_builder.h"
 #include "storage/segment_utils.h"
+#include "storage/tests/batch_generators.h"
 #include "storage/tests/common.h"
-#include "storage/tests/disk_log_builder_fixture.h"
 #include "storage/tests/storage_test_fixture.h"
 #include "storage/tests/utils/disk_log_builder.h"
 #include "storage/tests/utils/log_gap_analysis.h"
@@ -40,20 +44,21 @@
 #include "test_utils/async.h"
 #include "test_utils/random_bytes.h"
 #include "test_utils/randoms.h"
-#include "test_utils/tmp_dir.h"
+#include "test_utils/scoped_config.h"
+#include "test_utils/test_macros.h"
 #include "utils/directory_walker.h"
 #include "utils/tristate.h"
 
-#include <seastar/core/io_priority_class.hh>
 #include <seastar/core/loop.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/core/sleep.hh>
+#include <seastar/core/timed_out_error.hh>
 #include <seastar/core/when_all.hh>
 #include <seastar/util/defer.hh>
 #include <seastar/util/log.hh>
 
-#include <boost/test/tools/old/interface.hpp>
 #include <fmt/chrono.h>
+#include <gtest/gtest.h>
 
 #include <algorithm>
 #include <chrono>
@@ -69,12 +74,12 @@ static ss::logger e2e_test_log("storage_e2e_test");
 void validate_offsets(
   model::offset base,
   const std::vector<model::record_batch_header>& write_headers,
-  const ss::circular_buffer<model::record_batch>& read_batches) {
-    BOOST_REQUIRE_EQUAL(write_headers.size(), read_batches.size());
+  const chunked_circular_buffer<model::record_batch>& read_batches) {
+    ASSERT_EQ(write_headers.size(), read_batches.size());
     auto it = read_batches.begin();
     model::offset next_base = base;
     for (const auto& h : write_headers) {
-        BOOST_REQUIRE_EQUAL(it->base_offset(), next_base);
+        ASSERT_EQ(it->base_offset(), next_base);
         // last offset delta is inclusive (record with this offset belongs to
         // previous batch)
         next_base += (h.last_offset_delta + model::offset(1));
@@ -92,8 +97,8 @@ void compact_and_prefix_truncate(
     if (eviction_future.available()) {
         auto evict_until = eviction_future.get();
         log
-          .truncate_prefix(storage::truncate_prefix_config{
-            model::next_offset(evict_until), ss::default_priority_class()})
+          .truncate_prefix(
+            storage::truncate_prefix_config{model::next_offset(evict_until)})
           .get();
     } else {
         as.request_abort();
@@ -101,10 +106,9 @@ void compact_and_prefix_truncate(
     }
 }
 
-FIXTURE_TEST(
-  test_assinging_offsets_in_single_segment_log, storage_test_fixture) {
+TEST_F(storage_test_fixture, test_assigning_offsets_in_single_segment_log) {
     storage::log_manager mgr = make_log_manager();
-    info("Configuration: {}", mgr.config());
+    SUCCEED() << fmt::format("Configuration: {}", mgr.config());
     auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
     auto ntp = model::ntp("default", "test", 0);
     auto log
@@ -113,18 +117,18 @@ FIXTURE_TEST(
     log->flush().get();
     auto batches = read_and_validate_all_batches(log);
 
-    BOOST_REQUIRE_EQUAL(headers.size(), batches.size());
+    ASSERT_EQ(headers.size(), batches.size());
     auto lstats = log->offsets();
     auto last_term_start_offset = log->find_last_term_start_offset();
-    BOOST_REQUIRE_EQUAL(lstats.dirty_offset, batches.back().last_offset());
-    BOOST_REQUIRE_EQUAL(last_term_start_offset, batches.front().base_offset());
-    BOOST_REQUIRE_EQUAL(lstats.committed_offset, batches.back().last_offset());
+    ASSERT_EQ(lstats.dirty_offset, batches.back().last_offset());
+    ASSERT_EQ(last_term_start_offset, batches.front().base_offset());
+    ASSERT_EQ(lstats.committed_offset, batches.back().last_offset());
     validate_offsets(model::offset(0), headers, batches);
 };
 
-FIXTURE_TEST(append_twice_to_same_segment, storage_test_fixture) {
+TEST_F(storage_test_fixture, append_twice_to_same_segment) {
     storage::log_manager mgr = make_log_manager();
-    info("Configuration: {}", mgr.config());
+    SUCCEED() << fmt::format("Configuration: {}", mgr.config());
     auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
     auto ntp = model::ntp("default", "test", 0);
     auto log
@@ -137,19 +141,19 @@ FIXTURE_TEST(append_twice_to_same_segment, storage_test_fixture) {
       std::begin(headers_2), std::end(headers_2), std::back_inserter(headers));
     auto batches = read_and_validate_all_batches(log);
 
-    BOOST_REQUIRE_EQUAL(headers.size(), batches.size());
+    ASSERT_EQ(headers.size(), batches.size());
     auto lstats = log->offsets();
     auto last_term_start_offset = log->find_last_term_start_offset();
-    BOOST_REQUIRE_EQUAL(last_term_start_offset, batches.front().base_offset());
-    BOOST_REQUIRE_EQUAL(lstats.dirty_offset, batches.back().last_offset());
-    BOOST_REQUIRE_EQUAL(lstats.committed_offset, batches.back().last_offset());
+    ASSERT_EQ(last_term_start_offset, batches.front().base_offset());
+    ASSERT_EQ(lstats.dirty_offset, batches.back().last_offset());
+    ASSERT_EQ(lstats.committed_offset, batches.back().last_offset());
 };
 
-FIXTURE_TEST(test_assigning_offsets_in_multiple_segment, storage_test_fixture) {
+TEST_F(storage_test_fixture, test_assigning_offsets_in_multiple_segment) {
     auto cfg = default_log_config(test_dir);
     cfg.max_segment_size = config::mock_binding<size_t>(1_KiB);
     storage::log_manager mgr = make_log_manager(std::move(cfg));
-    info("Configuration: {}", mgr.config());
+    SUCCEED() << fmt::format("Configuration: {}", mgr.config());
     auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
     auto ntp = model::ntp("default", "test", 0);
     auto log
@@ -158,20 +162,20 @@ FIXTURE_TEST(test_assigning_offsets_in_multiple_segment, storage_test_fixture) {
     log->flush().get();
     auto batches = read_and_validate_all_batches(log);
 
-    BOOST_REQUIRE_EQUAL(headers.size(), batches.size());
+    ASSERT_EQ(headers.size(), batches.size());
     auto lstats = log->offsets();
     auto last_term_start_offset = log->find_last_term_start_offset();
-    BOOST_REQUIRE_EQUAL(last_term_start_offset, batches.front().base_offset());
-    BOOST_REQUIRE_EQUAL(lstats.dirty_offset, batches.back().last_offset());
-    BOOST_REQUIRE_EQUAL(lstats.committed_offset, batches.back().last_offset());
+    ASSERT_EQ(last_term_start_offset, batches.front().base_offset());
+    ASSERT_EQ(lstats.dirty_offset, batches.back().last_offset());
+    ASSERT_EQ(lstats.committed_offset, batches.back().last_offset());
     validate_offsets(model::offset(0), headers, batches);
 };
 
-FIXTURE_TEST(test_single_record_per_segment, storage_test_fixture) {
+TEST_F(storage_test_fixture, test_single_record_per_segment) {
     auto cfg = default_log_config(test_dir);
     cfg.max_segment_size = config::mock_binding<size_t>(10);
     storage::log_manager mgr = make_log_manager(std::move(cfg));
-    info("Configuration: {}", mgr.config());
+    SUCCEED() << fmt::format("Configuration: {}", mgr.config());
     auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
     auto ntp = model::ntp("default", "test", 0);
     auto log
@@ -180,34 +184,36 @@ FIXTURE_TEST(test_single_record_per_segment, storage_test_fixture) {
       log,
       10,
       model::term_id(1),
+      std::nullopt,
       [](std::optional<model::timestamp> ts = std::nullopt) {
-          ss::circular_buffer<model::record_batch> batches;
-          batches.push_back(model::test::make_random_batch(
-            model::offset(0),
-            1,
-            true,
-            model::record_batch_type::raft_data,
-            std::nullopt,
-            ts));
+          chunked_circular_buffer<model::record_batch> batches;
+          batches.push_back(
+            model::test::make_random_batch(
+              model::offset(0),
+              1,
+              true,
+              model::record_batch_type::raft_data,
+              std::nullopt,
+              ts));
           return batches;
       });
     log->flush().get();
     auto batches = read_and_validate_all_batches(log);
-    info("Flushed log: {}", log);
-    BOOST_REQUIRE_EQUAL(headers.size(), batches.size());
+    SUCCEED() << fmt::format("Flushed log: {}", log);
+    ASSERT_EQ(headers.size(), batches.size());
     auto lstats = log->offsets();
     auto last_term_start_offset = log->find_last_term_start_offset();
-    BOOST_REQUIRE_EQUAL(last_term_start_offset, batches.front().base_offset());
-    BOOST_REQUIRE_EQUAL(lstats.dirty_offset, batches.back().last_offset());
-    BOOST_REQUIRE_EQUAL(lstats.committed_offset, batches.back().last_offset());
+    ASSERT_EQ(last_term_start_offset, batches.front().base_offset());
+    ASSERT_EQ(lstats.dirty_offset, batches.back().last_offset());
+    ASSERT_EQ(lstats.committed_offset, batches.back().last_offset());
     validate_offsets(model::offset(0), headers, batches);
 };
 
-FIXTURE_TEST(test_segment_rolling, storage_test_fixture) {
+TEST_F(storage_test_fixture, test_segment_rolling) {
     auto cfg = default_log_config(test_dir);
     cfg.max_segment_size = config::mock_binding<size_t>(10 * 1024);
     storage::log_manager mgr = make_log_manager(std::move(cfg));
-    info("Configuration: {}", mgr.config());
+    SUCCEED() << fmt::format("Configuration: {}", mgr.config());
     auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
     auto ntp = model::ntp("default", "test", 0);
     auto log
@@ -216,60 +222,63 @@ FIXTURE_TEST(test_segment_rolling, storage_test_fixture) {
       log,
       10,
       model::term_id(1),
+      std::nullopt,
       [](std::optional<model::timestamp> ts = std::nullopt)
-        -> ss::circular_buffer<model::record_batch> {
-          ss::circular_buffer<model::record_batch> batches;
-          batches.push_back(model::test::make_random_batch(
-            model::offset(0),
-            1,
-            true,
-            model::record_batch_type::raft_data,
-            std::nullopt,
-            ts));
+        -> chunked_circular_buffer<model::record_batch> {
+          chunked_circular_buffer<model::record_batch> batches;
+          batches.push_back(
+            model::test::make_random_batch(
+              model::offset(0),
+              1,
+              true,
+              model::record_batch_type::raft_data,
+              std::nullopt,
+              ts));
           return batches;
       },
       storage::log_append_config::fsync::no,
       false);
     log->flush().get();
     auto batches = read_and_validate_all_batches(log);
-    info("Flushed log: {}", log);
-    BOOST_REQUIRE_EQUAL(headers.size(), batches.size());
+    SUCCEED() << fmt::format("Flushed log: {}", log);
+    ASSERT_EQ(headers.size(), batches.size());
     auto lstats = log->offsets();
     auto last_term_start_offset = log->find_last_term_start_offset();
-    BOOST_REQUIRE_EQUAL(last_term_start_offset, batches.front().base_offset());
-    BOOST_REQUIRE_EQUAL(lstats.dirty_offset, batches.back().last_offset());
-    BOOST_REQUIRE_EQUAL(lstats.committed_offset, batches.back().last_offset());
+    ASSERT_EQ(last_term_start_offset, batches.front().base_offset());
+    ASSERT_EQ(lstats.dirty_offset, batches.back().last_offset());
+    ASSERT_EQ(lstats.committed_offset, batches.back().last_offset());
     validate_offsets(model::offset(0), headers, batches);
     /// Do the second append round
     auto new_headers = append_random_batches(
       log,
       10,
       model::term_id(1),
+      std::nullopt,
       [](std::optional<model::timestamp> ts = std::nullopt) {
-          ss::circular_buffer<model::record_batch> batches;
-          batches.push_back(model::test::make_random_batch(
-            model::offset(0),
-            1,
-            true,
-            model::record_batch_type::raft_data,
-            std::nullopt,
-            ts));
+          chunked_circular_buffer<model::record_batch> batches;
+          batches.push_back(
+            model::test::make_random_batch(
+              model::offset(0),
+              1,
+              true,
+              model::record_batch_type::raft_data,
+              std::nullopt,
+              ts));
           return batches;
       },
       storage::log_append_config::fsync::no,
       false);
     auto new_lstats = log->offsets();
-    BOOST_REQUIRE_GE(new_lstats.committed_offset, lstats.committed_offset);
+    ASSERT_GE(new_lstats.committed_offset, lstats.committed_offset);
     auto new_batches = read_and_validate_all_batches(
       log, lstats.committed_offset);
-    BOOST_REQUIRE_EQUAL(last_term_start_offset, batches.front().base_offset());
-    BOOST_REQUIRE_EQUAL(
-      new_lstats.committed_offset, new_batches.back().last_offset());
+    ASSERT_EQ(last_term_start_offset, batches.front().base_offset());
+    ASSERT_EQ(new_lstats.committed_offset, new_batches.back().last_offset());
 };
 
-FIXTURE_TEST(test_reading_range_from_a_log, storage_test_fixture) {
+TEST_F(storage_test_fixture, test_reading_range_from_a_log) {
     storage::log_manager mgr = make_log_manager();
-    info("Configuration: {}", mgr.config());
+    SUCCEED() << fmt::format("Configuration: {}", mgr.config());
     auto ntp = model::ntp("default", "test", 0);
     auto log
       = mgr.manage(storage::ntp_config(ntp, mgr.config().base_dir)).get();
@@ -281,22 +290,22 @@ FIXTURE_TEST(test_reading_range_from_a_log, storage_test_fixture) {
     // range from base of beging to last of end
     auto range = read_range_to_vector(
       log, batches[3].base_offset(), batches[7].last_offset());
-    BOOST_REQUIRE_EQUAL(range.size(), 5);
-    BOOST_REQUIRE_EQUAL(range.front().header().crc, batches[3].header().crc);
-    BOOST_REQUIRE_EQUAL(range.back().header().crc, batches[7].header().crc);
+    ASSERT_EQ(range.size(), 5);
+    ASSERT_EQ(range.front().header().crc, batches[3].header().crc);
+    ASSERT_EQ(range.back().header().crc, batches[7].header().crc);
     // Range is inclusive base offset points to batch[7] so it have to be
     // included
     range = read_range_to_vector(
       log, batches[3].base_offset(), batches[7].base_offset());
-    BOOST_REQUIRE_EQUAL(range.size(), 5);
-    BOOST_REQUIRE_EQUAL(range.front().header().crc, batches[3].header().crc);
-    BOOST_REQUIRE_EQUAL(range.back().header().crc, batches[7].header().crc);
+    ASSERT_EQ(range.size(), 5);
+    ASSERT_EQ(range.front().header().crc, batches[3].header().crc);
+    ASSERT_EQ(range.back().header().crc, batches[7].header().crc);
 
     range = read_range_to_vector(
       log, batches[3].last_offset(), batches[7].base_offset());
-    BOOST_REQUIRE_EQUAL(range.size(), 5);
-    BOOST_REQUIRE_EQUAL(range.front().header().crc, batches[3].header().crc);
-    BOOST_REQUIRE_EQUAL(range.back().header().crc, batches[7].header().crc);
+    ASSERT_EQ(range.size(), 5);
+    ASSERT_EQ(range.front().header().crc, batches[3].header().crc);
+    ASSERT_EQ(range.back().header().crc, batches[7].header().crc);
 
     // Range that starts and ends in the middle of the same batch.
     range = read_range_to_vector(
@@ -304,23 +313,22 @@ FIXTURE_TEST(test_reading_range_from_a_log, storage_test_fixture) {
       batches[3].base_offset() + model::offset(batches[3].record_count() / 3),
       batches[3].base_offset()
         + model::offset(batches[3].record_count() / 3 * 2LL));
-    BOOST_REQUIRE_EQUAL(range.size(), 1);
-    BOOST_REQUIRE_EQUAL(range.front().header().crc, batches[3].header().crc);
+    ASSERT_EQ(range.size(), 1);
+    ASSERT_EQ(range.front().header().crc, batches[3].header().crc);
 
     // Range that starts and ends in the middle of batches.
     range = read_range_to_vector(
       log,
       batches[3].base_offset() + model::offset(batches[3].record_count() / 2),
       batches[7].base_offset() + model::offset(batches[7].record_count() / 2));
-    BOOST_REQUIRE_EQUAL(range.size(), 5);
-    BOOST_REQUIRE_EQUAL(range.front().header().crc, batches[3].header().crc);
-    BOOST_REQUIRE_EQUAL(range.back().header().crc, batches[7].header().crc);
+    ASSERT_EQ(range.size(), 5);
+    ASSERT_EQ(range.front().header().crc, batches[3].header().crc);
+    ASSERT_EQ(range.back().header().crc, batches[7].header().crc);
 };
 
-FIXTURE_TEST(
-  test_reading_range_from_a_log_with_write_caching, storage_test_fixture) {
+TEST_F(storage_test_fixture, test_reading_range_from_a_log_with_write_caching) {
     storage::log_manager mgr = make_log_manager();
-    info("Configuration: {}", mgr.config());
+    SUCCEED() << fmt::format("Configuration: {}", mgr.config());
     auto ntp = model::ntp("default", "test", 0);
     auto log
       = mgr.manage(storage::ntp_config(ntp, mgr.config().base_dir)).get();
@@ -329,6 +337,7 @@ FIXTURE_TEST(
       log,
       10,
       model::term_id(0),
+      std::nullopt,
       {},
       storage::log_append_config::fsync::no,
       false);
@@ -337,40 +346,40 @@ FIXTURE_TEST(
     storage::testing_details::log_manager_accessor::batch_cache(mgr).clear();
 
     auto batches = read_and_validate_all_batches(log);
-    BOOST_REQUIRE_EQUAL(batches.size(), headers.size());
+    ASSERT_EQ(batches.size(), headers.size());
 
     // range from base of beging to last of end
     auto range = read_range_to_vector(
       log, batches[3].base_offset(), batches[7].last_offset());
-    BOOST_REQUIRE_EQUAL(range.size(), 5);
-    BOOST_REQUIRE_EQUAL(range.front().header().crc, batches[3].header().crc);
-    BOOST_REQUIRE_EQUAL(range.back().header().crc, batches[7].header().crc);
+    ASSERT_EQ(range.size(), 5);
+    ASSERT_EQ(range.front().header().crc, batches[3].header().crc);
+    ASSERT_EQ(range.back().header().crc, batches[7].header().crc);
     // Range is inclusive base offset points to batch[7] so it have to be
     // included
     range = read_range_to_vector(
       log, batches[3].base_offset(), batches[7].base_offset());
-    BOOST_REQUIRE_EQUAL(range.size(), 5);
-    BOOST_REQUIRE_EQUAL(range.front().header().crc, batches[3].header().crc);
-    BOOST_REQUIRE_EQUAL(range.back().header().crc, batches[7].header().crc);
+    ASSERT_EQ(range.size(), 5);
+    ASSERT_EQ(range.front().header().crc, batches[3].header().crc);
+    ASSERT_EQ(range.back().header().crc, batches[7].header().crc);
 
     range = read_range_to_vector(
       log, batches[3].last_offset(), batches[7].base_offset());
-    BOOST_REQUIRE_EQUAL(range.size(), 5);
-    BOOST_REQUIRE_EQUAL(range.front().header().crc, batches[3].header().crc);
-    BOOST_REQUIRE_EQUAL(range.back().header().crc, batches[7].header().crc);
+    ASSERT_EQ(range.size(), 5);
+    ASSERT_EQ(range.front().header().crc, batches[3].header().crc);
+    ASSERT_EQ(range.back().header().crc, batches[7].header().crc);
     // range from base of beging to the middle of end
     range = read_range_to_vector(
       log,
       batches[3].base_offset(),
       batches[7].base_offset() + model::offset(batches[7].record_count() / 2));
-    BOOST_REQUIRE_EQUAL(range.size(), 5);
-    BOOST_REQUIRE_EQUAL(range.front().header().crc, batches[3].header().crc);
-    BOOST_REQUIRE_EQUAL(range.back().header().crc, batches[7].header().crc);
+    ASSERT_EQ(range.size(), 5);
+    ASSERT_EQ(range.front().header().crc, batches[3].header().crc);
+    ASSERT_EQ(range.back().header().crc, batches[7].header().crc);
 };
 
-FIXTURE_TEST(test_truncation_with_write_caching, storage_test_fixture) {
+TEST_F(storage_test_fixture, test_truncation_with_write_caching) {
     storage::log_manager mgr = make_log_manager();
-    info("Configuration: {}", mgr.config());
+    SUCCEED() << fmt::format("Configuration: {}", mgr.config());
     auto ntp = model::ntp("default", "test", 0);
     auto log
       = mgr.manage(storage::ntp_config(ntp, mgr.config().base_dir)).get();
@@ -379,6 +388,7 @@ FIXTURE_TEST(test_truncation_with_write_caching, storage_test_fixture) {
       log,
       10,
       model::term_id(0),
+      std::nullopt,
       {},
       storage::log_append_config::fsync::no,
       false);
@@ -392,49 +402,46 @@ FIXTURE_TEST(test_truncation_with_write_caching, storage_test_fixture) {
         return o;
     }();
 
-    log
-      ->truncate(
-        storage::truncate_config(truncate_offset, ss::default_priority_class()))
-      .get();
+    log->truncate(storage::truncate_config(truncate_offset)).get();
 
     // Reclaim everything from cache.
     storage::testing_details::log_manager_accessor::batch_cache(mgr).clear();
 
     auto batches = read_and_validate_all_batches(log);
-    BOOST_REQUIRE_EQUAL(batches.size(), truncate_batch_ix);
+    ASSERT_EQ(batches.size(), truncate_batch_ix);
 
     // range from base of beging to last of end
     auto range = read_range_to_vector(
       log, batches[3].base_offset(), batches[7].last_offset());
-    BOOST_REQUIRE_EQUAL(range.size(), 5);
-    BOOST_REQUIRE_EQUAL(range.front().header().crc, batches[3].header().crc);
-    BOOST_REQUIRE_EQUAL(range.back().header().crc, batches[7].header().crc);
+    ASSERT_EQ(range.size(), 5);
+    ASSERT_EQ(range.front().header().crc, batches[3].header().crc);
+    ASSERT_EQ(range.back().header().crc, batches[7].header().crc);
     // Range is inclusive base offset points to batch[7] so it have to be
     // included
     range = read_range_to_vector(
       log, batches[3].base_offset(), batches[7].base_offset());
-    BOOST_REQUIRE_EQUAL(range.size(), 5);
-    BOOST_REQUIRE_EQUAL(range.front().header().crc, batches[3].header().crc);
-    BOOST_REQUIRE_EQUAL(range.back().header().crc, batches[7].header().crc);
+    ASSERT_EQ(range.size(), 5);
+    ASSERT_EQ(range.front().header().crc, batches[3].header().crc);
+    ASSERT_EQ(range.back().header().crc, batches[7].header().crc);
 
     range = read_range_to_vector(
       log, batches[3].last_offset(), batches[7].base_offset());
-    BOOST_REQUIRE_EQUAL(range.size(), 5);
-    BOOST_REQUIRE_EQUAL(range.front().header().crc, batches[3].header().crc);
-    BOOST_REQUIRE_EQUAL(range.back().header().crc, batches[7].header().crc);
+    ASSERT_EQ(range.size(), 5);
+    ASSERT_EQ(range.front().header().crc, batches[3].header().crc);
+    ASSERT_EQ(range.back().header().crc, batches[7].header().crc);
     // range from base of beging to the middle of end
     range = read_range_to_vector(
       log,
       batches[3].base_offset(),
       batches[7].base_offset() + model::offset(batches[7].record_count() / 2));
-    BOOST_REQUIRE_EQUAL(range.size(), 5);
-    BOOST_REQUIRE_EQUAL(range.front().header().crc, batches[3].header().crc);
-    BOOST_REQUIRE_EQUAL(range.back().header().crc, batches[7].header().crc);
+    ASSERT_EQ(range.size(), 5);
+    ASSERT_EQ(range.front().header().crc, batches[3].header().crc);
+    ASSERT_EQ(range.back().header().crc, batches[7].header().crc);
 };
 
-FIXTURE_TEST(test_rolling_term, storage_test_fixture) {
+TEST_F(storage_test_fixture, test_rolling_term) {
     storage::log_manager mgr = make_log_manager();
-    info("Configuration: {}", mgr.config());
+    SUCCEED() << fmt::format("Configuration: {}", mgr.config());
     auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
     auto ntp = model::ntp("default", "test", 0);
     auto log
@@ -448,30 +455,29 @@ FIXTURE_TEST(test_rolling_term, storage_test_fixture) {
             current_offset += h.last_offset_delta + 1;
         }
         log->flush().get();
-        BOOST_REQUIRE_EQUAL(
+        ASSERT_EQ(
           model::term_id(i),
           log->get_term(current_offset - model::offset(1)).value());
         auto last_term_start_offset = log->find_last_term_start_offset();
-        BOOST_REQUIRE_EQUAL(last_term_start_offset, term_start_offset);
+        ASSERT_EQ(last_term_start_offset, term_start_offset);
         std::move(part.begin(), part.end(), std::back_inserter(headers));
     }
 
     auto read_batches = read_and_validate_all_batches(log);
     auto lstats = log->offsets();
-    BOOST_REQUIRE_EQUAL(lstats.dirty_offset, read_batches.back().last_offset());
-    BOOST_REQUIRE_EQUAL(
-      lstats.committed_offset, read_batches.back().last_offset());
+    ASSERT_EQ(lstats.dirty_offset, read_batches.back().last_offset());
+    ASSERT_EQ(lstats.committed_offset, read_batches.back().last_offset());
 };
 
-FIXTURE_TEST(test_append_batches_from_multiple_terms, storage_test_fixture) {
+TEST_F(storage_test_fixture, test_append_batches_from_multiple_terms) {
     storage::log_manager mgr = make_log_manager();
-    info("Testing type: {}", mgr.config());
+    SUCCEED() << fmt::format("Testing type: {}", mgr.config());
     auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
     auto ntp = model::ntp("default", "test", 0);
     auto log
       = mgr.manage(storage::ntp_config(ntp, mgr.config().base_dir)).get();
     std::vector<model::record_batch_header> headers;
-    ss::circular_buffer<model::record_batch> batches;
+    chunked_circular_buffer<model::record_batch> batches;
     std::vector<size_t> term_batches_counts;
     for (auto i = 0; i < 5; i++) {
         auto term_batches
@@ -486,9 +492,7 @@ FIXTURE_TEST(test_append_batches_from_multiple_terms, storage_test_fixture) {
           std::back_inserter(batches));
     }
     storage::log_append_config append_cfg{
-      storage::log_append_config::fsync::yes,
-      ss::default_priority_class(),
-      model::no_timeout};
+      storage::log_append_config::fsync::yes, model::no_timeout};
     auto reader = model::make_memory_record_batch_reader(std::move(batches));
     std::move(reader)
       .for_each_ref(log->make_appender(append_cfg), append_cfg.timeout)
@@ -497,15 +501,13 @@ FIXTURE_TEST(test_append_batches_from_multiple_terms, storage_test_fixture) {
 
     auto read_batches = read_and_validate_all_batches(log);
     auto lstats = log->offsets();
-    BOOST_REQUIRE_EQUAL(lstats.dirty_offset, read_batches.back().last_offset());
-    BOOST_REQUIRE_EQUAL(
-      lstats.committed_offset, read_batches.back().last_offset());
+    ASSERT_EQ(lstats.dirty_offset, read_batches.back().last_offset());
+    ASSERT_EQ(lstats.committed_offset, read_batches.back().last_offset());
     size_t next = 0;
     int expected_term = 0;
     for (auto c : term_batches_counts) {
         for (size_t i = next; i < next + c; ++i) {
-            BOOST_REQUIRE_EQUAL(
-              read_batches[i].term(), model::term_id(expected_term));
+            ASSERT_EQ(read_batches[i].term(), model::term_id(expected_term));
         }
         expected_term++;
         next = next + c;
@@ -515,7 +517,7 @@ struct custom_ts_batch_generator {
     explicit custom_ts_batch_generator(model::timestamp start_ts)
       : _start_ts(start_ts) {}
 
-    ss::circular_buffer<model::record_batch> operator()(
+    chunked_circular_buffer<model::record_batch> operator()(
       [[maybe_unused]] std::optional<model::timestamp> ts = std::nullopt) {
         // The input timestamp is unused, this class does its own timestamping
         auto batches = model::test::make_random_batches(
@@ -557,7 +559,6 @@ void append_custom_timestamp_batches(
           {std::move(batch)});
         storage::log_append_config cfg{
           .should_fsync = storage::log_append_config::fsync::no,
-          .io_priority = ss::default_priority_class(),
           .timeout = model::no_timeout,
         };
 
@@ -568,8 +569,8 @@ void append_custom_timestamp_batches(
     }
 }
 
-FIXTURE_TEST(
-  test_timestamp_updates_when_max_timestamp_is_not_set, storage_test_fixture) {
+TEST_F(
+  storage_test_fixture, test_timestamp_updates_when_max_timestamp_is_not_set) {
     auto append_batch_with_no_max_ts = [](
                                          ss::shared_ptr<storage::log> log,
                                          model::term_id term,
@@ -594,7 +595,6 @@ FIXTURE_TEST(
           {std::move(batch)});
         storage::log_append_config cfg{
           .should_fsync = storage::log_append_config::fsync::no,
-          .io_priority = ss::default_priority_class(),
           .timeout = model::no_timeout,
         };
 
@@ -617,7 +617,7 @@ FIXTURE_TEST(
     append_batch_with_no_max_ts(log, model::term_id(0), model::timestamp(100));
     append_batch_with_no_max_ts(log, model::term_id(0), model::timestamp(110));
     append_batch_with_no_max_ts(log, model::term_id(0), model::timestamp(120));
-    disk_log->force_roll(ss::default_priority_class()).get();
+    disk_log->force_roll().get();
 
     append_batch_with_no_max_ts(log, model::term_id(0), model::timestamp(200));
     // reordered timestamps
@@ -625,23 +625,19 @@ FIXTURE_TEST(
     append_batch_with_no_max_ts(log, model::term_id(0), model::timestamp(220));
     auto& segments = disk_log->segments();
     // first segment
-    BOOST_REQUIRE_EQUAL(
-      segments[0]->index().base_timestamp(), model::timestamp(100));
-    BOOST_REQUIRE_EQUAL(
-      segments[0]->index().max_timestamp(), model::timestamp(120));
+    ASSERT_EQ(segments[0]->index().base_timestamp(), model::timestamp(100));
+    ASSERT_EQ(segments[0]->index().max_timestamp(), model::timestamp(120));
     // second segment
-    BOOST_REQUIRE_EQUAL(
-      segments[1]->index().base_timestamp(), model::timestamp(200));
-    BOOST_REQUIRE_EQUAL(
-      segments[1]->index().max_timestamp(), model::timestamp(230));
+    ASSERT_EQ(segments[1]->index().base_timestamp(), model::timestamp(200));
+    ASSERT_EQ(segments[1]->index().max_timestamp(), model::timestamp(230));
 };
 
-FIXTURE_TEST(test_time_based_eviction, storage_test_fixture) {
+TEST_F(storage_test_fixture, test_time_based_eviction) {
     auto cfg = default_log_config(test_dir);
     ss::abort_source as;
     storage::log_manager mgr = make_log_manager(cfg);
-    info("Configuration: {}", mgr.config());
-    BOOST_REQUIRE(feature_table.local().is_active(
+    SUCCEED() << fmt::format("Configuration: {}", mgr.config());
+    ASSERT_TRUE(feature_table.local().is_active(
       features::feature::broker_time_based_retention));
     auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
     auto ntp = model::ntp("default", "test", 0);
@@ -657,14 +653,14 @@ FIXTURE_TEST(test_time_based_eviction, storage_test_fixture) {
     // broker timestamp: broker_t0
     append_custom_timestamp_batches(
       disk_log, 10, model::term_id(0), model::timestamp(100));
-    disk_log->force_roll(ss::default_priority_class()).get();
+    disk_log->force_roll().get();
 
     // 2. segment timestamps from 200 to 230
     // b ts: broker_t0 + broker_ts_sep
     ss::sleep(broker_ts_sep).get();
     append_custom_timestamp_batches(
       disk_log, 30, model::term_id(0), model::timestamp(200));
-    disk_log->force_roll(ss::default_priority_class()).get();
+    disk_log->force_roll().get();
 
     // 3. segment timestamps from 231 to 250
     // b_ts: broker_t0 + broker_ts_sep + broker_ts_sep
@@ -683,63 +679,44 @@ FIXTURE_TEST(test_time_based_eviction, storage_test_fixture) {
       std::nullopt,
       model::offset::min(), // should prevent compaction
       std::nullopt,
-      ss::default_priority_class(),
+      std::nullopt,
+      0ms,
       as);
     auto before = disk_log->offsets();
     disk_log->housekeeping(ccfg_no_compact).get();
     auto after = disk_log->offsets();
-    BOOST_REQUIRE_EQUAL(after.start_offset, before.start_offset);
+    ASSERT_EQ(after.start_offset, before.start_offset);
 
     auto make_compaction_cfg =
       [&as](model::timestamp_clock::time_point timestamp) {
-          BOOST_TEST_INFO(fmt::format("compacting up to {}", timestamp));
+          SUCCEED() << fmt::format("compacting up to {}", timestamp);
           return storage::housekeeping_config(
             model::to_timestamp(timestamp),
             std::nullopt,
             model::offset::max(),
             std::nullopt,
-            ss::default_priority_class(),
+            std::nullopt,
+            0ms,
             as);
       };
 
-    // gc with timestamp -1s, no segments should be evicted
+    // gc with timestamp -1s, all segments should be evicted
     compact_and_prefix_truncate(*disk_log, make_compaction_cfg(broker_t0 - 2s));
-    BOOST_REQUIRE_EQUAL(disk_log->segments().size(), 3);
-    BOOST_REQUIRE_EQUAL(
-      disk_log->segments().front()->offsets().get_base_offset(),
-      model::offset(0));
-    BOOST_REQUIRE_EQUAL(
-      disk_log->segments().back()->offsets().get_dirty_offset(),
-      model::offset(59));
-
-    // gc with timestamp +sep/2, should evict first segment
-    compact_and_prefix_truncate(
-      *disk_log, make_compaction_cfg(broker_t0 + (broker_ts_sep / 2)));
-    BOOST_REQUIRE_EQUAL(disk_log->segments().size(), 2);
-    BOOST_REQUIRE_EQUAL(
-      disk_log->segments().front()->offsets().get_base_offset(),
-      model::offset(10));
-    BOOST_REQUIRE_EQUAL(
-      disk_log->segments().back()->offsets().get_dirty_offset(),
-      model::offset(59));
-    // gc with timestamp +sep3/2, should evict another segment
-    compact_and_prefix_truncate(
-      *disk_log, make_compaction_cfg(broker_t0 + (3 * broker_ts_sep / 2)));
-    BOOST_REQUIRE_EQUAL(disk_log->segments().size(), 1);
-    BOOST_REQUIRE_EQUAL(
+    ASSERT_EQ(disk_log->segments().size(), 1);
+    ASSERT_EQ(
       disk_log->segments().front()->offsets().get_base_offset(),
       model::offset(40));
-    BOOST_REQUIRE_EQUAL(
+    ASSERT_EQ(
       disk_log->segments().back()->offsets().get_dirty_offset(),
       model::offset(59));
 };
 
-FIXTURE_TEST(test_size_based_eviction, storage_test_fixture) {
+TEST_F(storage_test_fixture, test_size_based_eviction) {
     auto cfg = default_log_config(test_dir);
     cfg.max_segment_size = config::mock_binding<size_t>(10);
     ss::abort_source as;
     storage::log_manager mgr = make_log_manager(cfg);
-    info("Configuration: {}", mgr.config());
+    SUCCEED() << fmt::format("Configuration: {}", mgr.config());
     auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
     auto ntp = model::ntp("default", "test", 0);
 
@@ -756,7 +733,7 @@ FIXTURE_TEST(test_size_based_eviction, storage_test_fixture) {
       [](size_t acc, model::record_batch& b) { return acc + b.size_bytes(); });
 
     auto lstats = log->offsets();
-    info("Offsets to be evicted {}", lstats);
+    SUCCEED() << fmt::format("Offsets to be evicted {}", lstats);
     headers = append_random_batches(log, 10);
     auto new_batches = read_and_validate_all_batches(log);
     size_t total_size = std::accumulate(
@@ -772,12 +749,13 @@ FIXTURE_TEST(test_size_based_eviction, storage_test_fixture) {
       total_size + first_size,
       model::offset::max(),
       std::nullopt,
-      ss::default_priority_class(),
+      std::nullopt,
+      0ms,
       as);
     compact_and_prefix_truncate(*disk_log, ccfg_no_compact);
 
     auto new_lstats = log->offsets();
-    BOOST_REQUIRE_EQUAL(new_lstats.start_offset, lstats.start_offset);
+    ASSERT_EQ(new_lstats.start_offset, lstats.start_offset);
 
     // max log size
     const auto max_size = (total_size - first_size) + 1;
@@ -802,14 +780,14 @@ FIXTURE_TEST(test_size_based_eviction, storage_test_fixture) {
       max_size,
       model::offset::max(),
       std::nullopt,
-      ss::default_priority_class(),
+      std::nullopt,
+      0ms,
       as);
     compact_and_prefix_truncate(*disk_log, ccfg);
 
     new_lstats = log->offsets();
-    info("Final offsets {}", new_lstats);
-    BOOST_REQUIRE_EQUAL(
-      new_lstats.start_offset, last_offset + model::offset(1));
+    SUCCEED() << fmt::format("Final offsets {}", new_lstats);
+    ASSERT_EQ(new_lstats.start_offset, last_offset + model::offset(1));
 
     {
         auto batches = read_and_validate_all_batches(log);
@@ -825,22 +803,22 @@ FIXTURE_TEST(test_size_based_eviction, storage_test_fixture) {
          * a per-byte granularity, and the real policy is to not violate max
          * size target, but to get as close as possible.
          */
-        BOOST_REQUIRE_GE(size, max_size);
+        ASSERT_GE(size, max_size);
 
         /*
          * but, we do expect to have removed some data
          */
-        BOOST_REQUIRE_LT(size, total_size);
+        ASSERT_LT(size, total_size);
     }
 };
 
-FIXTURE_TEST(test_eviction_notification, storage_test_fixture) {
+TEST_F(storage_test_fixture, test_eviction_notification) {
     ss::promise<model::offset> last_evicted_offset;
     auto cfg = default_log_config(test_dir);
     cfg.max_segment_size = config::mock_binding<size_t>(10);
     ss::abort_source as;
     storage::log_manager mgr = make_log_manager(cfg);
-    info("Configuration: {}", mgr.config());
+    SUCCEED() << fmt::format("Configuration: {}", mgr.config());
     auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
     auto ntp = model::ntp("default", "test", 0);
 
@@ -855,46 +833,37 @@ FIXTURE_TEST(test_eviction_notification, storage_test_fixture) {
       log,
       10,
       model::term_id(0),
+      std::nullopt,
       custom_ts_batch_generator(model::timestamp::now()));
     log->flush().get();
     ss::sleep(1s).get(); // ensure time separation for broker timestamp
     model::timestamp gc_ts
       = model::timestamp::now(); // this ts is after the above batch
     auto lstats_before = log->offsets();
-    info("Offsets to be evicted {}", lstats_before);
+    SUCCEED() << fmt::format("Offsets to be evicted {}", lstats_before);
     ss::sleep(1s).get(); // ensure time separation between gc_ts and next batch
     append_random_batches(
       log,
       10,
       model::term_id(0),
+      std::nullopt,
       custom_ts_batch_generator(model::timestamp(gc_ts() + 10)));
     storage::housekeeping_config ccfg(
       gc_ts,
       std::nullopt,
       model::offset::max(),
       std::nullopt,
-      ss::default_priority_class(),
+      std::nullopt,
+      0ms,
       as);
 
     log->housekeeping(ccfg).get();
 
-    auto offset = last_evicted_offset.get_future().get();
+    std::ignore = last_evicted_offset.get_future().get();
     log->housekeeping(ccfg).get();
     auto lstats_after = log->offsets();
 
-    BOOST_REQUIRE_EQUAL(lstats_before.start_offset, lstats_after.start_offset);
-    // wait for compaction
-    log->housekeeping(ccfg).get();
-    log
-      ->truncate_prefix(storage::truncate_prefix_config{
-        model::next_offset(offset), ss::default_priority_class()})
-      .get();
-    auto compacted_lstats = log->offsets();
-    info("Compacted offsets {}", compacted_lstats);
-    // check if compaction happened
-    BOOST_REQUIRE_EQUAL(
-      compacted_lstats.start_offset,
-      lstats_before.dirty_offset + model::offset(1));
+    ASSERT_EQ(lstats_before.start_offset, lstats_after.start_offset);
 };
 
 /**
@@ -913,11 +882,9 @@ ss::future<storage::append_result> append_exactly(
       model::packed_record_batch_header_size,
       batch_sz);
     storage::log_append_config append_cfg{
-      storage::log_append_config::fsync::no,
-      ss::default_priority_class(),
-      model::no_timeout};
+      storage::log_append_config::fsync::no, model::no_timeout};
 
-    ss::circular_buffer<model::record_batch> batches;
+    chunked_circular_buffer<model::record_batch> batches;
     auto val_sz = batch_sz - model::packed_record_batch_header_size;
     iobuf key_buf{};
 
@@ -956,7 +923,7 @@ ss::future<storage::append_result> append_exactly(
       log->make_appender(append_cfg), model::no_timeout);
 }
 
-FIXTURE_TEST(write_concurrently_with_gc, storage_test_fixture) {
+TEST_F(storage_test_fixture, write_concurrently_with_gc) {
     auto cfg = default_log_config(test_dir);
     // make sure segments are small
     cfg.max_segment_size = config::mock_binding<size_t>(1000);
@@ -966,7 +933,7 @@ FIXTURE_TEST(write_concurrently_with_gc, storage_test_fixture) {
     using overrides_t = storage::ntp_config::default_overrides;
     overrides_t ov;
     ov.cleanup_policy_bitflags = model::cleanup_policy_bitflags::deletion;
-    info("Configuration: {}", mgr.config());
+    SUCCEED() << fmt::format("Configuration: {}", mgr.config());
     auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
     auto ntp = model::ntp("default", "test", 0);
 
@@ -975,7 +942,7 @@ FIXTURE_TEST(write_concurrently_with_gc, storage_test_fixture) {
     auto log = mgr.manage(std::move(ntp_cfg)).get();
 
     append_exactly(log, 10, 100).get();
-    BOOST_REQUIRE_EQUAL(log->offsets().dirty_offset, model::offset(9));
+    ASSERT_EQ(log->offsets().dirty_offset, model::offset(9));
 
     std::vector<ss::future<>> futures;
 
@@ -988,7 +955,8 @@ FIXTURE_TEST(write_concurrently_with_gc, storage_test_fixture) {
           1000,
           model::offset::max(),
           std::nullopt,
-          ss::default_priority_class(),
+          std::nullopt,
+          0ms,
           as);
         return log->housekeeping(ccfg);
     };
@@ -1002,8 +970,7 @@ FIXTURE_TEST(write_concurrently_with_gc, storage_test_fixture) {
                       return append_exactly(log, batches_per_append, 100)
                         .then([&last_append_offset,
                                log](storage::append_result result) mutable {
-                            BOOST_REQUIRE_GT(
-                              result.last_offset, last_append_offset);
+                            ASSERT_GT(result.last_offset, last_append_offset);
                             last_append_offset = result.last_offset;
                         });
                   });
@@ -1021,7 +988,7 @@ FIXTURE_TEST(write_concurrently_with_gc, storage_test_fixture) {
     as.request_abort();
     loop.get();
     auto lstats_after = log->offsets();
-    BOOST_REQUIRE_EQUAL(
+    ASSERT_EQ(
       lstats_after.dirty_offset,
       model::offset(9 + appends * batches_per_append));
 };
@@ -1032,7 +999,7 @@ FIXTURE_TEST(write_concurrently_with_gc, storage_test_fixture) {
  * test validates if the offsets are correctly assigned i.e. if any batch did
  * not get the same offset assigned twice.
  */
-FIXTURE_TEST(append_concurrent_with_prefix_truncate, storage_test_fixture) {
+TEST_F(storage_test_fixture, append_concurrent_with_prefix_truncate) {
     auto cfg = default_log_config(test_dir);
     // start stress fiber to make the test less likely to trigger race
     // conditions
@@ -1073,7 +1040,7 @@ FIXTURE_TEST(append_concurrent_with_prefix_truncate, storage_test_fixture) {
                  std::nullopt,
                  random_generators::random_choice(types))
           .then([&](storage::append_result result) {
-              info("append result: {}", result);
+              SUCCEED() << fmt::format("append result: {}", result);
               vassert(
                 result.base_offset > last_append_base_offset,
                 "Invalid append result base offset: {}. The same base offset "
@@ -1102,13 +1069,13 @@ FIXTURE_TEST(append_concurrent_with_prefix_truncate, storage_test_fixture) {
     auto read = [&] {
         auto lstats = log->offsets();
         return log
-          ->make_reader(storage::log_reader_config(
-            lstats.start_offset,
-            model::offset::max(),
-            ss::default_priority_class()))
+          ->make_reader(
+            storage::local_log_reader_config(
+              lstats.start_offset, model::offset::max()))
           .then([](auto reader) {
-              return ss::sleep(std::chrono::milliseconds(
-                                 random_generators::get_int(15, 30)))
+              return ss::sleep(
+                       std::chrono::milliseconds(
+                         random_generators::get_int(15, 30)))
                 .then([r = std::move(reader)]() mutable {
                     return model::consume_reader_to_memory(
                       std::move(r), model::no_timeout);
@@ -1120,11 +1087,9 @@ FIXTURE_TEST(append_concurrent_with_prefix_truncate, storage_test_fixture) {
     auto prefix_truncate = [&] {
         auto offset = model::next_offset(log->offsets().dirty_offset);
 
-        return log
-          ->truncate_prefix(storage::truncate_prefix_config(
-            offset, ss::default_priority_class()))
+        return log->truncate_prefix(storage::truncate_prefix_config(offset))
           .then([offset] {
-              info("prefix truncate at: {}", offset);
+              SUCCEED() << fmt::format("prefix truncate at: {}", offset);
               return ss::sleep(
                 std::chrono::milliseconds(random_generators::get_int(5, 20)));
           });
@@ -1143,7 +1108,7 @@ FIXTURE_TEST(append_concurrent_with_prefix_truncate, storage_test_fixture) {
     stress_mgr.stop().get();
 };
 
-FIXTURE_TEST(empty_segment_recovery, storage_test_fixture) {
+TEST_F(storage_test_fixture, empty_segment_recovery) {
     auto cfg = default_log_config(test_dir);
     auto ntp = model::ntp("default", "test", 0);
     using overrides_t = storage::ntp_config::default_overrides;
@@ -1162,7 +1127,6 @@ FIXTURE_TEST(empty_segment_recovery, storage_test_fixture) {
     using should_flush_t = storage::disk_log_builder::should_flush_after;
     storage::log_append_config appender_cfg{
       .should_fsync = storage::log_append_config::fsync::no,
-      .io_priority = ss::default_priority_class(),
       .timeout = model::no_timeout};
     builder | storage::start(ntp) | storage::add_segment(0)
       | storage::add_random_batch(
@@ -1188,8 +1152,7 @@ FIXTURE_TEST(empty_segment_recovery, storage_test_fixture) {
         should_flush_t::no);
 
     builder.get_log()
-      ->truncate(storage::truncate_config(
-        model::offset(6), ss::default_priority_class()))
+      ->truncate(storage::truncate_config(model::offset(6)))
       .get();
 
     builder | storage::add_segment(6);
@@ -1224,9 +1187,8 @@ FIXTURE_TEST(empty_segment_recovery, storage_test_fixture) {
     storage::log_appender appender = log->make_appender(
       storage::log_append_config{
         .should_fsync = storage::log_append_config::fsync::no,
-        .io_priority = ss::default_priority_class(),
         .timeout = model::no_timeout});
-    ss::circular_buffer<model::record_batch> batches;
+    chunked_circular_buffer<model::record_batch> batches;
     batches.push_back(
       model::test::make_random_batch(model::offset(0), 1, false));
 
@@ -1234,14 +1196,14 @@ FIXTURE_TEST(empty_segment_recovery, storage_test_fixture) {
     rdr.for_each_ref(std::move(appender), model::no_timeout).get();
 
     // we truncate at {6} so we expect dirty offset equal {5}
-    BOOST_REQUIRE_EQUAL(offsets_after_recovery.dirty_offset, model::offset(5));
+    ASSERT_EQ(offsets_after_recovery.dirty_offset, model::offset(5));
 
     // after append we expect offset to be equal to {6} as one record was
     // appended
-    BOOST_REQUIRE_EQUAL(log->offsets().dirty_offset, model::offset(6));
+    ASSERT_EQ(log->offsets().dirty_offset, model::offset(6));
 }
 
-FIXTURE_TEST(test_compaction_preserve_state, storage_test_fixture) {
+TEST_F(storage_test_fixture, test_compaction_preserve_state) {
     auto cfg = default_log_config(test_dir);
     auto ntp = model::ntp("default", "test", 0);
     // compacted topic
@@ -1255,7 +1217,6 @@ FIXTURE_TEST(test_compaction_preserve_state, storage_test_fixture) {
     using should_flush_t = storage::disk_log_builder::should_flush_after;
     storage::log_append_config appender_cfg{
       .should_fsync = storage::log_append_config::fsync::no,
-      .io_priority = ss::default_priority_class(),
       .timeout = model::no_timeout};
 
     // single segment
@@ -1276,7 +1237,7 @@ FIXTURE_TEST(test_compaction_preserve_state, storage_test_fixture) {
         should_flush_t::no);
 
     builder.stop().get();
-    info("Before recovery: {}", builder.get_log());
+    SUCCEED() << fmt::format("Before recovery: {}", builder.get_log());
     // recover
     storage::log_manager mgr = make_log_manager(cfg);
     storage::ntp_config ntp_cfg(
@@ -1287,25 +1248,26 @@ FIXTURE_TEST(test_compaction_preserve_state, storage_test_fixture) {
       1,
       model::offset::max(),
       std::nullopt,
-      ss::default_priority_class(),
+      std::nullopt,
+      0ms,
       as);
     auto log = mgr.manage(std::move(ntp_cfg)).get();
     auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
     auto offsets_after_recovery = log->offsets();
-    info("After recovery: {}", log);
+    SUCCEED() << fmt::format("After recovery: {}", log);
     // trigger compaction
     log->housekeeping(compaction_cfg).get();
     auto offsets_after_compact = log->offsets();
-    info("After compaction, offsets: {}, {}", offsets_after_compact, log);
+    SUCCEED() << fmt::format(
+      "After compaction, offsets: {}, {}", offsets_after_compact, log);
 
     // Append single batch
     storage::log_appender appender = log->make_appender(
       storage::log_append_config{
         .should_fsync = storage::log_append_config::fsync::no,
-        .io_priority = ss::default_priority_class(),
         .timeout = model::no_timeout});
 
-    ss::circular_buffer<model::record_batch> batches;
+    chunked_circular_buffer<model::record_batch> batches;
     batches.push_back(
       model::test::make_random_batch(model::offset(0), 1, false));
 
@@ -1313,11 +1275,11 @@ FIXTURE_TEST(test_compaction_preserve_state, storage_test_fixture) {
     std::move(rdr).for_each_ref(std::move(appender), model::no_timeout).get();
 
     // before append offsets should be equal to {1}, as we stopped there
-    BOOST_REQUIRE_EQUAL(offsets_after_recovery.dirty_offset, model::offset(1));
-    BOOST_REQUIRE_EQUAL(offsets_after_compact.dirty_offset, model::offset(1));
+    ASSERT_EQ(offsets_after_recovery.dirty_offset, model::offset(1));
+    ASSERT_EQ(offsets_after_compact.dirty_offset, model::offset(1));
 
     // after append we expect offset to be equal to {2}
-    BOOST_REQUIRE_EQUAL(log->offsets().dirty_offset, model::offset(2));
+    ASSERT_EQ(log->offsets().dirty_offset, model::offset(2));
 }
 
 void append_single_record_batch(
@@ -1352,7 +1314,6 @@ void append_single_record_batch(
           {std::move(batch)});
         storage::log_append_config cfg{
           .should_fsync = storage::log_append_config::fsync::no,
-          .io_priority = ss::default_priority_class(),
           .timeout = model::no_timeout,
         };
 
@@ -1376,14 +1337,14 @@ void append_single_record_batch(
  * Expected outcome:
  *   Segment offsets should be correctly recovered.
  */
-FIXTURE_TEST(truncate_and_roll_segment, storage_test_fixture) {
+TEST_F(storage_test_fixture, truncate_and_roll_segment) {
     auto cfg = default_log_config(test_dir);
     cfg.cache = storage::with_cache::yes;
 
     {
         storage::log_manager mgr = make_log_manager(cfg);
 
-        info("config: {}", mgr.config());
+        SUCCEED() << fmt::format("config: {}", mgr.config());
         auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
         auto ntp = model::ntp("default", "test", 0);
         auto log
@@ -1394,11 +1355,8 @@ FIXTURE_TEST(truncate_and_roll_segment, storage_test_fixture) {
         check_dirty_and_closed_segment_bytes(log);
         // 2) truncate in the middle of segment
         model::offset truncate_at(7);
-        info("Truncating at offset:{}", truncate_at);
-        log
-          ->truncate(
-            storage::truncate_config(truncate_at, ss::default_priority_class()))
-          .get();
+        SUCCEED() << fmt::format("Truncating at offset:{}", truncate_at);
+        log->truncate(storage::truncate_config(truncate_at)).get();
         // 3) append some more batches to the same segment
         append_single_record_batch(log, 10, model::term_id(1));
         log->flush().get();
@@ -1419,12 +1377,12 @@ FIXTURE_TEST(truncate_and_roll_segment, storage_test_fixture) {
         auto read = read_and_validate_all_batches(log);
 
         for (model::offset o(0); o < log->offsets().committed_offset; ++o) {
-            BOOST_REQUIRE(log->get_term(o).has_value());
+            ASSERT_TRUE(log->get_term(o).has_value());
         }
     }
 }
 
-FIXTURE_TEST(compacted_log_truncation, storage_test_fixture) {
+TEST_F(storage_test_fixture, compacted_log_truncation) {
     auto cfg = default_log_config(test_dir);
     cfg.cache = storage::with_cache::yes;
     storage::ntp_config::default_overrides overrides;
@@ -1434,16 +1392,18 @@ FIXTURE_TEST(compacted_log_truncation, storage_test_fixture) {
     {
         storage::log_manager mgr = make_log_manager(cfg);
 
-        info("config: {}", mgr.config());
+        SUCCEED() << fmt::format("config: {}", mgr.config());
         auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
         auto ntp = model::ntp("default", "test", 0);
-        auto log = mgr
-                     .manage(storage::ntp_config(
-                       ntp,
-                       mgr.config().base_dir,
-                       std::make_unique<storage::ntp_config::default_overrides>(
-                         overrides)))
-                     .get();
+        auto log
+          = mgr
+              .manage(
+                storage::ntp_config(
+                  ntp,
+                  mgr.config().base_dir,
+                  std::make_unique<storage::ntp_config::default_overrides>(
+                    overrides)))
+              .get();
         // append some batches to first segment (all batches have the same key)
         append_single_record_batch(log, 14, model::term_id(1));
 
@@ -1452,16 +1412,14 @@ FIXTURE_TEST(compacted_log_truncation, storage_test_fixture) {
           std::nullopt,
           model::offset::max(),
           std::nullopt,
-          ss::default_priority_class(),
+          std::nullopt,
+          0ms,
           as);
         log->flush().get();
         check_dirty_and_closed_segment_bytes(log);
         model::offset truncate_at(7);
-        info("Truncating at offset:{}", truncate_at);
-        log
-          ->truncate(
-            storage::truncate_config(truncate_at, ss::default_priority_class()))
-          .get();
+        SUCCEED() << fmt::format("Truncating at offset:{}", truncate_at);
+        log->truncate(storage::truncate_config(truncate_at)).get();
         // roll segment
         append_single_record_batch(log, 10, model::term_id(2));
         log->flush().get();
@@ -1477,7 +1435,7 @@ FIXTURE_TEST(compacted_log_truncation, storage_test_fixture) {
 
     // force recovery
     {
-        BOOST_TEST_MESSAGE("recovering");
+        SUCCEED() << "recovering";
         storage::log_manager mgr = make_log_manager(cfg);
         auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
         auto ntp = model::ntp("default", "test", 0);
@@ -1488,13 +1446,12 @@ FIXTURE_TEST(compacted_log_truncation, storage_test_fixture) {
         auto lstats = log->offsets();
         for (model::offset o = lstats.start_offset; o < lstats.committed_offset;
              ++o) {
-            BOOST_REQUIRE(log->get_term(o).has_value());
+            ASSERT_TRUE(log->get_term(o).has_value());
         }
     }
 }
 
-FIXTURE_TEST(
-  check_segment_roll_after_compacted_log_truncate, storage_test_fixture) {
+TEST_F(storage_test_fixture, check_segment_roll_after_compacted_log_truncate) {
     auto cfg = default_log_config(test_dir);
     cfg.cache = storage::with_cache::yes;
     storage::ntp_config::default_overrides overrides;
@@ -1504,15 +1461,16 @@ FIXTURE_TEST(
 
     storage::log_manager mgr = make_log_manager(cfg);
 
-    info("config: {}", mgr.config());
+    SUCCEED() << fmt::format("config: {}", mgr.config());
     auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
     auto ntp = model::ntp("default", "test", 0);
     auto log = mgr
-                 .manage(storage::ntp_config(
-                   ntp,
-                   mgr.config().base_dir,
-                   std::make_unique<storage::ntp_config::default_overrides>(
-                     overrides)))
+                 .manage(
+                   storage::ntp_config(
+                     ntp,
+                     mgr.config().base_dir,
+                     std::make_unique<storage::ntp_config::default_overrides>(
+                       overrides)))
                  .get();
     // append some batches to first segment (all batches have the same key)
     append_single_record_batch(log, 14, model::term_id(1));
@@ -1522,34 +1480,32 @@ FIXTURE_TEST(
       std::nullopt,
       model::offset::max(),
       std::nullopt,
-      ss::default_priority_class(),
+      std::nullopt,
+      0ms,
       as);
     log->flush().get();
     check_dirty_and_closed_segment_bytes(log);
     model::offset truncate_at(7);
-    info("Truncating at offset:{}", truncate_at);
-    BOOST_REQUIRE_EQUAL(log->segment_count(), 1);
-    log
-      ->truncate(
-        storage::truncate_config(truncate_at, ss::default_priority_class()))
-      .get();
+    SUCCEED() << fmt::format("Truncating at offset:{}", truncate_at);
+    ASSERT_EQ(log->segment_count(), 1);
+    log->truncate(storage::truncate_config(truncate_at)).get();
     append_single_record_batch(log, 10, model::term_id(1));
     log->flush().get();
     check_dirty_and_closed_segment_bytes(log);
 
     // segment should be rolled after truncation
-    BOOST_REQUIRE_EQUAL(log->segment_count(), 2);
+    ASSERT_EQ(log->segment_count(), 2);
     log->housekeeping(c_cfg).get();
     check_dirty_and_closed_segment_bytes(log);
 
     auto read = read_and_validate_all_batches(log);
-    BOOST_REQUIRE_EQUAL(read.begin()->base_offset(), model::offset(6));
-    BOOST_REQUIRE_EQUAL(read.begin()->last_offset(), model::offset(6));
-    BOOST_REQUIRE_EQUAL(read[read.size() - 1].base_offset(), model::offset(16));
-    BOOST_REQUIRE_EQUAL(read[read.size() - 1].last_offset(), model::offset(16));
+    ASSERT_EQ(read.begin()->base_offset(), model::offset(6));
+    ASSERT_EQ(read.begin()->last_offset(), model::offset(6));
+    ASSERT_EQ(read[read.size() - 1].base_offset(), model::offset(16));
+    ASSERT_EQ(read[read.size() - 1].last_offset(), model::offset(16));
 }
 
-FIXTURE_TEST(check_max_segment_size, storage_test_fixture) {
+TEST_F(storage_test_fixture, check_max_segment_size) {
     auto cfg = default_log_config(test_dir);
 
     auto mock = config::mock_property<size_t>(20_GiB);
@@ -1564,35 +1520,35 @@ FIXTURE_TEST(check_max_segment_size, storage_test_fixture) {
     auto log = mgr.manage(std::move(ntp_cfg)).get();
     auto disk_log = log;
 
-    BOOST_REQUIRE_EQUAL(disk_log->segments().size(), 0);
+    ASSERT_EQ(disk_log->segments().size(), 0);
 
     // Write 100 * 1_KiB batches, should yield only 1 segment
     auto result = append_exactly(log, 100, 1_KiB).get(); // 100*1_KiB
     int size1 = disk_log->segments().size();
-    BOOST_REQUIRE_EQUAL(size1, 1);
+    ASSERT_EQ(size1, 1);
 
     // Update cluster level configuration and force a roll.
     mock.update(20_KiB);
-    disk_log->force_roll(ss::default_priority_class()).get();
+    disk_log->force_roll().get();
 
     // 30 * 1_KiB should yield 2 new segments.
     result = append_exactly(log, 30, 1_KiB).get();
     int size2 = disk_log->segments().size();
-    BOOST_REQUIRE_EQUAL(size2 - size1, 2);
+    ASSERT_EQ(size2 - size1, 2);
 
     // override segment size with ntp_config
     overrides_t ov;
     ov.segment_size = 40_KiB;
     disk_log->set_overrides(ov);
-    disk_log->force_roll(ss::default_priority_class()).get();
+    disk_log->force_roll().get();
 
     // 60 * 1_KiB batches should yield 2 segments.
     result = append_exactly(log, 60, 1_KiB).get(); // 60*1_KiB
     int size3 = disk_log->segments().size();
-    BOOST_REQUIRE_EQUAL(size3 - size2, 2);
+    ASSERT_EQ(size3 - size2, 2);
 }
 
-FIXTURE_TEST(check_max_segment_size_limits, storage_test_fixture) {
+TEST_F(storage_test_fixture, check_max_segment_size_limits) {
     auto cfg = default_log_config(test_dir);
 
     // Apply limits to the effective segment size: we may configure
@@ -1618,35 +1574,35 @@ FIXTURE_TEST(check_max_segment_size_limits, storage_test_fixture) {
         auto log = mgr.manage(std::move(ntp_cfg)).get();
         auto disk_log = log;
 
-        BOOST_REQUIRE_EQUAL(disk_log->segments().size(), 0);
+        ASSERT_EQ(disk_log->segments().size(), 0);
 
         // Write 100 * 1_KiB batches, should yield 1 full segment
         auto result = append_exactly(log, 50, 1_KiB).get(); // 100*1_KiB
-        BOOST_REQUIRE_EQUAL(disk_log->segments().size(), 1);
+        ASSERT_EQ(disk_log->segments().size(), 1);
         result = append_exactly(log, 100, 1_KiB).get(); // 100*1_KiB
-        BOOST_REQUIRE_EQUAL(disk_log->segments().size(), 2);
+        ASSERT_EQ(disk_log->segments().size(), 2);
 
         // A too-low segment size: should be clamped to the lower bound
         mock.update(1_KiB);
-        disk_log->force_roll(ss::default_priority_class()).get();
-        BOOST_REQUIRE_EQUAL(disk_log->segments().size(), 3);
+        disk_log->force_roll().get();
+        ASSERT_EQ(disk_log->segments().size(), 3);
 
         // Exceeding the apparent segment size doesn't roll, because it was
         // clamped
         result = append_exactly(log, 5, 1_KiB).get();
-        BOOST_REQUIRE_EQUAL(disk_log->segments().size(), 3);
+        ASSERT_EQ(disk_log->segments().size(), 3);
         // Exceeding the lower bound segment size does cause a roll
         result = append_exactly(log, 55, 1_KiB).get();
-        BOOST_REQUIRE_EQUAL(disk_log->segments().size(), 4);
+        ASSERT_EQ(disk_log->segments().size(), 4);
 
         // A too-high segment size: should be clamped to the upper bound
         mock.update(2000_KiB);
-        disk_log->force_roll(ss::default_priority_class()).get();
-        BOOST_REQUIRE_EQUAL(disk_log->segments().size(), 5);
+        disk_log->force_roll().get();
+        ASSERT_EQ(disk_log->segments().size(), 5);
         // Exceeding the upper bound causes a roll, even if we didn't reach
         // the user-configured segment size
         result = append_exactly(log, 201, 1_KiB).get();
-        BOOST_REQUIRE_EQUAL(disk_log->segments().size(), 6);
+        ASSERT_EQ(disk_log->segments().size(), 6);
     } catch (...) {
         ex = std::current_exception();
     }
@@ -1659,7 +1615,7 @@ FIXTURE_TEST(check_max_segment_size_limits, storage_test_fixture) {
     }
 }
 
-FIXTURE_TEST(partition_size_while_cleanup, storage_test_fixture) {
+TEST_F(storage_test_fixture, partition_size_while_cleanup) {
     auto cfg = default_log_config(test_dir);
     // make sure segments are small
     cfg.max_segment_size = config::mock_binding<size_t>(10_KiB);
@@ -1683,8 +1639,8 @@ FIXTURE_TEST(partition_size_while_cleanup, storage_test_fixture) {
     auto log = mgr.manage(std::move(ntp_cfg)).get();
 
     auto sz_initial = log->get_probe().partition_size();
-    info("sz_initial={}", sz_initial);
-    BOOST_REQUIRE_EQUAL(sz_initial, 0);
+    SUCCEED() << fmt::format("sz_initial={}", sz_initial);
+    ASSERT_EQ(sz_initial, 0);
 
     // Add 100 batches with one event each, all events having the same key
     static constexpr size_t batch_size = 1_KiB; // Size visible to Kafka API
@@ -1699,21 +1655,21 @@ FIXTURE_TEST(partition_size_while_cleanup, storage_test_fixture) {
     log->flush().get();
 
     // Read back and validate content of log pre-compaction.
-    BOOST_REQUIRE_EQUAL(
+    ASSERT_EQ(
       log->get_probe().partition_size(), input_batch_count * batch_size);
-    BOOST_REQUIRE_EQUAL(
-      read_and_validate_all_batches(log).size(), input_batch_count);
+    ASSERT_EQ(read_and_validate_all_batches(log).size(), input_batch_count);
     auto lstats_before = log->offsets();
-    BOOST_REQUIRE_EQUAL(
+    ASSERT_EQ(
       lstats_before.committed_offset, model::offset{input_batch_count - 1});
-    BOOST_REQUIRE_EQUAL(lstats_before.start_offset, model::offset{0});
+    ASSERT_EQ(lstats_before.start_offset, model::offset{0});
 
     storage::housekeeping_config ccfg(
       model::timestamp::min(),
       50_KiB,
       model::offset::max(),
       std::nullopt,
-      ss::default_priority_class(),
+      std::nullopt,
+      0ms,
       as);
 
     // Compact 10 times, with a configuration calling for 60kiB max log size.
@@ -1725,9 +1681,8 @@ FIXTURE_TEST(partition_size_while_cleanup, storage_test_fixture) {
 
     as.request_abort();
     auto lstats_after = log->offsets();
-    BOOST_REQUIRE_EQUAL(
-      lstats_after.committed_offset, lstats_before.committed_offset);
-    BOOST_REQUIRE_EQUAL(lstats_after.start_offset, model::offset{50});
+    ASSERT_EQ(lstats_after.committed_offset, lstats_before.committed_offset);
+    ASSERT_EQ(lstats_after.start_offset, model::offset{50});
 
     auto batches = read_and_validate_all_batches(log);
     auto total_batch_size = std::accumulate(
@@ -1741,16 +1696,17 @@ FIXTURE_TEST(partition_size_while_cleanup, storage_test_fixture) {
     auto& segments = log->segments();
     // One historic segment (all historic batches compacted down to 1), plus
     // one active segment.
-    BOOST_REQUIRE_EQUAL(segments.size(), 2);
+    ASSERT_EQ(segments.size(), 2);
 
     // The log-scope reported size must be equal to the sum of the batch sizes
     auto expected_size = total_batch_size;
     auto actual_size = log->get_probe().partition_size();
-    info("expected_size={}, actual_size={}", expected_size, actual_size);
-    BOOST_REQUIRE_EQUAL(actual_size, expected_size);
+    SUCCEED() << fmt::format(
+      "expected_size={}, actual_size={}", expected_size, actual_size);
+    ASSERT_EQ(actual_size, expected_size);
 };
 
-FIXTURE_TEST(check_segment_size_jitter, storage_test_fixture) {
+TEST_F(storage_test_fixture, check_segment_size_jitter) {
     auto cfg = default_log_config(test_dir);
 
     // Switch on jitter: it is off by default in default_log_config because
@@ -1776,7 +1732,7 @@ FIXTURE_TEST(check_segment_size_jitter, storage_test_fixture) {
         auto& segs = l->segments();
         sizes.push_back((*segs.begin())->size_bytes());
     }
-    BOOST_REQUIRE_EQUAL(
+    ASSERT_EQ(
       std::all_of(
         sizes.begin(),
         sizes.end(),
@@ -1784,7 +1740,7 @@ FIXTURE_TEST(check_segment_size_jitter, storage_test_fixture) {
       false);
 }
 
-FIXTURE_TEST(adjacent_segment_compaction, storage_test_fixture) {
+TEST_F(storage_test_fixture, adjacent_segment_compaction) {
     auto cfg = default_log_config(test_dir);
     cfg.cache = storage::with_cache::yes;
     storage::ntp_config::default_overrides overrides;
@@ -1794,36 +1750,38 @@ FIXTURE_TEST(adjacent_segment_compaction, storage_test_fixture) {
     ss::abort_source as;
     storage::log_manager mgr = make_log_manager(cfg);
 
-    info("config: {}", mgr.config());
+    SUCCEED() << fmt::format("config: {}", mgr.config());
     auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
     auto ntp = model::ntp("default", "test", 0);
     auto log = mgr
-                 .manage(storage::ntp_config(
-                   ntp,
-                   mgr.config().base_dir,
-                   std::make_unique<storage::ntp_config::default_overrides>(
-                     overrides)))
+                 .manage(
+                   storage::ntp_config(
+                     ntp,
+                     mgr.config().base_dir,
+                     std::make_unique<storage::ntp_config::default_overrides>(
+                       overrides)))
                  .get();
 
     // build some segments
     append_single_record_batch(log, 20, model::term_id(1));
-    log->force_roll(ss::default_priority_class()).get();
+    log->force_roll().get();
     append_single_record_batch(log, 30, model::term_id(1));
-    log->force_roll(ss::default_priority_class()).get();
+    log->force_roll().get();
     append_single_record_batch(log, 40, model::term_id(1));
-    log->force_roll(ss::default_priority_class()).get();
+    log->force_roll().get();
     append_single_record_batch(log, 50, model::term_id(1));
     log->flush().get();
 
-    BOOST_REQUIRE_EQUAL(log->segment_count(), 4);
+    ASSERT_EQ(log->segment_count(), 4);
 
     auto all_have_broker_timestamp = [&] {
         auto segments = std::vector<ss::lw_shared_ptr<storage::segment>>(
           log->segments().begin(), log->segments().end());
-        BOOST_REQUIRE(std::ranges::all_of(
-          segments,
-          [](auto bt) { return bt.has_value(); },
-          [](auto& seg) { return seg->index().broker_timestamp(); }));
+        ASSERT_TRUE(
+          std::ranges::all_of(
+            segments,
+            [](auto bt) { return bt.has_value(); },
+            [](auto& seg) { return seg->index().broker_timestamp(); }));
     };
 
     all_have_broker_timestamp();
@@ -1833,36 +1791,34 @@ FIXTURE_TEST(adjacent_segment_compaction, storage_test_fixture) {
       std::nullopt,
       model::offset::max(),
       std::nullopt,
-      ss::default_priority_class(),
+      std::nullopt,
+      0ms,
       as);
 
-    // There are 4 segments, and the last is the active segments. The first two
-    // will merge, and the third will be compacted but not merged.
+    // There are 4 segments, and the last is the active segments.
 
-    log->housekeeping(c_cfg).get();
-    BOOST_REQUIRE_EQUAL(log->segment_count(), 3);
-
-    // Check if it honors max_compactible offset by resetting it to the base
+    // Check if it honors max_compactible offset by setting it to the base
     // offset of first segment. Nothing should be compacted.
     const auto first_segment_offsets = log->segments().front()->offsets();
     c_cfg.compact.max_removable_local_log_offset
       = first_segment_offsets.get_base_offset();
     log->housekeeping(c_cfg).get();
-    BOOST_REQUIRE_EQUAL(log->segment_count(), 3);
+    ASSERT_EQ(log->segment_count(), 4);
 
-    // Now compact without restricting removable offset. The segment count
-    // will be reduced again.
+    // Now compact without restricting removable offset.
     c_cfg.compact.max_removable_local_log_offset = model::offset::max();
+
+    // The first three will merge.
     log->housekeeping(c_cfg).get();
-    BOOST_REQUIRE_EQUAL(log->segment_count(), 2);
+    ASSERT_EQ(log->segment_count(), 2);
 
     // No change since we can't combine with appender segment.
     log->housekeeping(c_cfg).get();
-    BOOST_REQUIRE_EQUAL(log->segment_count(), 2);
+    ASSERT_EQ(log->segment_count(), 2);
     all_have_broker_timestamp();
 }
 
-FIXTURE_TEST(adjacent_segment_compaction_terms, storage_test_fixture) {
+TEST_F(storage_test_fixture, adjacent_segment_compaction_terms) {
     auto cfg = default_log_config(test_dir);
     cfg.cache = storage::with_cache::yes;
     storage::ntp_config::default_overrides overrides;
@@ -1872,57 +1828,58 @@ FIXTURE_TEST(adjacent_segment_compaction_terms, storage_test_fixture) {
     ss::abort_source as;
     storage::log_manager mgr = make_log_manager(cfg);
 
-    info("config: {}", mgr.config());
+    SUCCEED() << fmt::format("config: {}", mgr.config());
     auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
     auto ntp = model::ntp("default", "test", 0);
     auto log = mgr
-                 .manage(storage::ntp_config(
-                   ntp,
-                   mgr.config().base_dir,
-                   std::make_unique<storage::ntp_config::default_overrides>(
-                     overrides)))
+                 .manage(
+                   storage::ntp_config(
+                     ntp,
+                     mgr.config().base_dir,
+                     std::make_unique<storage::ntp_config::default_overrides>(
+                       overrides)))
                  .get();
 
     // build some segments
     auto disk_log = log;
     append_single_record_batch(log, 20, model::term_id(1));
     append_single_record_batch(log, 30, model::term_id(2));
-    disk_log->force_roll(ss::default_priority_class()).get();
+    disk_log->force_roll().get();
     append_single_record_batch(log, 30, model::term_id(2));
     append_single_record_batch(log, 40, model::term_id(3));
     append_single_record_batch(log, 50, model::term_id(4));
     append_single_record_batch(log, 50, model::term_id(5));
     log->flush().get();
 
-    BOOST_REQUIRE_EQUAL(disk_log->segment_count(), 6);
+    ASSERT_EQ(disk_log->segment_count(), 6);
 
     storage::housekeeping_config c_cfg(
       model::timestamp::min(),
       std::nullopt,
       model::offset::max(),
       std::nullopt,
-      ss::default_priority_class(),
+      std::nullopt,
+      0ms,
       as);
 
     // compact all the individual segments
     // the two segments with term 2 can be combined
     log->housekeeping(c_cfg).get();
-    BOOST_REQUIRE_EQUAL(disk_log->segment_count(), 5);
+    ASSERT_EQ(disk_log->segment_count(), 5);
 
     // no more pairs with the same term
     log->housekeeping(c_cfg).get();
     log->housekeeping(c_cfg).get();
     log->housekeeping(c_cfg).get();
     log->housekeeping(c_cfg).get();
-    BOOST_REQUIRE_EQUAL(disk_log->segment_count(), 5);
+    ASSERT_EQ(disk_log->segment_count(), 5);
 
     for (int i = 0; i < 5; i++) {
-        BOOST_REQUIRE_EQUAL(
-          disk_log->segments()[i]->offsets().get_term()(), i + 1);
+        ASSERT_EQ(disk_log->segments()[i]->offsets().get_term()(), i + 1);
     }
 }
 
-FIXTURE_TEST(max_adjacent_segment_compaction, storage_test_fixture) {
+TEST_F(storage_test_fixture, max_adjacent_segment_compaction) {
     auto cfg = default_log_config(test_dir);
     cfg.max_compacted_segment_size = config::mock_binding<size_t>(6_MiB);
     cfg.cache = storage::with_cache::yes;
@@ -1933,15 +1890,16 @@ FIXTURE_TEST(max_adjacent_segment_compaction, storage_test_fixture) {
     ss::abort_source as;
     storage::log_manager mgr = make_log_manager(cfg);
 
-    info("config: {}", mgr.config());
+    SUCCEED() << fmt::format("config: {}", mgr.config());
     auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
     auto ntp = model::ntp("default", "test", 0);
     auto log = mgr
-                 .manage(storage::ntp_config(
-                   ntp,
-                   mgr.config().base_dir,
-                   std::make_unique<storage::ntp_config::default_overrides>(
-                     overrides)))
+                 .manage(
+                   storage::ntp_config(
+                     ntp,
+                     mgr.config().base_dir,
+                     std::make_unique<storage::ntp_config::default_overrides>(
+                       overrides)))
                  .get();
 
     auto disk_log = log;
@@ -1954,46 +1912,41 @@ FIXTURE_TEST(max_adjacent_segment_compaction, storage_test_fixture) {
     };
 
     add_segment(2_MiB, model::term_id(1));
-    disk_log->force_roll(ss::default_priority_class()).get();
+    disk_log->force_roll().get();
     add_segment(2_MiB, model::term_id(1));
-    disk_log->force_roll(ss::default_priority_class()).get();
+    disk_log->force_roll().get();
     add_segment(5_MiB, model::term_id(1));
-    disk_log->force_roll(ss::default_priority_class()).get();
+    disk_log->force_roll().get();
     add_segment(16_KiB, model::term_id(1));
-    disk_log->force_roll(ss::default_priority_class()).get();
+    disk_log->force_roll().get();
     add_segment(16_KiB, model::term_id(1));
-    disk_log->force_roll(ss::default_priority_class()).get();
+    disk_log->force_roll().get();
     add_segment(16_KiB, model::term_id(1));
     log->flush().get();
 
-    BOOST_REQUIRE_EQUAL(disk_log->segment_count(), 6);
+    ASSERT_EQ(disk_log->segment_count(), 6);
 
     storage::housekeeping_config c_cfg(
       model::timestamp::min(),
       std::nullopt,
       model::offset::max(),
       std::nullopt,
-      ss::default_priority_class(),
+      std::nullopt,
+      0ms,
       as);
 
     // self compaction steps
     // the first two segments are combined 2+2=4 < 6 MB
+    // the fourth, fifth and sixth can be combined 5 + 16KB + 16KB < 6 MB
     log->housekeeping(c_cfg).get();
-    BOOST_REQUIRE_EQUAL(disk_log->segment_count(), 5);
-
-    // the new first and second are too big 4+5 > 6 MB but the second and third
-    // can be combined 5 + 15KB < 6 MB
-    // then the next 16 KB can be folded in
-    log->housekeeping(c_cfg).get();
-    BOOST_REQUIRE_EQUAL(disk_log->segment_count(), 4);
+    ASSERT_EQ(disk_log->segment_count(), 3);
 
     // that's all that can be done. the next seg is an appender
     log->housekeeping(c_cfg).get();
-    BOOST_REQUIRE_EQUAL(disk_log->segment_count(), 3);
+    ASSERT_EQ(disk_log->segment_count(), 3);
 }
 
-FIXTURE_TEST(
-  adjacent_segment_compaction_range_u32_bounds, storage_test_fixture) {
+TEST_F(storage_test_fixture, adjacent_segment_compaction_range_u32_bounds) {
     storage::log_manager mgr = make_log_manager();
     auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
     auto ntp = model::ntp("kafka", "tapioca", 0);
@@ -2002,11 +1955,11 @@ FIXTURE_TEST(
     auto* disk_log = static_cast<storage::disk_log_impl*>(log.get());
 
     append_single_record_batch(log, 1, model::term_id(0));
-    disk_log->force_roll(ss::default_priority_class()).get();
+    disk_log->force_roll().get();
     append_single_record_batch(log, 1, model::term_id(0));
-    disk_log->force_roll(ss::default_priority_class()).get();
+    disk_log->force_roll().get();
     log->flush().get();
-    BOOST_REQUIRE_EQUAL(disk_log->segment_count(), 3);
+    ASSERT_EQ(disk_log->segment_count(), 3);
 
     auto& segs = disk_log->segments();
 
@@ -2014,7 +1967,8 @@ FIXTURE_TEST(
     // adjacent segment compaction.
     for (auto& seg : segs) {
         if (!seg->has_appender()) {
-            seg->mark_as_finished_self_compaction();
+            seg->index().maybe_set_self_compact_timestamp(
+              model::timestamp::now());
         }
     }
 
@@ -2036,10 +1990,10 @@ FIXTURE_TEST(
       storage::segment::offset_tracker::dirty_offset_t{one_past_u32_max});
 
     ss::abort_source as;
-    storage::compaction_config cfg(
-      model::offset::max(), std::nullopt, ss::default_priority_class(), as);
-    auto range = disk_log->find_adjacent_compaction_range(cfg);
-    BOOST_REQUIRE(!range.has_value());
+    compaction::compaction_config cfg(
+      model::offset::max(), std::nullopt, std::nullopt, as);
+    auto ranges = disk_log->find_adjacent_compaction_ranges(cfg);
+    ASSERT_TRUE(!ranges.has_value());
 
     // Set the last non-active segment's dirty offset to the uint32_t
     // max- this should make the segment eligible for adjacent compaction
@@ -2047,18 +2001,20 @@ FIXTURE_TEST(
     // uint32_t max.
     back_offset_tracker.set_offset(
       storage::segment::offset_tracker::dirty_offset_t{u32_max});
-    range = disk_log->find_adjacent_compaction_range(cfg);
-    BOOST_REQUIRE(range.has_value());
+    ranges = disk_log->find_adjacent_compaction_ranges(cfg);
+    ASSERT_TRUE(ranges.has_value());
+    ASSERT_EQ(ranges->size(), 1);
+    auto& range = ranges->front();
 
     auto range_segments = std::vector<ss::lw_shared_ptr<storage::segment>>(
-      range->first, range->second);
+      range.first, range.second);
 
     // Compare filenames for equality
-    BOOST_REQUIRE_EQUAL(range_segments[0]->filename(), segs[0]->filename());
-    BOOST_REQUIRE_EQUAL(range_segments[1]->filename(), segs[1]->filename());
+    ASSERT_EQ(range_segments[0]->filename(), segs[0]->filename());
+    ASSERT_EQ(range_segments[1]->filename(), segs[1]->filename());
 };
 
-FIXTURE_TEST(many_segment_locking, storage_test_fixture) {
+TEST_F(storage_test_fixture, many_segment_locking) {
     auto cfg = default_log_config(test_dir);
     cfg.cache = storage::with_cache::yes;
     storage::ntp_config::default_overrides overrides;
@@ -2068,47 +2024,48 @@ FIXTURE_TEST(many_segment_locking, storage_test_fixture) {
     ss::abort_source as;
     storage::log_manager mgr = make_log_manager(cfg);
 
-    info("config: {}", mgr.config());
+    SUCCEED() << fmt::format("config: {}", mgr.config());
     auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
     auto ntp = model::ntp("default", "test", 0);
     auto log = mgr
-                 .manage(storage::ntp_config(
-                   ntp,
-                   mgr.config().base_dir,
-                   std::make_unique<storage::ntp_config::default_overrides>(
-                     overrides)))
+                 .manage(
+                   storage::ntp_config(
+                     ntp,
+                     mgr.config().base_dir,
+                     std::make_unique<storage::ntp_config::default_overrides>(
+                       overrides)))
                  .get();
 
     auto disk_log = log;
     append_single_record_batch(log, 20, model::term_id(1));
-    disk_log->force_roll(ss::default_priority_class()).get();
+    disk_log->force_roll().get();
     append_single_record_batch(log, 30, model::term_id(2));
-    disk_log->force_roll(ss::default_priority_class()).get();
+    disk_log->force_roll().get();
     append_single_record_batch(log, 40, model::term_id(3));
-    disk_log->force_roll(ss::default_priority_class()).get();
+    disk_log->force_roll().get();
     append_single_record_batch(log, 50, model::term_id(4));
     log->flush().get();
 
-    BOOST_REQUIRE_EQUAL(disk_log->segment_count(), 4);
+    ASSERT_EQ(disk_log->segment_count(), 4);
 
-    std::vector<ss::lw_shared_ptr<storage::segment>> segments;
+    chunked_vector<ss::lw_shared_ptr<storage::segment>> segments;
     std::copy(
       disk_log->segments().begin(),
       disk_log->segments().end(),
       std::back_inserter(segments));
     segments.pop_back(); // discard the active segment
-    BOOST_REQUIRE_EQUAL(segments.size(), 3);
+    ASSERT_EQ(segments.size(), 3);
 
     {
         auto locks = storage::internal::write_lock_segments(
                        segments, std::chrono::seconds(1), 1)
                        .get();
-        BOOST_REQUIRE(locks.size() == segments.size());
+        ASSERT_TRUE(locks.size() == segments.size());
     }
 
     {
         auto lock = segments[2]->write_lock().get();
-        BOOST_REQUIRE_THROW(
+        ASSERT_THROW(
           storage::internal::write_lock_segments(
             segments, std::chrono::seconds(1), 1)
             .get(),
@@ -2119,26 +2076,27 @@ FIXTURE_TEST(many_segment_locking, storage_test_fixture) {
         auto locks = storage::internal::write_lock_segments(
                        segments, std::chrono::seconds(1), 1)
                        .get();
-        BOOST_REQUIRE(locks.size() == segments.size());
+        ASSERT_TRUE(locks.size() == segments.size());
     }
 }
 
-FIXTURE_TEST(reader_reusability_test_parser_header, storage_test_fixture) {
+TEST_F(storage_test_fixture, reader_reusability_test_parser_header) {
     auto cfg = default_log_config(test_dir);
     cfg.cache = storage::with_cache::no;
     cfg.max_segment_size = config::mock_binding<size_t>(10_MiB);
     storage::ntp_config::default_overrides overrides;
     ss::abort_source as;
     storage::log_manager mgr = make_log_manager(cfg);
-    info("config: {}", mgr.config());
+    SUCCEED() << fmt::format("config: {}", mgr.config());
     auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
     auto ntp = model::ntp("default", "test", 0);
     auto log = mgr
-                 .manage(storage::ntp_config(
-                   ntp,
-                   mgr.config().base_dir,
-                   std::make_unique<storage::ntp_config::default_overrides>(
-                     overrides)))
+                 .manage(
+                   storage::ntp_config(
+                     ntp,
+                     mgr.config().base_dir,
+                     std::make_unique<storage::ntp_config::default_overrides>(
+                       overrides)))
                  .get();
     // first small batch
     append_exactly(log, 1, 128).get();
@@ -2147,12 +2105,10 @@ FIXTURE_TEST(reader_reusability_test_parser_header, storage_test_fixture) {
     append_exactly(log, 1, 128_KiB).get();
     log->flush().get();
 
-    storage::log_reader_config reader_cfg(
+    storage::local_log_reader_config reader_cfg(
       model::offset(0),
       model::model_limits<model::offset>::max(),
-      0,
       4096,
-      ss::default_priority_class(),
       std::nullopt,
       std::nullopt,
       std::nullopt);
@@ -2170,7 +2126,7 @@ FIXTURE_TEST(reader_reusability_test_parser_header, storage_test_fixture) {
                      std::move(reader), model::no_timeout)
                      .get();
         next_to_read = rec.back().last_offset() + model::offset(1);
-        BOOST_REQUIRE_EQUAL(rec.size(), 1);
+        ASSERT_EQ(rec.size(), 1);
     }
     {
         reader_cfg.start_offset = next_to_read;
@@ -2181,28 +2137,30 @@ FIXTURE_TEST(reader_reusability_test_parser_header, storage_test_fixture) {
                      std::move(reader), model::no_timeout)
                      .get();
 
-        BOOST_REQUIRE_EQUAL(rec.size(), 1);
+        ASSERT_EQ(rec.size(), 1);
     }
 }
 
-FIXTURE_TEST(compaction_backlog_calculation, storage_test_fixture) {
+TEST_F(storage_test_fixture, compaction_backlog_calculation) {
     auto cfg = default_log_config(test_dir);
     cfg.max_compacted_segment_size = config::mock_binding<size_t>(100_MiB);
     cfg.cache = storage::with_cache::yes;
     storage::ntp_config::default_overrides overrides;
     overrides.cleanup_policy_bitflags
       = model::cleanup_policy_bitflags::compaction;
+    overrides.min_cleanable_dirty_ratio = tristate<double>{0.0};
 
     ss::abort_source as;
     storage::log_manager mgr = make_log_manager(cfg);
     auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
     auto ntp = model::ntp("default", "test", 0);
     auto log = mgr
-                 .manage(storage::ntp_config(
-                   ntp,
-                   mgr.config().base_dir,
-                   std::make_unique<storage::ntp_config::default_overrides>(
-                     overrides)))
+                 .manage(
+                   storage::ntp_config(
+                     ntp,
+                     mgr.config().base_dir,
+                     std::make_unique<storage::ntp_config::default_overrides>(
+                       overrides)))
                  .get();
 
     auto disk_log = log;
@@ -2215,56 +2173,66 @@ FIXTURE_TEST(compaction_backlog_calculation, storage_test_fixture) {
     };
 
     add_segment(2_MiB, model::term_id(1));
-    disk_log->force_roll(ss::default_priority_class()).get();
+    disk_log->force_roll().get();
     add_segment(2_MiB, model::term_id(1));
-    disk_log->force_roll(ss::default_priority_class()).get();
+    disk_log->force_roll().get();
     add_segment(5_MiB, model::term_id(1));
-    disk_log->force_roll(ss::default_priority_class()).get();
+    disk_log->force_roll().get();
     add_segment(16_KiB, model::term_id(1));
-    disk_log->force_roll(ss::default_priority_class()).get();
+    disk_log->force_roll().get();
     add_segment(16_KiB, model::term_id(1));
     log->flush().get();
 
-    BOOST_REQUIRE_EQUAL(disk_log->segment_count(), 5);
+    ASSERT_EQ(disk_log->segment_count(), 5);
 
     storage::housekeeping_config c_cfg(
       model::timestamp::min(),
       std::nullopt,
       model::offset::max(),
       std::nullopt,
-      ss::default_priority_class(),
+      std::nullopt,
+      0ms,
       as);
-    /**
-     * Initially all compaction rations are equal to 1.0 so it is easy to
-     * calculate backlog size.
-     */
     auto& segments = disk_log->segments();
-    auto backlog_size = log->compaction_backlog();
-    size_t self_seg_compaction_sz = 0;
-    for (auto& s : segments) {
-        self_seg_compaction_sz += s->size_bytes();
+    {
+        auto backlog_size = log->compaction_backlog();
+        size_t expected_backlog = 0;
+        for (auto& s : segments) {
+            if (!s->has_appender()) {
+                expected_backlog += s->size_bytes();
+            }
+        }
+        ASSERT_EQ(backlog_size, expected_backlog);
     }
-    BOOST_REQUIRE_EQUAL(
-      backlog_size,
-      3 * segments[0]->size_bytes() + 3 * segments[1]->size_bytes()
-        + 2 * segments[2]->size_bytes() + segments[3]->size_bytes()
-        + self_seg_compaction_sz);
-    // self compaction steps
+
+    // Perform compaction.
     log->housekeeping(c_cfg).get();
 
-    BOOST_REQUIRE_EQUAL(disk_log->segment_count(), 4);
-    auto new_backlog_size = log->compaction_backlog();
-    /**
-     * after all self segments are compacted they shouldn't be included into the
-     * backlog (only last segment is since it has appender and isn't self
-     * compacted)
-     */
-    BOOST_REQUIRE_LT(
-      new_backlog_size,
-      backlog_size - self_seg_compaction_sz + segments[3]->size_bytes());
+    ASSERT_EQ(disk_log->segment_count(), 2);
+    {
+        auto backlog_size = log->compaction_backlog();
+        // Log should be fully clean.
+        ASSERT_EQ(backlog_size, 0);
+    }
+
+    // Addition of a new segment results in all of the bytes of the log being
+    // added to backlog due to min.cleanable.dirty.ratio=0.0
+    add_segment(16_KiB, model::term_id(1));
+    disk_log->force_roll().get();
+    ASSERT_EQ(disk_log->segment_count(), 3);
+    {
+        auto backlog_size = log->compaction_backlog();
+        size_t expected_backlog = 0;
+        for (auto& s : segments) {
+            if (!s->has_appender()) {
+                expected_backlog += s->size_bytes();
+            }
+        }
+        ASSERT_EQ(backlog_size, expected_backlog);
+    }
 }
 
-FIXTURE_TEST(not_compacted_log_backlog, storage_test_fixture) {
+TEST_F(storage_test_fixture, not_compacted_log_backlog) {
     auto cfg = default_log_config(test_dir);
     cfg.max_compacted_segment_size = config::mock_binding<size_t>(100_MiB);
     cfg.cache = storage::with_cache::yes;
@@ -2277,11 +2245,12 @@ FIXTURE_TEST(not_compacted_log_backlog, storage_test_fixture) {
     auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
     auto ntp = model::ntp("default", "test", 0);
     auto log = mgr
-                 .manage(storage::ntp_config(
-                   ntp,
-                   mgr.config().base_dir,
-                   std::make_unique<storage::ntp_config::default_overrides>(
-                     overrides)))
+                 .manage(
+                   storage::ntp_config(
+                     ntp,
+                     mgr.config().base_dir,
+                     std::make_unique<storage::ntp_config::default_overrides>(
+                       overrides)))
                  .get();
 
     auto disk_log = log;
@@ -2294,19 +2263,19 @@ FIXTURE_TEST(not_compacted_log_backlog, storage_test_fixture) {
     };
 
     add_segment(2_MiB, model::term_id(1));
-    disk_log->force_roll(ss::default_priority_class()).get();
+    disk_log->force_roll().get();
     add_segment(2_MiB, model::term_id(1));
-    disk_log->force_roll(ss::default_priority_class()).get();
+    disk_log->force_roll().get();
     add_segment(5_MiB, model::term_id(1));
-    disk_log->force_roll(ss::default_priority_class()).get();
+    disk_log->force_roll().get();
     add_segment(16_KiB, model::term_id(1));
-    disk_log->force_roll(ss::default_priority_class()).get();
+    disk_log->force_roll().get();
     add_segment(16_KiB, model::term_id(1));
     log->flush().get();
 
-    BOOST_REQUIRE_EQUAL(disk_log->segment_count(), 5);
+    ASSERT_EQ(disk_log->segment_count(), 5);
 
-    BOOST_REQUIRE_EQUAL(log->compaction_backlog(), 0);
+    ASSERT_EQ(log->compaction_backlog(), 0);
 }
 
 ss::future<model::record_batch_reader::data_t> copy_reader_to_memory(
@@ -2328,34 +2297,33 @@ ss::future<model::record_batch_reader::data_t> copy_reader_to_memory(
     return reader.for_each_ref(memory_batch_consumer{}, timeout);
 }
 
-FIXTURE_TEST(disposing_in_use_reader, storage_test_fixture) {
+TEST_F(storage_test_fixture, disposing_in_use_reader) {
     auto cfg = default_log_config(test_dir);
     cfg.cache = storage::with_cache::no;
     cfg.max_segment_size = config::mock_binding<size_t>(100_MiB);
     storage::ntp_config::default_overrides overrides;
     ss::abort_source as;
     storage::log_manager mgr = make_log_manager(cfg);
-    info("config: {}", mgr.config());
+    SUCCEED() << fmt::format("config: {}", mgr.config());
     auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
     auto ntp = model::ntp("default", "test", 0);
     auto log = mgr
-                 .manage(storage::ntp_config(
-                   ntp,
-                   mgr.config().base_dir,
-                   std::make_unique<storage::ntp_config::default_overrides>(
-                     overrides)))
+                 .manage(
+                   storage::ntp_config(
+                     ntp,
+                     mgr.config().base_dir,
+                     std::make_unique<storage::ntp_config::default_overrides>(
+                       overrides)))
                  .get();
     for (auto i = 1; i < 100; ++i) {
         append_single_record_batch(log, 1, model::term_id(1), 128, true);
     }
     log->flush().get();
     // read only up to 4096 bytes, this way a reader will still be in a cache
-    storage::log_reader_config reader_cfg(
+    storage::local_log_reader_config reader_cfg(
       model::offset(0),
       model::offset::max(),
-      0,
       4096,
-      ss::default_priority_class(),
       std::nullopt,
       std::nullopt,
       std::nullopt);
@@ -2366,9 +2334,8 @@ FIXTURE_TEST(disposing_in_use_reader, storage_test_fixture) {
 
         auto rec = copy_reader_to_memory(reader, model::no_timeout).get();
 
-        BOOST_REQUIRE_EQUAL(rec.back().last_offset(), model::offset(17));
-        truncate_f = log->truncate(storage::truncate_config(
-          model::offset(5), ss::default_priority_class()));
+        ASSERT_EQ(rec.back().last_offset(), model::offset(17));
+        truncate_f = log->truncate(storage::truncate_config(model::offset(5)));
         // yield to allow truncate fiber to reach waiting for a lock
         ss::sleep(200ms).get();
     }
@@ -2379,7 +2346,7 @@ FIXTURE_TEST(disposing_in_use_reader, storage_test_fixture) {
 
     // we should be able to finish truncate immediately since reader was
     // destroyed
-    BOOST_REQUIRE(truncate_f.available());
+    ASSERT_TRUE(truncate_f.available());
     truncate_f.get();
 }
 
@@ -2394,7 +2361,7 @@ model::record_batch make_batch() {
     return std::move(builder).build();
 }
 
-FIXTURE_TEST(committed_offset_updates, storage_test_fixture) {
+TEST_F(storage_test_fixture, committed_offset_updates) {
     auto cfg = default_log_config(test_dir);
     cfg.cache = storage::with_cache::no;
     cfg.max_segment_size = config::mock_binding<size_t>(500_MiB);
@@ -2402,15 +2369,16 @@ FIXTURE_TEST(committed_offset_updates, storage_test_fixture) {
     storage::ntp_config::default_overrides overrides;
     ss::abort_source as;
     storage::log_manager mgr = make_log_manager(cfg);
-    info("config: {}", mgr.config());
+    SUCCEED() << fmt::format("config: {}", mgr.config());
     auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
     auto ntp = model::ntp("default", "test", 0);
     auto log = mgr
-                 .manage(storage::ntp_config(
-                   ntp,
-                   mgr.config().base_dir,
-                   std::make_unique<storage::ntp_config::default_overrides>(
-                     overrides)))
+                 .manage(
+                   storage::ntp_config(
+                     ntp,
+                     mgr.config().base_dir,
+                     std::make_unique<storage::ntp_config::default_overrides>(
+                       overrides)))
                  .get();
 
     auto append = [&] {
@@ -2418,10 +2386,9 @@ FIXTURE_TEST(committed_offset_updates, storage_test_fixture) {
         storage::log_appender appender = log->make_appender(
           storage::log_append_config{
             .should_fsync = storage::log_append_config::fsync::no,
-            .io_priority = ss::default_priority_class(),
             .timeout = model::no_timeout});
 
-        ss::circular_buffer<model::record_batch> batches;
+        chunked_circular_buffer<model::record_batch> batches;
         batches.push_back(
           model::test::make_random_batch(model::offset(0), 1, false));
 
@@ -2449,7 +2416,7 @@ FIXTURE_TEST(committed_offset_updates, storage_test_fixture) {
                   u.return_all();
                   return f.then([&, dirty = res.last_offset] {
                       auto lstats = log->offsets();
-                      BOOST_REQUIRE_GE(lstats.committed_offset, dirty);
+                      ASSERT_GE(lstats.committed_offset, dirty);
                   });
               });
         });
@@ -2475,12 +2442,12 @@ FIXTURE_TEST(committed_offset_updates, storage_test_fixture) {
               }
               auto stable
                 = log->segments().back()->offsets().get_stable_offset();
-              BOOST_REQUIRE_LE(prev_stable_offset, stable);
+              EXPECT_LE(prev_stable_offset, stable);
               prev_stable_offset = stable;
 
               auto committed
                 = log->segments().back()->offsets().get_committed_offset();
-              BOOST_REQUIRE_LE(prev_committed_offset, committed);
+              EXPECT_LE(prev_committed_offset, committed);
               prev_committed_offset = committed;
 
               return ss::now();
@@ -2492,7 +2459,7 @@ FIXTURE_TEST(committed_offset_updates, storage_test_fixture) {
     monitor.get();
 }
 
-FIXTURE_TEST(changing_cleanup_policy_back_and_forth, storage_test_fixture) {
+TEST_F(storage_test_fixture, changing_cleanup_policy_back_and_forth) {
     // issue: https://github.com/redpanda-data/redpanda/issues/2214
     auto cfg = default_log_config(test_dir);
     cfg.max_compacted_segment_size = config::mock_binding<size_t>(100_MiB);
@@ -2506,11 +2473,12 @@ FIXTURE_TEST(changing_cleanup_policy_back_and_forth, storage_test_fixture) {
     auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
     auto ntp = model::ntp("default", "test", 0);
     auto log = mgr
-                 .manage(storage::ntp_config(
-                   ntp,
-                   mgr.config().base_dir,
-                   std::make_unique<storage::ntp_config::default_overrides>(
-                     overrides)))
+                 .manage(
+                   storage::ntp_config(
+                     ntp,
+                     mgr.config().base_dir,
+                     std::make_unique<storage::ntp_config::default_overrides>(
+                       overrides)))
                  .get();
 
     auto disk_log = log;
@@ -2542,7 +2510,6 @@ FIXTURE_TEST(changing_cleanup_policy_back_and_forth, storage_test_fixture) {
                   {std::move(batch)});
                 storage::log_append_config cfg{
                   .should_fsync = storage::log_append_config::fsync::no,
-                  .io_priority = ss::default_priority_class(),
                   .timeout = model::no_timeout,
                 };
 
@@ -2554,20 +2521,21 @@ FIXTURE_TEST(changing_cleanup_policy_back_and_forth, storage_test_fixture) {
     };
     // add 2 log segments
     add_segment(1_MiB);
-    disk_log->force_roll(ss::default_priority_class()).get();
+    disk_log->force_roll().get();
     add_segment(1_MiB);
-    disk_log->force_roll(ss::default_priority_class()).get();
+    disk_log->force_roll().get();
     add_segment(1_MiB);
     log->flush().get();
 
-    BOOST_REQUIRE_EQUAL(disk_log->segment_count(), 3);
+    ASSERT_EQ(disk_log->segment_count(), 3);
 
     storage::housekeeping_config c_cfg(
       model::timestamp::min(),
       std::nullopt,
       model::offset::max(),
       std::nullopt,
-      ss::default_priority_class(),
+      std::nullopt,
+      0ms,
       as);
 
     // self compaction steps
@@ -2586,12 +2554,12 @@ FIXTURE_TEST(changing_cleanup_policy_back_and_forth, storage_test_fixture) {
     // read all batches again
     auto second_read = read_and_validate_all_batches(log);
 
-    BOOST_REQUIRE_EQUAL(first_read.size(), second_read.size());
+    ASSERT_EQ(first_read.size(), second_read.size());
 }
 
-ss::future<ss::circular_buffer<model::record_batch>>
+ss::future<chunked_circular_buffer<model::record_batch>>
 copy_to_mem(model::record_batch_reader& reader) {
-    using data_t = ss::circular_buffer<model::record_batch>;
+    using data_t = chunked_circular_buffer<model::record_batch>;
     class memory_batch_consumer {
     public:
         ss::future<ss::stop_iteration> operator()(model::record_batch b) {
@@ -2608,7 +2576,7 @@ copy_to_mem(model::record_batch_reader& reader) {
     return reader.consume(memory_batch_consumer{}, model::no_timeout);
 }
 
-FIXTURE_TEST(reader_prevents_log_shutdown, storage_test_fixture) {
+TEST_F(storage_test_fixture, reader_prevents_log_shutdown) {
     auto cfg = default_log_config(test_dir);
     cfg.cache = storage::with_cache::no;
     cfg.max_segment_size = config::mock_binding<size_t>(10_MiB);
@@ -2619,22 +2587,21 @@ FIXTURE_TEST(reader_prevents_log_shutdown, storage_test_fixture) {
     auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
     auto ntp = model::ntp("default", "test", 0);
     auto log = mgr
-                 .manage(storage::ntp_config(
-                   ntp,
-                   mgr.config().base_dir,
-                   std::make_unique<storage::ntp_config::default_overrides>(
-                     overrides)))
+                 .manage(
+                   storage::ntp_config(
+                     ntp,
+                     mgr.config().base_dir,
+                     std::make_unique<storage::ntp_config::default_overrides>(
+                       overrides)))
                  .get();
     // append some batches
     append_exactly(log, 5, 128).get();
 
     // drain whole log with reader so it is not reusable anymore.
-    storage::log_reader_config reader_cfg(
+    storage::local_log_reader_config reader_cfg(
       model::offset(0),
       model::model_limits<model::offset>::max(),
-      0,
       std::numeric_limits<int64_t>::max(),
-      ss::default_priority_class(),
       std::nullopt,
       std::nullopt,
       std::nullopt);
@@ -2648,7 +2615,7 @@ FIXTURE_TEST(reader_prevents_log_shutdown, storage_test_fixture) {
     f.get();
 }
 
-FIXTURE_TEST(test_querying_term_last_offset, storage_test_fixture) {
+TEST_F(storage_test_fixture, test_querying_term_last_offset) {
     auto cfg = default_log_config(test_dir);
     storage::ntp_config::default_overrides overrides;
     ss::abort_source as;
@@ -2657,11 +2624,12 @@ FIXTURE_TEST(test_querying_term_last_offset, storage_test_fixture) {
     auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
     auto ntp = model::ntp("default", "test", 0);
     auto log = mgr
-                 .manage(storage::ntp_config(
-                   ntp,
-                   mgr.config().base_dir,
-                   std::make_unique<storage::ntp_config::default_overrides>(
-                     overrides)))
+                 .manage(
+                   storage::ntp_config(
+                     ntp,
+                     mgr.config().base_dir,
+                     std::make_unique<storage::ntp_config::default_overrides>(
+                       overrides)))
                  .get();
     // append some baches in term 0
     append_random_batches(log, 10, model::term_id(0));
@@ -2671,7 +2639,7 @@ FIXTURE_TEST(test_querying_term_last_offset, storage_test_fixture) {
     {
         auto disk_log = log;
         // force segment roll
-        disk_log->force_roll(ss::default_priority_class()).get();
+        disk_log->force_roll().get();
     }
     // append more batches in the same term
     append_random_batches(log, 10, model::term_id(1));
@@ -2679,26 +2647,26 @@ FIXTURE_TEST(test_querying_term_last_offset, storage_test_fixture) {
     // append some batche sin term 2
     append_random_batches(log, 10, model::term_id(2));
 
-    BOOST_REQUIRE_EQUAL(
+    ASSERT_EQ(
       lstats_term_0.dirty_offset,
       log->get_term_last_offset(model::term_id(0)).value());
-    BOOST_REQUIRE_EQUAL(
+    ASSERT_EQ(
       lstats_term_1.dirty_offset,
       log->get_term_last_offset(model::term_id(1)).value());
-    BOOST_REQUIRE_EQUAL(
+    ASSERT_EQ(
       log->offsets().dirty_offset,
       log->get_term_last_offset(model::term_id(2)).value());
 
-    BOOST_REQUIRE(!log->get_term_last_offset(model::term_id(3)).has_value());
+    ASSERT_TRUE(!log->get_term_last_offset(model::term_id(3)).has_value());
     // prefix truncate log at end offset fo term 0
 
     log
-      ->truncate_prefix(storage::truncate_prefix_config(
-        lstats_term_0.dirty_offset + model::offset(1),
-        ss::default_priority_class()))
+      ->truncate_prefix(
+        storage::truncate_prefix_config(
+          lstats_term_0.dirty_offset + model::offset(1)))
       .get();
 
-    BOOST_REQUIRE(!log->get_term_last_offset(model::term_id(0)).has_value());
+    ASSERT_TRUE(!log->get_term_last_offset(model::term_id(0)).has_value());
 }
 
 void write_batch(
@@ -2719,7 +2687,6 @@ void write_batch(
     auto reader = model::make_memory_record_batch_reader({std::move(batch)});
     storage::log_append_config cfg{
       .should_fsync = storage::log_append_config::fsync::no,
-      .io_priority = ss::default_priority_class(),
       .timeout = model::no_timeout,
     };
 
@@ -2730,10 +2697,9 @@ absl::
   flat_hash_map<std::tuple<model::record_batch_type, bool, ss::sstring>, int>
   compact_in_memory(ss::shared_ptr<storage::log> log) {
     auto rdr = log
-                 ->make_reader(storage::log_reader_config(
-                   model::offset(0),
-                   model::offset::max(),
-                   ss::default_priority_class()))
+                 ->make_reader(
+                   storage::local_log_reader_config(
+                     model::offset(0), model::offset::max()))
                  .get();
 
     absl::flat_hash_map<
@@ -2757,7 +2723,7 @@ absl::
     return ret;
 }
 
-FIXTURE_TEST(test_compacting_batches_of_different_types, storage_test_fixture) {
+TEST_F(storage_test_fixture, test_compacting_batches_of_different_types) {
     auto cfg = default_log_config(test_dir);
     cfg.max_compacted_segment_size = config::mock_binding<size_t>(100_MiB);
     cfg.cache = storage::with_cache::no;
@@ -2770,11 +2736,12 @@ FIXTURE_TEST(test_compacting_batches_of_different_types, storage_test_fixture) {
     auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
     auto ntp = model::ntp("default", "test", 0);
     auto log = mgr
-                 .manage(storage::ntp_config(
-                   ntp,
-                   mgr.config().base_dir,
-                   std::make_unique<storage::ntp_config::default_overrides>(
-                     overrides)))
+                 .manage(
+                   storage::ntp_config(
+                     ntp,
+                     mgr.config().base_dir,
+                     std::make_unique<storage::ntp_config::default_overrides>(
+                       overrides)))
                  .get();
 
     auto disk_log = log;
@@ -2798,30 +2765,31 @@ FIXTURE_TEST(test_compacting_batches_of_different_types, storage_test_fixture) {
     write_batch(log, "key_1", 300, model::record_batch_type::tm_update, false);
     write_batch(log, "key_1", 400, model::record_batch_type::tm_update, false);
 
-    disk_log->force_roll(ss::default_priority_class()).get();
+    disk_log->force_roll().get();
 
     log->flush().get();
 
-    BOOST_REQUIRE_EQUAL(disk_log->segment_count(), 2);
+    ASSERT_EQ(disk_log->segment_count(), 2);
 
     storage::housekeeping_config c_cfg(
       model::timestamp::min(),
       std::nullopt,
       model::offset::max(),
       std::nullopt,
-      ss::default_priority_class(),
+      std::nullopt,
+      0ms,
       as);
     auto before_compaction = compact_in_memory(log);
 
-    BOOST_REQUIRE_EQUAL(before_compaction.size(), 4);
+    ASSERT_EQ(before_compaction.size(), 4);
     // compact
     log->housekeeping(c_cfg).get();
     auto after_compaction = compact_in_memory(log);
 
-    BOOST_REQUIRE(before_compaction == after_compaction);
+    ASSERT_TRUE(before_compaction == after_compaction);
 }
 
-FIXTURE_TEST(read_write_truncate, storage_test_fixture) {
+TEST_F(storage_test_fixture, read_write_truncate) {
     /**
      * Test validating concurrent reads, writes and truncations
      */
@@ -2831,7 +2799,7 @@ FIXTURE_TEST(read_write_truncate, storage_test_fixture) {
     storage::ntp_config::default_overrides overrides;
     ss::abort_source as;
     storage::log_manager mgr = make_log_manager(cfg);
-    info("config: {}", mgr.config());
+    SUCCEED() << fmt::format("config: {}", mgr.config());
     auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
 
     auto ntp = model::ntp("default", "test", 0);
@@ -2844,7 +2812,7 @@ FIXTURE_TEST(read_write_truncate, storage_test_fixture) {
     auto produce = ss::do_until(
       [&] { return cnt > max; },
       [&log, &cnt, &log_mutex] {
-          ss::circular_buffer<model::record_batch> batches;
+          chunked_circular_buffer<model::record_batch> batches;
           for (int i = 0; i < 20; ++i) {
               storage::record_batch_builder builder(
                 model::record_batch_type::raft_data, model::offset(0));
@@ -2858,18 +2826,17 @@ FIXTURE_TEST(read_write_truncate, storage_test_fixture) {
 
           storage::log_append_config cfg{
             .should_fsync = storage::log_append_config::fsync::no,
-            .io_priority = ss::default_priority_class(),
             .timeout = model::no_timeout,
           };
-          info("append");
+          SUCCEED() << "append";
           return log_mutex
             .with([reader = std::move(reader), cfg, &log]() mutable {
-                info("append_lock");
+                SUCCEED() << "append_lock";
                 return std::move(reader).for_each_ref(
                   log->make_appender(cfg), cfg.timeout);
             })
             .then([](storage::append_result res) {
-                info("append_result: {}", res.last_offset);
+                SUCCEED() << fmt::format("append_result: {}", res.last_offset);
             })
             .then([&log] { return log->flush(); })
             .finally([&cnt] { cnt++; });
@@ -2882,26 +2849,24 @@ FIXTURE_TEST(read_write_truncate, storage_test_fixture) {
           if (offset.dirty_offset == model::offset{}) {
               return ss::now();
           }
-          storage::log_reader_config cfg(
+          storage::local_log_reader_config cfg(
             std::max(model::offset(0), offset.dirty_offset - model::offset(10)),
             cnt % 2 == 0 ? offset.dirty_offset - model::offset(2)
-                         : offset.dirty_offset,
-            ss::default_priority_class());
+                         : offset.dirty_offset);
           auto start = ss::steady_clock_type::now();
           return log->make_reader(cfg)
             .then([start](model::record_batch_reader rdr) {
                 // assert that creating a reader took less than 5 seconds
-                BOOST_REQUIRE_LT(
-                  (ss::steady_clock_type::now() - start) / 1ms, 5000);
+                EXPECT_LT((ss::steady_clock_type::now() - start) / 1ms, 5000);
                 return model::consume_reader_to_memory(
                   std::move(rdr), model::no_timeout);
             })
-            .then([](ss::circular_buffer<model::record_batch> batches) {
+            .then([](chunked_circular_buffer<model::record_batch> batches) {
                 if (batches.empty()) {
-                    info("read empty range");
+                    SUCCEED() << "read empty range";
                     return;
                 }
-                info(
+                SUCCEED() << fmt::format(
                   "read range: {}, {}",
                   batches.front().base_offset(),
                   batches.back().last_offset());
@@ -2917,19 +2882,18 @@ FIXTURE_TEST(read_write_truncate, storage_test_fixture) {
           }
           return log_mutex.with([&log] {
               auto offset = log->offsets();
-              info("truncate offsets: {}", offset);
+              SUCCEED() << fmt::format("truncate offsets: {}", offset);
               auto start = ss::steady_clock_type::now();
               auto orig_cnt = log->get_log_truncation_counter();
               return log
-                ->truncate(storage::truncate_config(
-                  offset.dirty_offset, ss::default_priority_class()))
+                ->truncate(storage::truncate_config(offset.dirty_offset))
                 .finally([start, orig_cnt, log] {
                     // assert that truncation took less than 5 seconds
-                    BOOST_REQUIRE_LT(
+                    ASSERT_LT(
                       (ss::steady_clock_type::now() - start) / 1ms, 5000);
                     auto new_cnt = log->get_log_truncation_counter();
-                    BOOST_REQUIRE_GT(new_cnt, orig_cnt);
-                    info("truncate_done");
+                    ASSERT_GT(new_cnt, orig_cnt);
+                    SUCCEED() << "truncate_done";
                 });
           });
       });
@@ -2939,7 +2903,7 @@ FIXTURE_TEST(read_write_truncate, storage_test_fixture) {
     truncate.get();
 }
 
-FIXTURE_TEST(write_truncate_compact, storage_test_fixture) {
+TEST_F(storage_test_fixture, write_truncate_compact) {
     /**
      * Test validating concurrent reads, writes and truncations
      */
@@ -2949,17 +2913,18 @@ FIXTURE_TEST(write_truncate_compact, storage_test_fixture) {
     storage::ntp_config::default_overrides overrides;
     ss::abort_source as;
     storage::log_manager mgr = make_log_manager(cfg);
-    info("config: {}", mgr.config());
+    SUCCEED() << fmt::format("config: {}", mgr.config());
     auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
     overrides.cleanup_policy_bitflags
       = model::cleanup_policy_bitflags::compaction;
     auto ntp = model::ntp("default", "test", 0);
     auto log = mgr
-                 .manage(storage::ntp_config(
-                   ntp,
-                   mgr.config().base_dir,
-                   std::make_unique<storage::ntp_config::default_overrides>(
-                     overrides)))
+                 .manage(
+                   storage::ntp_config(
+                     ntp,
+                     mgr.config().base_dir,
+                     std::make_unique<storage::ntp_config::default_overrides>(
+                       overrides)))
                  .get();
 
     int cnt = 0;
@@ -2970,7 +2935,7 @@ FIXTURE_TEST(write_truncate_compact, storage_test_fixture) {
       = ss::do_until(
           [&] { return cnt > max || done; },
           [&log, &cnt, &log_mutex] {
-              ss::circular_buffer<model::record_batch> batches;
+              chunked_circular_buffer<model::record_batch> batches;
               for (int i = 0; i < 20; ++i) {
                   storage::record_batch_builder builder(
                     model::record_batch_type::raft_data, model::offset(0));
@@ -2986,7 +2951,6 @@ FIXTURE_TEST(write_truncate_compact, storage_test_fixture) {
 
               storage::log_append_config cfg{
                 .should_fsync = storage::log_append_config::fsync::no,
-                .io_priority = ss::default_priority_class(),
                 .timeout = model::no_timeout,
               };
               return log_mutex
@@ -2995,7 +2959,8 @@ FIXTURE_TEST(write_truncate_compact, storage_test_fixture) {
                       log->make_appender(cfg), cfg.timeout);
                 })
                 .then([](storage::append_result res) {
-                    info("append_result: {}", res.last_offset);
+                    SUCCEED()
+                      << fmt::format("append_result: {}", res.last_offset);
                 })
                 .then([&log] { return log->flush(); })
                 .finally([&cnt] { cnt++; });
@@ -3015,27 +2980,25 @@ FIXTURE_TEST(write_truncate_compact, storage_test_fixture) {
                   auto truncate_at = model::offset{
                     random_generators::get_int<int64_t>(
                       offset.dirty_offset() / 2, offset.dirty_offset)};
-                  info(
+                  SUCCEED() << fmt::format(
                     "truncate offsets: {}, truncate at: {}",
                     offset,
                     truncate_at);
 
                   auto orig_cnt = log->get_log_truncation_counter();
-                  return log
-                    ->truncate(storage::truncate_config(
-                      truncate_at, ss::default_priority_class()))
+                  return log->truncate(storage::truncate_config(truncate_at))
                     .then_wrapped([log, o = truncate_at, orig_cnt](
                                     ss::future<> f) {
                         vassert(
                           !f.failed(),
                           "truncation failed with {}",
                           f.get_exception());
-                        BOOST_REQUIRE_LE(
+                        ASSERT_LE(
                           log->offsets().dirty_offset, model::prev_offset(o));
                         if (
                           log->offsets().dirty_offset < model::prev_offset(o)) {
                             auto new_cnt = log->get_log_truncation_counter();
-                            BOOST_REQUIRE_GT(new_cnt, orig_cnt);
+                            ASSERT_GT(new_cnt, orig_cnt);
                         }
                     });
               });
@@ -3046,29 +3009,32 @@ FIXTURE_TEST(write_truncate_compact, storage_test_fixture) {
                      [&] { return done; },
                      [&log, &as] {
                          return log
-                           ->housekeeping(storage::housekeeping_config(
-                             model::timestamp::min(),
-                             std::nullopt,
-                             model::offset::max(),
-                             std::nullopt,
-                             ss::default_priority_class(),
-                             as))
+                           ->housekeeping(
+                             storage::housekeeping_config(
+                               model::timestamp::min(),
+                               std::nullopt,
+                               model::offset::max(),
+                               std::nullopt,
+                               std::nullopt,
+                               0ms,
+                               as))
                            .handle_exception_type(
                              [](const storage::segment_closed_exception&) {
 
                              })
                            .handle_exception([](std::exception_ptr e) {
-                               info("compaction exception - {}", e);
+                               SUCCEED()
+                                 << fmt::format("compaction exception - {}", e);
                            });
                      })
                      .finally([&] { done = true; });
 
     compact.get();
-    info("compact_done");
+    SUCCEED() << "compact_done";
     produce.get();
-    info("produce_done");
+    SUCCEED() << "produce_done";
     truncate.get();
-    info("truncate_done");
+    SUCCEED() << "truncate_done";
 
     // Ensure we've cleaned up all our staging segments such that a removal of
     // the log results in nothing leftover.
@@ -3081,12 +3047,12 @@ FIXTURE_TEST(write_truncate_compact, storage_test_fixture) {
           .walk(
             dir_path,
             [](const ss::directory_entry& de) {
-                info("Leftover file: {}", de.name);
+                SUCCEED() << fmt::format("Leftover file: {}", de.name);
                 return ss::make_ready_future<>();
             })
           .get();
     }
-    BOOST_REQUIRE_EQUAL(false, ss::file_exists(dir_path).get());
+    ASSERT_EQ(false, ss::file_exists(dir_path).get());
 };
 
 // This test acts as a regression test to ensure that non raft data batches
@@ -3098,8 +3064,7 @@ FIXTURE_TEST(write_truncate_compact, storage_test_fixture) {
 // your patch, it usually means that you made a non raft data batch
 // compactible, which is not allowed for reason described above.
 // (unless the test itself is buggy, ofcourse :))
-FIXTURE_TEST(
-  compaction_non_raft_batches_regression_test, storage_test_fixture) {
+TEST_F(storage_test_fixture, compaction_non_raft_batches_regression_test) {
     class logging_consumer {
     public:
         ss::future<ss::stop_iteration> operator()(model::record_batch& b) {
@@ -3128,8 +3093,8 @@ FIXTURE_TEST(
     };
 
     auto print_batch_info = [](ss::shared_ptr<storage::log> log) {
-        storage::log_reader_config reader_cfg(
-          model::offset(0), model::offset::max(), ss::default_priority_class());
+        storage::local_log_reader_config reader_cfg(
+          model::offset(0), model::offset::max());
         auto reader = log->make_reader(reader_cfg).get();
         std::move(reader)
           .for_each_ref(logging_consumer{}, model::no_timeout)
@@ -3159,11 +3124,10 @@ FIXTURE_TEST(
                    raft::group_id{0},
                    model::offset_translator_batch_types())
                  .get();
-    log->start(std::nullopt).get();
+    log->start(std::nullopt, as).get();
 
     storage::log_append_config appender_cfg{
       .should_fsync = storage::log_append_config::fsync::no,
-      .io_priority = ss::default_priority_class(),
       .timeout = model::no_timeout,
     };
 
@@ -3211,13 +3175,14 @@ FIXTURE_TEST(
     }
 
     // compact the log
-    log->force_roll(ss::default_priority_class()).get();
+    log->force_roll().get();
     storage::housekeeping_config compaction_cfg(
       model::timestamp::min(),
       std::nullopt,
       model::offset::max(),
       std::nullopt,
-      ss::default_priority_class(),
+      std::nullopt,
+      0ms,
       as);
     log->housekeeping(compaction_cfg).get();
 
@@ -3237,19 +3202,19 @@ FIXTURE_TEST(
               raft::group_id{0},
               model::offset_translator_batch_types())
             .get();
-    log->start(std::nullopt).get();
+    log->start(std::nullopt, as).get();
 
     // validate the translation by comparing it with state before
     // compaction.
     for (model::offset o = begin; o < log->offsets().dirty_offset;
          o = model::next_offset(o)) {
         vlog(e2e_test_log.trace, "checking offset: {}", o);
-        BOOST_REQUIRE_EQUAL(log->from_log_offset(o), log_to_kafka[o]);
-        BOOST_REQUIRE_EQUAL(log->to_log_offset(o), kafka_to_log[o]);
+        ASSERT_EQ(log->from_log_offset(o), log_to_kafka[o]);
+        ASSERT_EQ(log->to_log_offset(o), kafka_to_log[o]);
     }
 }
 
-FIXTURE_TEST(compaction_truncation_corner_cases, storage_test_fixture) {
+TEST_F(storage_test_fixture, compaction_truncation_corner_cases) {
     auto cfg = default_log_config(test_dir);
     cfg.cache = storage::with_cache::no;
     cfg.max_compacted_segment_size = config::mock_binding<size_t>(100_MiB);
@@ -3263,11 +3228,12 @@ FIXTURE_TEST(compaction_truncation_corner_cases, storage_test_fixture) {
     auto ntp = model::ntp("default", "test", 0);
 
     auto log = mgr
-                 .manage(storage::ntp_config(
-                   ntp,
-                   mgr.config().base_dir,
-                   std::make_unique<storage::ntp_config::default_overrides>(
-                     overrides)))
+                 .manage(
+                   storage::ntp_config(
+                     ntp,
+                     mgr.config().base_dir,
+                     std::make_unique<storage::ntp_config::default_overrides>(
+                       overrides)))
                  .get();
 
     auto large_batch = [](int key) {
@@ -3281,13 +3247,12 @@ FIXTURE_TEST(compaction_truncation_corner_cases, storage_test_fixture) {
     };
 
     auto write_and_compact =
-      [&](ss::circular_buffer<model::record_batch> batches) {
+      [&](chunked_circular_buffer<model::record_batch> batches) {
           auto reader = model::make_memory_record_batch_reader(
             std::move(batches));
 
           storage::log_append_config appender_cfg{
             .should_fsync = storage::log_append_config::fsync::no,
-            .io_priority = ss::default_priority_class(),
             .timeout = model::no_timeout,
           };
 
@@ -3298,13 +3263,15 @@ FIXTURE_TEST(compaction_truncation_corner_cases, storage_test_fixture) {
             .get();
 
           log
-            ->housekeeping(storage::housekeeping_config(
-              model::timestamp::min(),
-              std::nullopt,
-              model::offset::max(),
-              std::nullopt,
-              ss::default_priority_class(),
-              as))
+            ->housekeeping(
+              storage::housekeeping_config(
+                model::timestamp::min(),
+                std::nullopt,
+                model::offset::max(),
+                std::nullopt,
+                std::nullopt,
+                0ms,
+                as))
             .get();
       };
     {
@@ -3314,7 +3281,7 @@ FIXTURE_TEST(compaction_truncation_corner_cases, storage_test_fixture) {
          * segment: [[batch (base_offset: 0)][gap][batch (base_offset: 10)]]
          *
          */
-        ss::circular_buffer<model::record_batch> batches;
+        chunked_circular_buffer<model::record_batch> batches;
 
         // first batch
         batches.push_back(large_batch(1));
@@ -3331,12 +3298,10 @@ FIXTURE_TEST(compaction_truncation_corner_cases, storage_test_fixture) {
 
         model::offset truncate_offset(10);
 
-        log
-          ->truncate(storage::truncate_config(
-            truncate_offset, ss::default_priority_class()))
-          .get();
-        info("truncated at: {}, offsets: {}", truncate_offset, log->offsets());
-        BOOST_REQUIRE_EQUAL(log->offsets().dirty_offset, model::offset(0));
+        log->truncate(storage::truncate_config(truncate_offset)).get();
+        SUCCEED() << fmt::format(
+          "truncated at: {}, offsets: {}", truncate_offset, log->offsets());
+        ASSERT_EQ(log->offsets().dirty_offset, model::offset(0));
     }
 
     {
@@ -3345,7 +3310,7 @@ FIXTURE_TEST(compaction_truncation_corner_cases, storage_test_fixture) {
          * segment: [batch: (base_offset: 11)]
          *
          */
-        ss::circular_buffer<model::record_batch> batches;
+        chunked_circular_buffer<model::record_batch> batches;
 
         // first batch
         batches.push_back(large_batch(1));
@@ -3363,29 +3328,23 @@ FIXTURE_TEST(compaction_truncation_corner_cases, storage_test_fixture) {
         write_and_compact(std::move(batches));
 
         model::offset truncate_offset(11);
-        log
-          ->truncate_prefix(storage::truncate_prefix_config(
-            truncate_offset, ss::default_priority_class()))
+        log->truncate_prefix(storage::truncate_prefix_config(truncate_offset))
           .get();
 
-        log
-          ->truncate(storage::truncate_config(
-            truncate_offset, ss::default_priority_class()))
-          .get();
-        info("truncated at: {}, offsets: {}", truncate_offset, log->offsets());
+        log->truncate(storage::truncate_config(truncate_offset)).get();
+        SUCCEED() << fmt::format(
+          "truncated at: {}, offsets: {}", truncate_offset, log->offsets());
         // empty log have a dirty offset equal to (start_offset - 1)
-        BOOST_REQUIRE_EQUAL(log->offsets().dirty_offset, model::offset(10));
+        ASSERT_EQ(log->offsets().dirty_offset, model::offset(10));
     }
 }
 
 static storage::log_gap_analysis analyze(storage::log& log) {
     // TODO factor out common constant
-    storage::log_reader_config reader_cfg(
+    storage::local_log_reader_config reader_cfg(
       model::offset(0),
       model::model_limits<model::offset>::max(),
-      0,
       10_MiB,
-      ss::default_priority_class(),
       std::nullopt,
       std::nullopt,
       std::nullopt);
@@ -3393,13 +3352,13 @@ static storage::log_gap_analysis analyze(storage::log& log) {
       log.make_reader(reader_cfg).get(), model::offset(0));
 }
 
-FIXTURE_TEST(test_max_compact_offset, storage_test_fixture) {
+TEST_F(storage_test_fixture, test_max_compact_offset) {
     // Test setup.
     auto cfg = default_log_config(test_dir);
     cfg.max_segment_size = config::mock_binding<size_t>(10_MiB);
     ss::abort_source as;
     storage::log_manager mgr = make_log_manager(cfg);
-    info("Configuration: {}", mgr.config());
+    SUCCEED() << fmt::format("Configuration: {}", mgr.config());
     auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
     auto ntp = model::ntp("default", "test", 0);
     storage::ntp_config::default_overrides overrides;
@@ -3415,53 +3374,58 @@ FIXTURE_TEST(test_max_compact_offset, storage_test_fixture) {
     // (1) append some random data, with limited number of distinct keys, so
     // compaction can make progress.
     auto headers = append_random_batches<key_limited_random_batch_generator>(
-      log, 20);
+      log, 20, model::term_id{0}, model::timestamp::now());
 
     // (2) remember log offset, roll log, and produce more messages
     log->flush().get();
     auto first_stats = log->offsets();
-    info("Offsets to be compacted {}", first_stats);
-    disk_log->force_roll(ss::default_priority_class()).get();
+    SUCCEED() << fmt::format("Offsets to be compacted {}", first_stats);
+    disk_log->force_roll().get();
     headers = append_random_batches<key_limited_random_batch_generator>(
-      log, 20);
+      log, 20, model::term_id{0}, model::timestamp::now());
+
+    ss::sleep(1s).get(); // ensure time separation for max.compaction.lag.ms
 
     // (3) roll log and trigger compaction, analyzing offset gaps before and
     // after, to observe compaction behavior.
     log->flush().get();
     auto second_stats = log->offsets();
     auto pre_compact_gaps = analyze(*disk_log);
-    disk_log->force_roll(ss::default_priority_class()).get();
+    disk_log->force_roll().get();
     auto max_compact_offset = first_stats.committed_offset;
     storage::housekeeping_config ccfg(
       model::timestamp::max(), // no time-based deletion
       std::nullopt,
       max_compact_offset,
       std::nullopt,
-      ss::default_priority_class(),
+      std::nullopt,
+      0ms,
       as);
     log->housekeeping(ccfg).get();
     auto final_stats = log->offsets();
     auto post_compact_gaps = analyze(*disk_log);
 
     // (4) check correctness.
-    info("pre-compact gaps {}", pre_compact_gaps);
-    info("post-compact gaps {}", post_compact_gaps);
+    SUCCEED() << fmt::format("pre-compact gaps {}", pre_compact_gaps);
+    SUCCEED() << fmt::format("post-compact gaps {}", post_compact_gaps);
 
     // Compaction doesn't change offset values, it creates holes in offset
     // space.
-    BOOST_REQUIRE(
-      final_stats.committed_offset == second_stats.committed_offset);
+    ASSERT_TRUE(final_stats.committed_offset == second_stats.committed_offset);
 
     // No gaps before compacting, and >0 gaps after.
-    BOOST_REQUIRE_EQUAL(pre_compact_gaps.num_gaps, 0);
-    BOOST_REQUIRE_GT(post_compact_gaps.num_gaps, 0);
+    ASSERT_EQ(pre_compact_gaps.num_gaps, 0);
+    ASSERT_GT(post_compact_gaps.num_gaps, 0);
     // Verify no compaction happened past the max_compactable_offset we
     // specified.
-    BOOST_REQUIRE_LE(post_compact_gaps.first_gap_start, max_compact_offset);
-    BOOST_REQUIRE_LE(post_compact_gaps.last_gap_end, max_compact_offset);
+    ASSERT_LE(post_compact_gaps.first_gap_start, max_compact_offset);
+    ASSERT_LE(post_compact_gaps.last_gap_end, max_compact_offset);
+    ASSERT_LE(
+      log->max_eligible_for_compacted_reupload_offset(model::offset{0}),
+      max_compact_offset);
 };
 
-FIXTURE_TEST(test_self_compaction_while_reader_is_open, storage_test_fixture) {
+TEST_F(storage_test_fixture, test_self_compaction_while_reader_is_open) {
     // Test setup.
     auto cfg = default_log_config(test_dir);
     cfg.max_segment_size = config::mock_binding<size_t>(10_MiB);
@@ -3488,7 +3452,7 @@ FIXTURE_TEST(test_self_compaction_while_reader_is_open, storage_test_fixture) {
     // (2) remember log offset, roll log, and produce more messages
     log->flush().get();
 
-    disk_log->force_roll(ss::default_priority_class()).get();
+    disk_log->force_roll().get();
     headers = append_random_batches<key_limited_random_batch_generator>(
       log, 20);
 
@@ -3496,24 +3460,22 @@ FIXTURE_TEST(test_self_compaction_while_reader_is_open, storage_test_fixture) {
     // after, to observe compaction behavior.
     log->flush().get();
 
-    disk_log->force_roll(ss::default_priority_class()).get();
+    disk_log->force_roll().get();
     storage::housekeeping_config ccfg(
       model::timestamp::max(), // no time-based deletion
       std::nullopt,
       model::offset::max(),
       std::nullopt,
-      ss::default_priority_class(),
+      std::nullopt,
+      0ms,
       as);
     auto& segment = *(disk_log->segments().begin());
-    auto stream = segment
-                    ->offset_data_stream(
-                      model::offset(0), ss::default_priority_class())
-                    .get();
+    auto stream = segment->offset_data_stream(model::offset(0)).get();
     log->housekeeping(std::move(ccfg)).get();
     stream.close().get();
 };
 
-FIXTURE_TEST(test_simple_compaction_rebuild_index, storage_test_fixture) {
+TEST_F(storage_test_fixture, test_simple_compaction_rebuild_index) {
     // Test setup.
     auto cfg = default_log_config(test_dir);
     cfg.max_segment_size = config::mock_binding<size_t>(10_MiB);
@@ -3534,20 +3496,21 @@ FIXTURE_TEST(test_simple_compaction_rebuild_index, storage_test_fixture) {
 
     // Append some linear kv ints
     int num_appends = 5;
-    append_random_batches<linear_int_kv_batch_generator>(log, num_appends);
+    append_random_batches<linear_int_kv_batch_generator>(
+      log, num_appends, model::term_id(0), model::timestamp::min());
     log->flush().get();
-    disk_log->force_roll(ss::default_priority_class()).get();
-    BOOST_REQUIRE_EQUAL(disk_log->segment_count(), 2);
+    disk_log->force_roll().get();
+    ASSERT_EQ(disk_log->segment_count(), 2);
 
     // Remove compacted indexes to trigger a full index rebuild.
     auto index_path = disk_log->segments()[0]->path().to_compacted_index();
-    BOOST_REQUIRE(std::filesystem::remove(index_path));
+    ASSERT_TRUE(std::filesystem::remove(index_path));
 
     auto batches = read_and_validate_all_batches(log);
-    BOOST_REQUIRE_EQUAL(
+    ASSERT_EQ(
       batches.size(),
       num_appends * linear_int_kv_batch_generator::batches_per_call);
-    BOOST_REQUIRE(std::all_of(batches.begin(), batches.end(), [](auto& b) {
+    ASSERT_TRUE(std::all_of(batches.begin(), batches.end(), [](auto& b) {
         return b.record_count()
                == linear_int_kv_batch_generator::records_per_batch;
     }));
@@ -3557,13 +3520,14 @@ FIXTURE_TEST(test_simple_compaction_rebuild_index, storage_test_fixture) {
       std::nullopt,
       model::offset::max(),
       std::nullopt,
-      ss::default_priority_class(),
+      std::nullopt,
+      0ms,
       as);
 
     log->housekeeping(ccfg).get();
 
     batches = read_and_validate_all_batches(log);
-    BOOST_REQUIRE_EQUAL(
+    ASSERT_EQ(
       batches.size(),
       num_appends * linear_int_kv_batch_generator::batches_per_call);
     linear_int_kv_batch_generator::validate_post_compaction(std::move(batches));
@@ -3620,7 +3584,6 @@ do_compact_test(const compact_test_args args, storage_test_fixture& f) {
           {std::move(batch)});
         storage::log_append_config cfg{
           .should_fsync = storage::log_append_config::fsync::no,
-          .io_priority = ss::default_priority_class(),
           .timeout = model::no_timeout,
         };
 
@@ -3636,7 +3599,7 @@ do_compact_test(const compact_test_args args, storage_test_fixture& f) {
         for (int i = 0; i < args.msg_per_segment; i++) {
             append_batch(log, model::term_id(0), key);
         }
-        disk_log->force_roll(ss::default_priority_class()).get();
+        disk_log->force_roll().get();
     }
     append_batch(log, model::term_id(0)); // write single message for final
                                           // segment after last roll
@@ -3644,9 +3607,8 @@ do_compact_test(const compact_test_args args, storage_test_fixture& f) {
     log->flush().get();
     auto pre_gaps = analyze(*disk_log);
     auto pre_stats = log->offsets();
-    BOOST_REQUIRE_EQUAL(
-      pre_stats.committed_offset, args.segments * args.msg_per_segment);
-    BOOST_REQUIRE_EQUAL(pre_gaps.num_gaps, 0);
+    ASSERT_EQ(pre_stats.committed_offset, args.segments * args.msg_per_segment);
+    ASSERT_EQ(pre_gaps.num_gaps, 0);
     tlog.info("pre-compact stats: {}, analysis: {}", pre_stats, pre_gaps);
 
     storage::housekeeping_config ccfg(
@@ -3654,36 +3616,40 @@ do_compact_test(const compact_test_args args, storage_test_fixture& f) {
       std::nullopt,
       model::offset(args.max_compact_offs),
       std::nullopt,
-      ss::default_priority_class(),
+      std::nullopt,
+      0ms,
       as);
     log->housekeeping(ccfg).get();
     auto final_stats = log->offsets();
     auto final_gaps = analyze(*disk_log);
     tlog.info("post-compact stats: {}, analysis: {}", final_stats, final_gaps);
-    BOOST_REQUIRE_EQUAL(
+    ASSERT_EQ(
       final_stats.committed_offset, args.segments * args.msg_per_segment);
 
     // If we used keys with segment IDs for records in each segment, we
     // should have one huge gap at the beginning of each compacted segment.
     // If we used the same key for each record, we should only expect one gap
     // after compaction runs across the entire window of segments.
-    BOOST_REQUIRE_EQUAL(final_gaps.num_gaps, args.num_expected_gaps);
-    BOOST_REQUIRE_EQUAL(final_gaps.first_gap_start, model::offset(0));
+    ASSERT_EQ(final_gaps.num_gaps, args.num_expected_gaps);
+    ASSERT_EQ(final_gaps.first_gap_start, model::offset(0));
 
     // If adjacent segment compaction worked in order from oldest to newest, we
     // could use this assert.
     // We can compact the whole first segment, ending at num_compactible_msg -
     // 1, but compaction leaves at least one message per key in the segment,
     // thus the - 2 here.
-    //   BOOST_REQUIRE_EQUAL(
+    //   ASSERT_EQ(
     //     final_gaps.last_gap_end, model::offset(args.num_compactable_msg -
     //     2));
     //  Instead, we use weaker assert for now:
 
-    BOOST_REQUIRE_LE(final_gaps.last_gap_end, args.max_compact_offs);
+    ASSERT_LE(final_gaps.last_gap_end, args.max_compact_offs);
+    ASSERT_LE(
+      log->max_eligible_for_compacted_reupload_offset(model::offset{0}),
+      args.max_compact_offs);
 }
 
-FIXTURE_TEST(test_max_compact_offset_mid_segment, storage_test_fixture) {
+TEST_F(storage_test_fixture, test_max_compact_offset_mid_segment) {
     // Create a log with three segments. We will set max compactible offset to
     // be in the middle of the second segment. This should cause only the first
     // segment to be compacted, as we do not support partial compaction of a
@@ -3699,7 +3665,7 @@ FIXTURE_TEST(test_max_compact_offset_mid_segment, storage_test_fixture) {
       *this);
 }
 
-FIXTURE_TEST(test_max_compact_offset_unset, storage_test_fixture) {
+TEST_F(storage_test_fixture, test_max_compact_offset_unset) {
     // Same as above, but leave max_compact_offset unset.
     do_compact_test(
       {.max_compact_offs = model::offset::max(),
@@ -3714,8 +3680,7 @@ FIXTURE_TEST(test_max_compact_offset_unset, storage_test_fixture) {
       *this);
 }
 
-FIXTURE_TEST(
-  test_max_compact_offset_unset_use_segment_ids, storage_test_fixture) {
+TEST_F(storage_test_fixture, test_max_compact_offset_unset_use_segment_ids) {
     // Use segment IDs for keys, thereby preventing compaction from reducing
     // down to just one record in the last segment (each segment will have 1,
     // unique record)
@@ -3730,12 +3695,12 @@ FIXTURE_TEST(
       *this);
 }
 
-FIXTURE_TEST(test_bytes_eviction_overrides, storage_test_fixture) {
+TEST_F(storage_test_fixture, test_bytes_eviction_overrides) {
     size_t batch_size = 128;
     size_t segment_size = 512_KiB;
     auto batches_per_segment = size_t(segment_size / batch_size);
     auto batch_cnt = batches_per_segment * 10 + 1;
-    info(
+    SUCCEED() << fmt::format(
       "using batch of size {}, with {} batches per segment, total batches: {}",
       batch_size,
       batches_per_segment,
@@ -3754,111 +3719,121 @@ FIXTURE_TEST(test_bytes_eviction_overrides, storage_test_fixture) {
     /**
      * Retention disabled
      */
-    test_cases.push_back(test_case{
-      std::nullopt,                   // default local
-      std::nullopt,                   // default cloud
-      tristate<size_t>(std::nullopt), // topic local
-      tristate<size_t>(std::nullopt), // topic cloud
-      false,
-      batch_size * batch_cnt,
-    });
+    test_cases.push_back(
+      test_case{
+        std::nullopt,                   // default local
+        std::nullopt,                   // default cloud
+        tristate<size_t>(std::nullopt), // topic local
+        tristate<size_t>(std::nullopt), // topic cloud
+        false,
+        batch_size * batch_cnt,
+      });
 
-    test_cases.push_back(test_case{
-      std::nullopt,                   // default local
-      std::nullopt,                   // default cloud
-      tristate<size_t>(std::nullopt), // topic local
-      tristate<size_t>(std::nullopt), // topic cloud
-      true,
-      batch_size * batch_cnt,
-    });
+    test_cases.push_back(
+      test_case{
+        std::nullopt,                   // default local
+        std::nullopt,                   // default cloud
+        tristate<size_t>(std::nullopt), // topic local
+        tristate<size_t>(std::nullopt), // topic cloud
+        true,
+        batch_size * batch_cnt,
+      });
     /**
      * Local retention takes precedence over cloud retention
      */
     // defaults
-    test_cases.push_back(test_case{
-      retain_segments(4),             // default local
-      retain_segments(6),             // default cloud
-      tristate<size_t>(std::nullopt), // topic local
-      tristate<size_t>(std::nullopt), // topic cloud
-      true,
-      segment_size * 4 + batch_size,
-    });
+    test_cases.push_back(
+      test_case{
+        retain_segments(4),             // default local
+        retain_segments(6),             // default cloud
+        tristate<size_t>(std::nullopt), // topic local
+        tristate<size_t>(std::nullopt), // topic cloud
+        true,
+        segment_size * 4 + batch_size,
+      });
 
     // per topic configuration
-    test_cases.push_back(test_case{
-      retain_segments(4),                     // default local
-      retain_segments(6),                     // default cloud
-      tristate<size_t>(segment_size * 2 + 1), // topic local
-      tristate<size_t>(segment_size * 3 + 1), // topic cloud
-      true,
-      segment_size * 2 + batch_size,
-    });
+    test_cases.push_back(
+      test_case{
+        retain_segments(4),                     // default local
+        retain_segments(6),                     // default cloud
+        tristate<size_t>(segment_size * 2 + 1), // topic local
+        tristate<size_t>(segment_size * 3 + 1), // topic cloud
+        true,
+        segment_size * 2 + batch_size,
+      });
     // /**
     //  * Local retention is capped by cloud retention
     //  */
     // defaults, local retention is larger than remote one, it should be capped
-    test_cases.push_back(test_case{
-      retain_segments(5),             // default local
-      retain_segments(3),             // default cloud
-      tristate<size_t>(std::nullopt), // topic local
-      tristate<size_t>(std::nullopt), // topic cloud
-      true,
-      segment_size * 3 + batch_size,
-    });
+    test_cases.push_back(
+      test_case{
+        retain_segments(5),             // default local
+        retain_segments(3),             // default cloud
+        tristate<size_t>(std::nullopt), // topic local
+        tristate<size_t>(std::nullopt), // topic cloud
+        true,
+        segment_size * 3 + batch_size,
+      });
 
     // defaults, local retention is disabled, it should be replaced by cloud one
-    test_cases.push_back(test_case{
-      std::nullopt,                   // default local
-      retain_segments(3),             // default cloud
-      tristate<size_t>(std::nullopt), // topic local
-      tristate<size_t>(std::nullopt), // topic cloud
-      true,
-      segment_size * 3 + batch_size,
-    });
+    test_cases.push_back(
+      test_case{
+        std::nullopt,                   // default local
+        retain_segments(3),             // default cloud
+        tristate<size_t>(std::nullopt), // topic local
+        tristate<size_t>(std::nullopt), // topic cloud
+        true,
+        segment_size * 3 + batch_size,
+      });
 
     // topic configuration, local retention is larger than remote one, it
     // should be capped
-    test_cases.push_back(test_case{
-      retain_segments(6),                   // default local
-      retain_segments(8),                   // default cloud
-      tristate<size_t>(retain_segments(5)), // topic local
-      tristate<size_t>(retain_segments(2)), // topic cloud
-      true,
-      segment_size * 2 + batch_size,
-    });
+    test_cases.push_back(
+      test_case{
+        retain_segments(6),                   // default local
+        retain_segments(8),                   // default cloud
+        tristate<size_t>(retain_segments(5)), // topic local
+        tristate<size_t>(retain_segments(2)), // topic cloud
+        true,
+        segment_size * 2 + batch_size,
+      });
     //  topic configuration, local retention is disabled, it should be
     // replaced by cloud one
-    test_cases.push_back(test_case{
-      retain_segments(6),                   // default local
-      retain_segments(8),                   // default cloud
-      tristate<size_t>{},                   // topic local
-      tristate<size_t>(retain_segments(2)), // topic cloud
-      true,
-      segment_size * 2 + batch_size,
-    });
+    test_cases.push_back(
+      test_case{
+        retain_segments(6),                   // default local
+        retain_segments(8),                   // default cloud
+        tristate<size_t>{},                   // topic local
+        tristate<size_t>(retain_segments(2)), // topic cloud
+        true,
+        segment_size * 2 + batch_size,
+      });
 
     // cloud storage disabled, use whatever is there in cloud settings
-    test_cases.push_back(test_case{
-      retain_segments(6),                   // default local
-      retain_segments(8),                   // default cloud
-      tristate<size_t>(retain_segments(2)), // topic local
-      tristate<size_t>(retain_segments(5)), // topic cloud
-      false,
-      segment_size * 5 + batch_size,
-    });
+    test_cases.push_back(
+      test_case{
+        retain_segments(6),                   // default local
+        retain_segments(8),                   // default cloud
+        tristate<size_t>(retain_segments(2)), // topic local
+        tristate<size_t>(retain_segments(5)), // topic cloud
+        false,
+        segment_size * 5 + batch_size,
+      });
 
-    test_cases.push_back(test_case{
-      retain_segments(2),             // default local
-      retain_segments(6),             // default cloud
-      tristate<size_t>(std::nullopt), // topic local
-      tristate<size_t>(std::nullopt), // topic cloud
-      false,
-      segment_size * 6 + batch_size,
-    });
+    test_cases.push_back(
+      test_case{
+        retain_segments(2),             // default local
+        retain_segments(6),             // default cloud
+        tristate<size_t>(std::nullopt), // topic local
+        tristate<size_t>(std::nullopt), // topic cloud
+        false,
+        segment_size * 6 + batch_size,
+      });
 
     size_t i = 0;
     for (auto& tc : test_cases) {
-        info("Running case {}", i++);
+        SUCCEED() << fmt::format("Running case {}", i++);
         auto cfg = default_log_config(test_dir);
         // enable cloud storage
         config::shard_local_cfg().cloud_storage_enabled.set_value(
@@ -3917,7 +3892,7 @@ FIXTURE_TEST(test_bytes_eviction_overrides, storage_test_fixture) {
         }
         auto disk_log = log;
 
-        BOOST_REQUIRE_EQUAL(disk_log->segment_count(), 11);
+        ASSERT_EQ(disk_log->segment_count(), 11);
 
         compact_and_prefix_truncate(
           *disk_log,
@@ -3926,12 +3901,13 @@ FIXTURE_TEST(test_bytes_eviction_overrides, storage_test_fixture) {
             cfg.retention_bytes(),
             model::offset::max(),
             std::nullopt,
-            ss::default_priority_class(),
+            std::nullopt,
+            0ms,
             as));
 
         // retention won't violate the target
-        BOOST_REQUIRE_GE(disk_log->size_bytes(), tc.expected_bytes_left);
-        BOOST_REQUIRE_GT(
+        ASSERT_GE(disk_log->size_bytes(), tc.expected_bytes_left);
+        ASSERT_GT(
           disk_log->size_bytes(), tc.expected_bytes_left - segment_size);
     }
     config::shard_local_cfg().cloud_storage_enabled.reset();
@@ -3939,7 +3915,7 @@ FIXTURE_TEST(test_bytes_eviction_overrides, storage_test_fixture) {
     config::shard_local_cfg().retention_local_target_bytes_default.reset();
 }
 
-FIXTURE_TEST(issue_8091, storage_test_fixture) {
+TEST_F(storage_test_fixture, issue_8091) {
     /**
      * Test validating concurrent reads, writes and truncations
      */
@@ -3949,7 +3925,7 @@ FIXTURE_TEST(issue_8091, storage_test_fixture) {
     storage::ntp_config::default_overrides overrides;
     ss::abort_source as;
     storage::log_manager mgr = make_log_manager(cfg);
-    info("config: {}", mgr.config());
+    SUCCEED() << fmt::format("config: {}", mgr.config());
     auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
 
     auto ntp = model::ntp(model::kafka_namespace, "test", 0);
@@ -3957,14 +3933,14 @@ FIXTURE_TEST(issue_8091, storage_test_fixture) {
       = mgr.manage(storage::ntp_config(ntp, mgr.config().base_dir)).get();
 
     int cnt = 0;
-    int max = 500;
+    int max = 50; // NB: Reduced for GTest due to OOM; hopefully temporary.
     mutex log_mutex{"e2e_test::log_mutex"};
     model::offset last_truncate;
 
     auto produce = ss::do_until(
       [&] { return cnt > max; },
       [&log, &cnt, &log_mutex] {
-          ss::circular_buffer<model::record_batch> batches;
+          chunked_circular_buffer<model::record_batch> batches;
           auto bt = random_generators::random_choice(
             std::vector<model::record_batch_type>{
               model::record_batch_type::raft_data,
@@ -3987,17 +3963,17 @@ FIXTURE_TEST(issue_8091, storage_test_fixture) {
 
           storage::log_append_config cfg{
             .should_fsync = storage::log_append_config::fsync::no,
-            .io_priority = ss::default_priority_class(),
             .timeout = model::no_timeout,
           };
-          info("append");
+          SUCCEED() << "append";
           return log_mutex
             .with([reader = std::move(reader), cfg, &log]() mutable {
-                info("append_lock");
+                SUCCEED() << "append_lock";
                 return std::move(reader)
                   .for_each_ref(log->make_appender(cfg), cfg.timeout)
                   .then([](storage::append_result res) {
-                      info("append_result: {}", res.last_offset);
+                      SUCCEED()
+                        << fmt::format("append_result: {}", res.last_offset);
                   })
                   .then([&log] { return log->flush(); });
             })
@@ -4011,27 +3987,24 @@ FIXTURE_TEST(issue_8091, storage_test_fixture) {
               return ss::now();
           }
           auto offset = log->offsets();
-          storage::log_reader_config cfg(
-            last_truncate - model::offset(1),
-            offset.dirty_offset,
-            ss::default_priority_class());
+          storage::local_log_reader_config cfg(
+            last_truncate - model::offset(1), offset.dirty_offset);
           cfg.type_filter = model::record_batch_type::raft_data;
 
           auto start = ss::steady_clock_type::now();
           return log->make_reader(cfg)
             .then([start](model::record_batch_reader rdr) {
                 // assert that creating a reader took less than 5 seconds
-                BOOST_REQUIRE_LT(
-                  (ss::steady_clock_type::now() - start) / 1ms, 5000);
+                EXPECT_LT((ss::steady_clock_type::now() - start) / 1ms, 5000);
                 return model::consume_reader_to_memory(
                   std::move(rdr), model::no_timeout);
             })
-            .then([](ss::circular_buffer<model::record_batch> batches) {
+            .then([](chunked_circular_buffer<model::record_batch> batches) {
                 if (batches.empty()) {
-                    info("read empty range");
+                    SUCCEED() << "read empty range";
                     return;
                 }
-                info(
+                SUCCEED() << fmt::format(
                   "read range: {}, {}",
                   batches.front().base_offset(),
                   batches.back().last_offset());
@@ -4048,17 +4021,16 @@ FIXTURE_TEST(issue_8091, storage_test_fixture) {
           return log_mutex
             .with([&log, &last_truncate] {
                 auto offset = log->offsets();
-                info("truncate offsets: {}", offset);
+                SUCCEED() << fmt::format("truncate offsets: {}", offset);
                 auto start = ss::steady_clock_type::now();
                 last_truncate = offset.dirty_offset;
                 return log
-                  ->truncate(storage::truncate_config(
-                    offset.dirty_offset, ss::default_priority_class()))
+                  ->truncate(storage::truncate_config(offset.dirty_offset))
                   .finally([start] {
                       // assert that truncation took less than 5 seconds
-                      BOOST_REQUIRE_LT(
+                      ASSERT_LT(
                         (ss::steady_clock_type::now() - start) / 1ms, 5000);
-                      info("truncate_done");
+                      SUCCEED() << "truncate_done";
                   });
             })
             .then([] { return ss::sleep(10ms); });
@@ -4070,79 +4042,15 @@ FIXTURE_TEST(issue_8091, storage_test_fixture) {
     auto disk_log = log;
 
     // at the end of this test there must be no batch parse errors
-    BOOST_REQUIRE_EQUAL(disk_log->get_probe().get_batch_parse_errors(), 0);
-}
-
-FIXTURE_TEST(test_skipping_compaction_below_start_offset, log_builder_fixture) {
-    using namespace storage;
-
-    ss::abort_source abs;
-    temporary_dir tmp_dir("storage_e2e");
-    auto data_path = tmp_dir.get_path();
-
-    storage::ntp_config config{{"test_ns", "test_tpc", 0}, {data_path}};
-
-    storage::ntp_config::default_overrides overrides;
-    overrides.retention_bytes = tristate<size_t>{1};
-    overrides.cleanup_policy_bitflags
-      = model::cleanup_policy_bitflags::compaction
-        | model::cleanup_policy_bitflags::deletion;
-
-    config.set_overrides(overrides);
-
-    // Create a log and populate it with two segments,
-    // while making sure to close the first segment before
-    // opening the second.
-    b | start(std::move(config));
-
-    auto& log = b.get_disk_log_impl();
-
-    b | add_segment(0) | add_random_batch(0, 100);
-
-    log.force_roll(ss::default_priority_class()).get();
-
-    b | add_segment(100) | add_random_batch(100, 100);
-
-    BOOST_REQUIRE_EQUAL(log.segment_count(), 2);
-
-    housekeeping_config cfg{
-      model::timestamp::max(),
-      1,
-      model::offset::max(),
-      std::nullopt,
-      ss::default_priority_class(),
-      abs};
-
-    // Call into `disk_log_impl::gc` and listen for the eviction
-    // notification being created.
-    auto eviction_future = log.monitor_eviction(abs);
-    auto new_start_offset = b.apply_retention(cfg.gc).get();
-    BOOST_REQUIRE(new_start_offset);
-
-    BOOST_REQUIRE_EQUAL(log.segment_count(), 2);
-
-    // Grab the new start offset from the notification and
-    // update the removable offset and start offsets.
-    auto evict_at_offset = eviction_future.get();
-    BOOST_REQUIRE_EQUAL(*new_start_offset, model::next_offset(evict_at_offset));
-    BOOST_REQUIRE(b.update_start_offset(*new_start_offset).get());
-
-    // Call into `disk_log_impl::compact`. The only segment eligible for
-    // compaction is the below the start offset and it should be ignored.
-    auto& first_seg = log.segments().front();
-    BOOST_REQUIRE_EQUAL(first_seg->finished_self_compaction(), false);
-
-    b.apply_adjacent_merge_compaction(cfg.compact, *new_start_offset).get();
-
-    BOOST_REQUIRE_EQUAL(first_seg->finished_self_compaction(), false);
-
-    b.stop().get();
+    ASSERT_EQ(disk_log->get_probe().get_batch_parse_errors(), 0);
 }
 
 struct batch_summary {
     model::offset base;
     model::offset last;
     size_t batch_size;
+    model::timestamp base_ts;
+    model::timestamp max_ts;
 };
 
 struct batch_summary_accumulator {
@@ -4153,6 +4061,8 @@ struct batch_summary_accumulator {
           .last = b.last_offset(),
           .batch_size = b.data().size_bytes()
                         + model::packed_record_batch_header_size,
+          .base_ts = b.header().first_timestamp,
+          .max_ts = b.header().max_timestamp,
         };
         summaries.push_back(summary);
         acc_size.push_back(sz + summary.batch_size);
@@ -4183,21 +4093,22 @@ namespace model {
 struct record_batch_reader_accessor {
     static storage::log_reader* get_impl(model::record_batch_reader& r) {
         auto impl = r._impl.get();
-        BOOST_REQUIRE(impl != nullptr);
+        // Google test doesn't handle assertions here well.
+        EXPECT_TRUE(impl != nullptr);
         auto impl_log_reader = dynamic_cast<storage::log_reader*>(impl);
-        BOOST_REQUIRE_MESSAGE(impl_log_reader, "impl was not a log_reader");
+        EXPECT_TRUE(impl_log_reader) << "impl was not a log reader";
         return impl_log_reader;
     }
 
     static private_flags get_flags(model::record_batch_reader& r) {
         auto flags = r._impl->get_flags();
-        BOOST_REQUIRE_MESSAGE(flags.has_value(), "private flags unset");
+        EXPECT_TRUE(flags.has_value()) << "private flags unset";
         return *flags;
     };
 };
 } // namespace model
 
-FIXTURE_TEST(reader_reusability_max_bytes, storage_test_fixture) {
+TEST_F(storage_test_fixture, reader_reusability_max_bytes) {
     constexpr size_t total_log_bytes = 1_MiB;
 
     auto cfg = default_log_config(test_dir);
@@ -4205,7 +4116,7 @@ FIXTURE_TEST(reader_reusability_max_bytes, storage_test_fixture) {
     cfg.max_segment_size = config::mock_binding<size_t>(2_MiB);
     storage::ntp_config::default_overrides overrides;
     storage::log_manager mgr = make_log_manager(cfg);
-    info("config: {}", mgr.config());
+    SUCCEED() << fmt::format("config: {}", mgr.config());
     auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
 
     int log_num = 0;
@@ -4214,19 +4125,22 @@ FIXTURE_TEST(reader_reusability_max_bytes, storage_test_fixture) {
                        size_t bytes_per_batch,
                        size_t reader_max_bytes,
                        bool second_read_reusable = true) {
-        BOOST_TEST_CONTEXT(fmt::format(
-          "bytes_per_batch={}, reader_max_bytes={}",
-          bytes_per_batch,
-          reader_max_bytes)) {
+        {
+            SCOPED_TRACE(
+              fmt::format(
+                "bytes_per_batch={}, reader_max_bytes={}",
+                bytes_per_batch,
+                reader_max_bytes));
             auto ntp = model::ntp(
               "default", fmt::format("test-{}", log_num++), 0);
             auto log
               = mgr
-                  .manage(storage::ntp_config(
-                    ntp,
-                    mgr.config().base_dir,
-                    std::make_unique<storage::ntp_config::default_overrides>(
-                      overrides)))
+                  .manage(
+                    storage::ntp_config(
+                      ntp,
+                      mgr.config().base_dir,
+                      std::make_unique<storage::ntp_config::default_overrides>(
+                        overrides)))
                   .get();
 
             append_exactly(
@@ -4234,12 +4148,10 @@ FIXTURE_TEST(reader_reusability_max_bytes, storage_test_fixture) {
               .get();
             log->flush().get();
 
-            storage::log_reader_config reader_cfg(
+            storage::local_log_reader_config reader_cfg(
               model::offset(0),
               model::model_limits<model::offset>::max(),
-              0,
               reader_max_bytes,
-              ss::default_priority_class(),
               std::nullopt,
               std::nullopt,
               std::nullopt);
@@ -4265,9 +4177,10 @@ FIXTURE_TEST(reader_reusability_max_bytes, storage_test_fixture) {
                 auto flags = model::record_batch_reader_accessor::get_flags(
                   reader);
 
-                BOOST_TEST_CONTEXT(fmt::format("label={}", label)) {
-                    BOOST_CHECK_EQUAL(flags.is_reusable, expected_reusable);
-                    BOOST_CHECK_EQUAL(flags.was_cached, expected_cached);
+                {
+                    SCOPED_TRACE(fmt::format("label={}", label));
+                    EXPECT_EQ(flags.is_reusable, expected_reusable);
+                    EXPECT_EQ(flags.was_cached, expected_cached);
                 }
 
                 return summary;
@@ -4308,13 +4221,13 @@ FIXTURE_TEST(reader_reusability_max_bytes, storage_test_fixture) {
     test_case(400000, 300000, false);
 }
 
-FIXTURE_TEST(
-  test_offset_range_size_after_mid_segment_truncation, storage_test_fixture) {
+TEST_F(
+  storage_test_fixture, test_offset_range_size_after_mid_segment_truncation) {
     size_t num_segments = 2;
     model::offset first_segment_last_offset;
     auto cfg = default_log_config(test_dir);
     storage::log_manager mgr = make_log_manager(cfg);
-    info("Configuration: {}", mgr.config());
+    SUCCEED() << fmt::format("Configuration: {}", mgr.config());
     auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
     auto ntp = model::ntp("redpanda", "test-topic", 0);
 
@@ -4326,43 +4239,38 @@ FIXTURE_TEST(
           log,
           10,
           model::term_id(0),
+          std::nullopt,
           custom_ts_batch_generator(model::timestamp::now()));
         if (first_segment_last_offset == model::offset{}) {
             first_segment_last_offset = log->offsets().dirty_offset;
         }
-        log->force_roll(ss::default_priority_class()).get();
+        log->force_roll().get();
     }
 
     // Prefix truncate such that offset 1 is the new log start.
-    log
-      ->truncate_prefix(storage::truncate_prefix_config(
-        model::offset(1), ss::default_priority_class()))
+    log->truncate_prefix(storage::truncate_prefix_config(model::offset(1)))
       .get();
 
     // Run size queries on ranges that don't exist in the log, but whose range
     // is still included in a segment.
 
-    BOOST_CHECK(
-      log
-        ->offset_range_size(
-          model::offset(0), model::offset(1), ss::default_priority_class())
-        .get()
+    EXPECT_TRUE(
+      log->offset_range_size(model::offset(0), model::offset(1)).get()
       == std::nullopt);
 
-    BOOST_CHECK(
+    EXPECT_TRUE(
       log
         ->offset_range_size(
           model::offset(0),
           storage::log::offset_range_size_requirements_t{
             .target_size = 1,
             .min_size = 0,
-          },
-          ss::default_priority_class())
+          })
         .get()
       == std::nullopt);
 }
 
-FIXTURE_TEST(test_offset_range_size, storage_test_fixture) {
+TEST_F(storage_test_fixture, test_offset_range_size) {
 #ifdef NDEBUG
     size_t num_test_cases = 5000;
     size_t num_segments = 300;
@@ -4377,7 +4285,7 @@ FIXTURE_TEST(test_offset_range_size, storage_test_fixture) {
     auto cfg = default_log_config(test_dir);
     ss::abort_source as;
     storage::log_manager mgr = make_log_manager(cfg);
-    info("Configuration: {}", mgr.config());
+    SUCCEED() << fmt::format("Configuration: {}", mgr.config());
     auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
     auto ntp = model::ntp("redpanda", "test-topic", 0);
 
@@ -4391,15 +4299,16 @@ FIXTURE_TEST(test_offset_range_size, storage_test_fixture) {
           log,
           10,
           model::term_id(0),
+          std::nullopt,
           custom_ts_batch_generator(model::timestamp::now()));
         if (first_segment_last_offset == model::offset{}) {
             first_segment_last_offset = log->offsets().dirty_offset;
         }
-        log->force_roll(ss::default_priority_class()).get();
+        log->force_roll().get();
     }
 
-    storage::log_reader_config reader_cfg(
-      model::offset(0), model::offset::max(), ss::default_priority_class());
+    storage::local_log_reader_config reader_cfg(
+      model::offset(0), model::offset::max());
     auto reader = log->make_reader(reader_cfg).get();
 
     auto acc = std::move(reader)
@@ -4412,29 +4321,33 @@ FIXTURE_TEST(test_offset_range_size, storage_test_fixture) {
         auto ix_last = model::test::get_int(ix_base, summaries.size() - 1);
         auto base = summaries[ix_base].base;
         auto last = summaries[ix_last].last;
+        auto base_ts = summaries[ix_base].base_ts;
+        auto max_ts = summaries[ix_last].max_ts;
 
         auto expected_size = acc.acc_size[ix_last] - acc.prev_size[ix_base];
-        auto result
-          = log->offset_range_size(base, last, ss::default_priority_class())
-              .get();
+        auto result = log->offset_range_size(base, last).get();
 
-        BOOST_REQUIRE(result.has_value());
+        ASSERT_TRUE(result.has_value());
 
         vlog(
           e2e_test_log.debug,
-          "base: {}, last: {}, expected size: {}, actual size: {}",
+          "base: {}, last: {}, base_ts: {}, max_ts: {}, expected size: {}, "
+          "actual size: {}",
           base,
           last,
+          base_ts,
+          max_ts,
           expected_size,
           result->on_disk_size);
 
-        BOOST_REQUIRE_EQUAL(expected_size, result->on_disk_size);
-        BOOST_REQUIRE_EQUAL(last, result->last_offset);
+        ASSERT_EQ(expected_size, result->on_disk_size);
+        ASSERT_EQ(last, result->last_offset);
+        ASSERT_EQ(base_ts, result->first_timestamp);
+        ASSERT_EQ(max_ts, result->last_timestamp);
 
         // Validate using the segment reader
         size_t consumed_size = 0;
-        storage::log_reader_config reader_cfg(
-          base, result->last_offset, ss::default_priority_class());
+        storage::local_log_reader_config reader_cfg(base, result->last_offset);
         reader_cfg.skip_readers_cache = true;
         reader_cfg.skip_batch_cache = true;
         auto log_rdr = log->make_reader(std::move(reader_cfg)).get();
@@ -4442,40 +4355,35 @@ FIXTURE_TEST(test_offset_range_size, storage_test_fixture) {
           .size_bytes = &consumed_size,
         };
         std::move(log_rdr).consume(size_acc, model::no_timeout).get();
-        BOOST_REQUIRE_EQUAL(expected_size, result->on_disk_size);
+        ASSERT_EQ(expected_size, result->on_disk_size);
     }
 
     auto new_start_offset = model::next_offset(first_segment_last_offset);
-    log
-      ->truncate_prefix(storage::truncate_prefix_config(
-        new_start_offset, ss::default_priority_class()))
+    log->truncate_prefix(storage::truncate_prefix_config(new_start_offset))
       .get();
 
     auto lstat = log->offsets();
-    BOOST_REQUIRE_EQUAL(lstat.start_offset, new_start_offset);
+    ASSERT_EQ(lstat.start_offset, new_start_offset);
 
     // Check that out of range access triggers exception.
 
-    BOOST_REQUIRE(
+    ASSERT_TRUE(
       log
         ->offset_range_size(
-          model::offset(0),
-          model::next_offset(new_start_offset),
-          ss::default_priority_class())
+          model::offset(0), model::next_offset(new_start_offset))
         .get()
       == std::nullopt);
 
-    BOOST_REQUIRE(
+    ASSERT_TRUE(
       log
         ->offset_range_size(
           model::next_offset(new_start_offset),
-          model::next_offset(lstat.committed_offset),
-          ss::default_priority_class())
+          model::next_offset(lstat.committed_offset))
         .get()
       == std::nullopt);
 };
 
-FIXTURE_TEST(test_offset_range_size2, storage_test_fixture) {
+TEST_F(storage_test_fixture, test_offset_range_size2) {
 #ifdef NDEBUG
     size_t num_test_cases = 5000;
     size_t num_segments = 300;
@@ -4490,7 +4398,7 @@ FIXTURE_TEST(test_offset_range_size2, storage_test_fixture) {
     auto cfg = default_log_config(test_dir);
     ss::abort_source as;
     storage::log_manager mgr = make_log_manager(cfg);
-    info("Configuration: {}", mgr.config());
+    SUCCEED() << fmt::format("Configuration: {}", mgr.config());
     auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
     auto ntp = model::ntp("redpanda", "test-topic", 0);
 
@@ -4504,15 +4412,16 @@ FIXTURE_TEST(test_offset_range_size2, storage_test_fixture) {
           log,
           10,
           model::term_id(0),
+          std::nullopt,
           custom_ts_batch_generator(model::timestamp::now()));
         if (first_segment_last_offset == model::offset{}) {
             first_segment_last_offset = log->offsets().dirty_offset;
         }
-        log->force_roll(ss::default_priority_class()).get();
+        log->force_roll().get();
     }
 
-    storage::log_reader_config reader_cfg(
-      model::offset(0), model::offset::max(), ss::default_priority_class());
+    storage::local_log_reader_config reader_cfg(
+      model::offset(0), model::offset::max());
     auto reader = log->make_reader(reader_cfg).get();
     auto acc = std::move(reader)
                  .consume(batch_summary_accumulator{}, model::no_timeout)
@@ -4528,6 +4437,7 @@ FIXTURE_TEST(test_offset_range_size2, storage_test_fixture) {
         // - compare it to on_disk_size field of the result
         auto base_ix = model::test::get_int((size_t)0, summaries.size() - 1);
         auto base = summaries[base_ix].base;
+        auto base_ts = summaries[base_ix].base_ts;
         auto max_size = acc.acc_size.back() - acc.prev_size[base_ix];
         auto min_size = storage::segment_index::default_data_buffer_step;
         auto target_size = model::test::get_int(min_size, max_size);
@@ -4537,11 +4447,10 @@ FIXTURE_TEST(test_offset_range_size2, storage_test_fixture) {
                           storage::log::offset_range_size_requirements_t{
                             .target_size = target_size,
                             .min_size = 0,
-                          },
-                          ss::default_priority_class())
+                          })
                         .get();
 
-        BOOST_REQUIRE(result.has_value());
+        ASSERT_TRUE(result.has_value());
         auto last_offset = result->last_offset;
         size_t result_ix = 0;
         for (auto s : summaries) {
@@ -4551,12 +4460,13 @@ FIXTURE_TEST(test_offset_range_size2, storage_test_fixture) {
             result_ix++;
         }
         auto expected_size = acc.acc_size[result_ix] - acc.prev_size[base_ix];
-        BOOST_REQUIRE_EQUAL(expected_size, result->on_disk_size);
+        ASSERT_EQ(expected_size, result->on_disk_size);
+        ASSERT_EQ(base_ts, result->first_timestamp);
+        ASSERT_EQ(summaries[result_ix].max_ts, result->last_timestamp);
 
         // Validate using the segment reader
         size_t consumed_size = 0;
-        storage::log_reader_config reader_cfg(
-          base, result->last_offset, ss::default_priority_class());
+        storage::local_log_reader_config reader_cfg(base, result->last_offset);
         reader_cfg.skip_readers_cache = true;
         reader_cfg.skip_batch_cache = true;
         auto log_rdr = log->make_reader(std::move(reader_cfg)).get();
@@ -4564,58 +4474,53 @@ FIXTURE_TEST(test_offset_range_size2, storage_test_fixture) {
           .size_bytes = &consumed_size,
         };
         std::move(log_rdr).consume(size_acc, model::no_timeout).get();
-        BOOST_REQUIRE_EQUAL(expected_size, result->on_disk_size);
+        ASSERT_EQ(expected_size, result->on_disk_size);
     }
 
     auto new_start_offset = model::next_offset(first_segment_last_offset);
-    log
-      ->truncate_prefix(storage::truncate_prefix_config(
-        new_start_offset, ss::default_priority_class()))
+    log->truncate_prefix(storage::truncate_prefix_config(new_start_offset))
       .get();
 
     auto lstat = log->offsets();
-    BOOST_REQUIRE_EQUAL(lstat.start_offset, new_start_offset);
+    ASSERT_EQ(lstat.start_offset, new_start_offset);
 
     // Check that out of range access triggers exception.
 
-    BOOST_REQUIRE(
+    ASSERT_TRUE(
       log
         ->offset_range_size(
           model::offset(0),
           storage::log::offset_range_size_requirements_t{
             .target_size = 0x10000,
             .min_size = 1,
-          },
-          ss::default_priority_class())
+          })
         .get()
       == std::nullopt);
 
     // Query committed offset of the last batch, expect
     // no result.
 
-    BOOST_REQUIRE(
+    ASSERT_TRUE(
       log
         ->offset_range_size(
           summaries.back().last,
           storage::log::offset_range_size_requirements_t{
             .target_size = 0x10000,
             .min_size = 0,
-          },
-          ss::default_priority_class())
+          })
         .get()
       == std::nullopt);
 
     // Query offset out of range to trigger the exception.
 
-    BOOST_REQUIRE(
+    ASSERT_TRUE(
       log
         ->offset_range_size(
           model::next_offset(summaries.back().last),
           storage::log::offset_range_size_requirements_t{
             .target_size = 0x10000,
             .min_size = 0,
-          },
-          ss::default_priority_class())
+          })
         .get()
       == std::nullopt);
 
@@ -4626,14 +4531,12 @@ FIXTURE_TEST(test_offset_range_size2, storage_test_fixture) {
                    storage::log::offset_range_size_requirements_t{
                      .target_size = 0x10000,
                      .min_size = 0,
-                   },
-                   ss::default_priority_class())
+                   })
                  .get();
 
     // Only one batch is returned
-    BOOST_REQUIRE_EQUAL(res->last_offset, lstat.committed_offset);
-    BOOST_REQUIRE_EQUAL(
-      res->on_disk_size, acc.acc_size.back() - acc.prev_size.back());
+    ASSERT_EQ(res->last_offset, lstat.committed_offset);
+    ASSERT_EQ(res->on_disk_size, acc.acc_size.back() - acc.prev_size.back());
 
     // Check that we can measure the size of the log tail. This is needed for
     // timed uploads.
@@ -4647,30 +4550,28 @@ FIXTURE_TEST(test_offset_range_size2, storage_test_fixture) {
                   storage::log::offset_range_size_requirements_t{
                     .target_size = 0x10000,
                     .min_size = 0,
-                  },
-                  ss::default_priority_class())
+                  })
                 .get();
 
-        BOOST_REQUIRE_EQUAL(res->last_offset, lstat.committed_offset);
-        BOOST_REQUIRE_EQUAL(
+        ASSERT_EQ(res->last_offset, lstat.committed_offset);
+        ASSERT_EQ(
           res->on_disk_size, acc.acc_size.back() - acc.prev_size.at(ix_batch));
     }
 
     // Check that the min_size is respected
-    BOOST_REQUIRE(
+    ASSERT_TRUE(
       log
         ->offset_range_size(
           summaries.back().base,
           storage::log::offset_range_size_requirements_t{
             .target_size = 0x10000,
             .min_size = summaries.back().batch_size + 1,
-          },
-          ss::default_priority_class())
+          })
         .get()
       == std::nullopt);
 };
 
-FIXTURE_TEST(test_offset_range_size_compacted, storage_test_fixture) {
+TEST_F(storage_test_fixture, test_offset_range_size_compacted) {
 #ifdef NDEBUG
     size_t num_test_cases = 5000;
     size_t num_segments = 300;
@@ -4688,7 +4589,7 @@ FIXTURE_TEST(test_offset_range_size_compacted, storage_test_fixture) {
     auto cfg = default_log_config(test_dir);
     ss::abort_source as;
     storage::log_manager mgr = make_log_manager(cfg);
-    info("Configuration: {}", mgr.config());
+    SUCCEED() << fmt::format("Configuration: {}", mgr.config());
     auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
     auto ntp = model::ntp("kafka", "test-topic", 0);
 
@@ -4705,19 +4606,23 @@ FIXTURE_TEST(test_offset_range_size_compacted, storage_test_fixture) {
     model::offset first_segment_last_offset;
     for (size_t i = 0; i < num_segments; i++) {
         append_random_batches(
-          log, 10, model::term_id(i), key_limited_random_batch_generator());
+          log,
+          10,
+          model::term_id(i),
+          model::timestamp::now(),
+          key_limited_random_batch_generator());
         if (first_segment_last_offset == model::offset{}) {
             first_segment_last_offset = log->offsets().dirty_offset;
         }
-        log->force_roll(ss::default_priority_class()).get();
+        log->force_roll().get();
     }
 
     // Build the maps before and after compaction (nc_ vs c_) to reflect the
     // changes
 
     // Read non-compacted version
-    storage::log_reader_config nc_reader_cfg(
-      model::offset(0), model::offset::max(), ss::default_priority_class());
+    storage::local_log_reader_config nc_reader_cfg(
+      model::offset(0), model::offset::max());
     auto nc_reader = log->make_reader(nc_reader_cfg).get();
 
     auto nc_summary = std::move(nc_reader)
@@ -4734,13 +4639,14 @@ FIXTURE_TEST(test_offset_range_size_compacted, storage_test_fixture) {
       std::nullopt,
       log->offsets().committed_offset,
       std::nullopt,
-      ss::default_priority_class(),
+      std::nullopt,
+      0ms,
       as);
     log->housekeeping(h_cfg).get();
 
     // Read compacted version
-    storage::log_reader_config c_reader_cfg(
-      model::offset(0), model::offset::max(), ss::default_priority_class());
+    storage::local_log_reader_config c_reader_cfg(
+      model::offset(0), model::offset::max());
     auto c_reader = log->make_reader(c_reader_cfg).get();
     auto c_acc = std::move(c_reader)
                    .consume(batch_summary_accumulator{}, model::no_timeout)
@@ -4762,7 +4668,7 @@ FIXTURE_TEST(test_offset_range_size_compacted, storage_test_fixture) {
       "Size before compaction {}, size after compaction {}",
       nc_acc_size.back(),
       c_acc_size.back());
-    BOOST_REQUIRE(num_compacted > 0);
+    ASSERT_TRUE(num_compacted > 0);
 
     for (size_t i = 0; i < num_test_cases; i++) {
         auto ix_base = model::test::get_int((size_t)0, nc_summaries.size() - 1);
@@ -4810,11 +4716,9 @@ FIXTURE_TEST(test_offset_range_size_compacted, storage_test_fixture) {
           c_ix_base,
           c_ix_last);
 
-        auto result
-          = log->offset_range_size(base, last, ss::default_priority_class())
-              .get();
+        auto result = log->offset_range_size(base, last).get();
 
-        BOOST_REQUIRE(result.has_value());
+        ASSERT_TRUE(result.has_value());
 
         vlog(
           e2e_test_log.debug,
@@ -4824,12 +4728,12 @@ FIXTURE_TEST(test_offset_range_size_compacted, storage_test_fixture) {
           expected_size,
           result->on_disk_size);
 
-        BOOST_REQUIRE_EQUAL(expected_size, result->on_disk_size);
-        BOOST_REQUIRE_EQUAL(last, result->last_offset);
+        ASSERT_EQ(expected_size, result->on_disk_size);
+        ASSERT_EQ(last, result->last_offset);
 
         size_t consumed_size = 0;
-        storage::log_reader_config c_reader_cfg(
-          base, result->last_offset, ss::default_priority_class());
+        storage::local_log_reader_config c_reader_cfg(
+          base, result->last_offset);
         c_reader_cfg.skip_readers_cache = true;
         c_reader_cfg.skip_batch_cache = true;
         auto c_log_rdr = log->make_reader(std::move(c_reader_cfg)).get();
@@ -4837,40 +4741,35 @@ FIXTURE_TEST(test_offset_range_size_compacted, storage_test_fixture) {
           .size_bytes = &consumed_size,
         };
         std::move(c_log_rdr).consume(c_size_acc, model::no_timeout).get();
-        BOOST_REQUIRE_EQUAL(expected_size, result->on_disk_size);
+        ASSERT_EQ(expected_size, result->on_disk_size);
     }
 
     auto new_start_offset = model::next_offset(first_segment_last_offset);
-    log
-      ->truncate_prefix(storage::truncate_prefix_config(
-        new_start_offset, ss::default_priority_class()))
+    log->truncate_prefix(storage::truncate_prefix_config(new_start_offset))
       .get();
 
     auto lstat = log->offsets();
-    BOOST_REQUIRE_EQUAL(lstat.start_offset, new_start_offset);
+    ASSERT_EQ(lstat.start_offset, new_start_offset);
 
     // Check that out of range access triggers exception.
 
-    BOOST_REQUIRE(
+    ASSERT_TRUE(
       log
         ->offset_range_size(
-          model::offset(0),
-          model::next_offset(new_start_offset),
-          ss::default_priority_class())
+          model::offset(0), model::next_offset(new_start_offset))
         .get()
       == std::nullopt);
 
-    BOOST_REQUIRE(
+    ASSERT_TRUE(
       log
         ->offset_range_size(
           model::next_offset(new_start_offset),
-          model::next_offset(lstat.committed_offset),
-          ss::default_priority_class())
+          model::next_offset(lstat.committed_offset))
         .get()
       == std::nullopt);
 };
 
-FIXTURE_TEST(test_offset_range_size2_compacted, storage_test_fixture) {
+TEST_F(storage_test_fixture, test_offset_range_size2_compacted) {
 #ifdef NDEBUG
     size_t num_test_cases = 1000;
     size_t num_segments = 300;
@@ -4887,7 +4786,7 @@ FIXTURE_TEST(test_offset_range_size2_compacted, storage_test_fixture) {
     auto cfg = default_log_config(test_dir);
     ss::abort_source as;
     storage::log_manager mgr = make_log_manager(cfg);
-    info("Configuration: {}", mgr.config());
+    SUCCEED() << fmt::format("Configuration: {}", mgr.config());
     auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
     auto ntp = model::ntp("kafka", "test-topic", 0);
 
@@ -4904,19 +4803,23 @@ FIXTURE_TEST(test_offset_range_size2_compacted, storage_test_fixture) {
     model::offset first_segment_last_offset;
     for (size_t i = 0; i < num_segments; i++) {
         append_random_batches(
-          log, 10, model::term_id(0), key_limited_random_batch_generator());
+          log,
+          10,
+          model::term_id(0),
+          model::timestamp::now(),
+          key_limited_random_batch_generator());
         if (first_segment_last_offset == model::offset{}) {
             first_segment_last_offset = log->offsets().dirty_offset;
         }
-        log->force_roll(ss::default_priority_class()).get();
+        log->force_roll().get();
     }
 
     // Build the maps before and after compaction (nc_ vs c_) to reflect the
     // changes
 
     // Read non-compacted version
-    storage::log_reader_config nc_reader_cfg(
-      model::offset(0), model::offset::max(), ss::default_priority_class());
+    storage::local_log_reader_config nc_reader_cfg(
+      model::offset(0), model::offset::max());
     auto nc_reader = log->make_reader(nc_reader_cfg).get();
 
     auto nc_summary = std::move(nc_reader)
@@ -4933,13 +4836,14 @@ FIXTURE_TEST(test_offset_range_size2_compacted, storage_test_fixture) {
       std::nullopt,
       log->offsets().committed_offset,
       std::nullopt,
-      ss::default_priority_class(),
+      std::nullopt,
+      0ms,
       as);
     log->housekeeping(h_cfg).get();
 
     // Read compacted version
-    storage::log_reader_config c_reader_cfg(
-      model::offset(0), model::offset::max(), ss::default_priority_class());
+    storage::local_log_reader_config c_reader_cfg(
+      model::offset(0), model::offset::max());
     auto c_reader = log->make_reader(c_reader_cfg).get();
 
     auto c_acc = std::move(c_reader)
@@ -4962,7 +4866,7 @@ FIXTURE_TEST(test_offset_range_size2_compacted, storage_test_fixture) {
       "Size before compaction {}, size after compaction {}",
       nc_acc_size.back(),
       c_acc_size.back());
-    BOOST_REQUIRE(num_compacted > 0);
+    ASSERT_TRUE(num_compacted > 0);
 
     for (const auto& s : c_summaries) {
         vlog(
@@ -5011,16 +4915,14 @@ FIXTURE_TEST(test_offset_range_size2_compacted, storage_test_fixture) {
                           storage::log::offset_range_size_requirements_t{
                             .target_size = target_size,
                             .min_size = 0,
-                          },
-                          ss::default_priority_class())
+                          })
                         .get();
-        BOOST_REQUIRE(result.has_value());
+        ASSERT_TRUE(result.has_value());
         auto last_offset = result->last_offset;
 
         size_t expected_size = 0;
 
-        storage::log_reader_config c_reader_cfg(
-          base, last_offset, ss::default_priority_class());
+        storage::local_log_reader_config c_reader_cfg(base, last_offset);
         c_reader_cfg.skip_readers_cache = true;
         c_reader_cfg.skip_batch_cache = true;
         auto c_log_rdr = log->make_reader(std::move(c_reader_cfg)).get();
@@ -5028,65 +4930,60 @@ FIXTURE_TEST(test_offset_range_size2_compacted, storage_test_fixture) {
           .size_bytes = &expected_size,
         };
         std::move(c_log_rdr).consume(c_size_acc, model::no_timeout).get();
-        BOOST_REQUIRE_EQUAL(expected_size, result->on_disk_size);
-        BOOST_REQUIRE(result->on_disk_size >= target_size);
+        ASSERT_EQ(expected_size, result->on_disk_size);
+        ASSERT_TRUE(result->on_disk_size >= target_size);
     }
 
-    info("Prefix truncating");
+    SUCCEED() << fmt::format("Prefix truncating");
     auto new_start_offset = model::next_offset(first_segment_last_offset);
-    log
-      ->truncate_prefix(storage::truncate_prefix_config(
-        new_start_offset, ss::default_priority_class()))
+    log->truncate_prefix(storage::truncate_prefix_config(new_start_offset))
       .get();
 
     auto lstat = log->offsets();
-    BOOST_REQUIRE_EQUAL(lstat.start_offset, new_start_offset);
+    ASSERT_EQ(lstat.start_offset, new_start_offset);
 
     // Check that out of range access triggers exception.
 
-    info("Checking for null on out-of-range");
-    BOOST_REQUIRE(
+    SUCCEED() << fmt::format("Checking for null on out-of-range");
+    ASSERT_TRUE(
       log
         ->offset_range_size(
           model::offset(0),
           storage::log::offset_range_size_requirements_t{
             .target_size = 0x10000,
             .min_size = 1,
-          },
-          ss::default_priority_class())
+          })
         .get()
       == std::nullopt);
 
     // Query committed offset of the last batch, expect
     // no result.
 
-    BOOST_REQUIRE(
+    ASSERT_TRUE(
       log
         ->offset_range_size(
           nc_summaries.back().last,
           storage::log::offset_range_size_requirements_t{
             .target_size = 0x10000,
             .min_size = 0,
-          },
-          ss::default_priority_class())
+          })
         .get()
       == std::nullopt);
 
     // Query offset out of range to trigger the exception.
 
-    BOOST_REQUIRE(
+    ASSERT_TRUE(
       log
         ->offset_range_size(
           model::next_offset(c_summaries.back().last),
           storage::log::offset_range_size_requirements_t{
             .target_size = 0x10000,
             .min_size = 0,
-          },
-          ss::default_priority_class())
+          })
         .get()
       == std::nullopt);
 
-    info("Checking the last batch");
+    SUCCEED() << "Checking the last batch";
     // Check that the last batch can be measured independently
     auto res = log
                  ->offset_range_size(
@@ -5094,21 +4991,19 @@ FIXTURE_TEST(test_offset_range_size2_compacted, storage_test_fixture) {
                    storage::log::offset_range_size_requirements_t{
                      .target_size = 0x10000,
                      .min_size = 0,
-                   },
-                   ss::default_priority_class())
+                   })
                  .get();
 
     // Only one batch is returned
-    BOOST_REQUIRE_EQUAL(res->last_offset, lstat.committed_offset);
-    BOOST_REQUIRE_EQUAL(
-      res->on_disk_size, c_acc_size.back() - c_prev_size.back());
+    ASSERT_EQ(res->last_offset, lstat.committed_offset);
+    ASSERT_EQ(res->on_disk_size, c_acc_size.back() - c_prev_size.back());
 
     // Check that we can measure the size of the log tail. This is needed for
     // timed uploads.
     size_t tail_length = 5;
 
     for (size_t i = 0; i < tail_length; i++) {
-        info("Checking i = {}", i);
+        SUCCEED() << fmt::format("Checking i = {}", i);
         auto ix_batch = c_summaries.size() - 1 - i;
         res = log
                 ->offset_range_size(
@@ -5116,26 +5011,24 @@ FIXTURE_TEST(test_offset_range_size2_compacted, storage_test_fixture) {
                   storage::log::offset_range_size_requirements_t{
                     .target_size = 0x10000,
                     .min_size = 0,
-                  },
-                  ss::default_priority_class())
+                  })
                 .get();
 
-        BOOST_REQUIRE_EQUAL(res->last_offset, lstat.committed_offset);
-        BOOST_REQUIRE_EQUAL(
+        ASSERT_EQ(res->last_offset, lstat.committed_offset);
+        ASSERT_EQ(
           res->on_disk_size, c_acc_size.back() - c_prev_size.at(ix_batch));
     }
 
     // Check that the min_size is respected
-    info("Checking the back segment");
-    BOOST_REQUIRE(
+    SUCCEED() << "Checking the back segment";
+    ASSERT_TRUE(
       log
         ->offset_range_size(
           c_summaries.back().base,
           storage::log::offset_range_size_requirements_t{
             .target_size = 0x10000,
             .min_size = c_summaries.back().batch_size + 1,
-          },
-          ss::default_priority_class())
+          })
         .get()
       == std::nullopt);
 };
@@ -5148,7 +5041,7 @@ public:
       , _size(segment_size) {}
 
     size_t max_step_size() const {
-        fragmented_vector<size_t> diffs;
+        chunked_vector<size_t> diffs;
         chunked_vector<uint64_t> pos
           = _index._state.index.copy_position_index();
         diffs.reserve(pos.size() + 1);
@@ -5162,13 +5055,17 @@ public:
         return std::ranges::max(diffs);
     }
 
+    static std::optional<size_t> disk_usage_size(segment_index& index) {
+        return index._disk_usage_size;
+    }
+
 private:
     segment_index& _index;
     size_t _size;
 };
 } // namespace storage
 
-FIXTURE_TEST(test_offset_range_size_incremental, storage_test_fixture) {
+TEST_F(storage_test_fixture, test_offset_range_size_incremental) {
 #ifdef NDEBUG
     size_t num_segments = 300;
 #else
@@ -5200,7 +5097,7 @@ FIXTURE_TEST(test_offset_range_size_incremental, storage_test_fixture) {
     auto cfg = default_log_config(test_dir);
     ss::abort_source as;
     storage::log_manager mgr = make_log_manager(cfg);
-    info("Configuration: {}", mgr.config());
+    SUCCEED() << fmt::format("Configuration: {}", mgr.config());
     auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
     auto ntp = model::ntp("redpanda", "test-topic", 0);
 
@@ -5214,11 +5111,12 @@ FIXTURE_TEST(test_offset_range_size_incremental, storage_test_fixture) {
           log,
           10,
           model::term_id(0),
+          std::nullopt,
           custom_ts_batch_generator(model::timestamp::now()));
         if (first_segment_last_offset == model::offset{}) {
             first_segment_last_offset = log->offsets().dirty_offset;
         }
-        log->force_roll(ss::default_priority_class()).get();
+        log->force_roll().get();
     }
     size_t max_step_size = 0;
     for (auto& s : log->segments()) {
@@ -5230,14 +5128,14 @@ FIXTURE_TEST(test_offset_range_size_incremental, storage_test_fixture) {
           "Index {} has {} elements",
           s->index().path(),
           s->index().size());
-        BOOST_REQUIRE(s->index().size() > 0);
+        ASSERT_TRUE(s->index().size() > 0);
         max_step_size = std::max(
           max_step_size,
           storage::segment_index_observer{s->index(), s->size_bytes()}
             .max_step_size());
     }
 
-    BOOST_REQUIRE(max_step_size > 0);
+    ASSERT_TRUE(max_step_size > 0);
     vlog(
       e2e_test_log.info,
       "Max index step size among all segments: {}",
@@ -5247,8 +5145,8 @@ FIXTURE_TEST(test_offset_range_size_incremental, storage_test_fixture) {
         sc.max_size += max_step_size + sc.target;
     }
 
-    storage::log_reader_config reader_cfg(
-      model::offset(0), model::offset::max(), ss::default_priority_class());
+    storage::local_log_reader_config reader_cfg(
+      model::offset(0), model::offset::max());
     auto reader = log->make_reader(reader_cfg).get();
 
     auto acc = std::move(reader)
@@ -5258,7 +5156,7 @@ FIXTURE_TEST(test_offset_range_size_incremental, storage_test_fixture) {
     // Total log size in bytes
     auto full_log_size = acc.acc_size.back();
 
-    BOOST_REQUIRE_EQUAL(log->size_bytes(), full_log_size);
+    ASSERT_EQ(log->size_bytes(), full_log_size);
 
     for (auto [target_size, min_size, max_size] : size_classes) {
         model::offset last_offset;
@@ -5271,10 +5169,9 @@ FIXTURE_TEST(test_offset_range_size_incremental, storage_test_fixture) {
                            storage::log::offset_range_size_requirements_t{
                              .target_size = target_size,
                              .min_size = min_size,
-                           },
-                           ss::default_priority_class())
+                           })
                          .get();
-            BOOST_REQUIRE(res.has_value());
+            ASSERT_TRUE(res.has_value());
             last_offset = res->last_offset;
             done = last_offset == log->offsets().committed_offset;
             vlog(
@@ -5285,8 +5182,8 @@ FIXTURE_TEST(test_offset_range_size_incremental, storage_test_fixture) {
               max_size,
               res->on_disk_size,
               res->last_offset);
-            BOOST_REQUIRE(res->on_disk_size > min_size);
-            BOOST_REQUIRE(res->on_disk_size < max_size);
+            ASSERT_TRUE(res->on_disk_size > min_size);
+            ASSERT_TRUE(res->on_disk_size < max_size);
 
             // scan the range using the storage reader and compare
 
@@ -5294,8 +5191,7 @@ FIXTURE_TEST(test_offset_range_size_incremental, storage_test_fixture) {
             batch_size_accumulator acc{};
             acc.size_bytes = &measured_size;
 
-            storage::log_reader_config reader_cfg(
-              base, res->last_offset, ss::default_priority_class());
+            storage::local_log_reader_config reader_cfg(base, res->last_offset);
             reader_cfg.skip_readers_cache = true;
             reader_cfg.skip_batch_cache = true;
             auto reader = log->make_reader(reader_cfg).get();
@@ -5305,12 +5201,12 @@ FIXTURE_TEST(test_offset_range_size_incremental, storage_test_fixture) {
               "Expected size: {}, actual size: {}",
               measured_size,
               res->on_disk_size);
-            BOOST_REQUIRE_EQUAL(measured_size, res->on_disk_size);
+            ASSERT_EQ(measured_size, res->on_disk_size);
         }
     }
 };
 
-FIXTURE_TEST(dirty_ratio, storage_test_fixture) {
+TEST_F(storage_test_fixture, dirty_ratio) {
     auto cfg = default_log_config(test_dir);
     cfg.max_compacted_segment_size = config::mock_binding<size_t>(100_MiB);
     cfg.cache = storage::with_cache::yes;
@@ -5323,11 +5219,12 @@ FIXTURE_TEST(dirty_ratio, storage_test_fixture) {
     auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
     auto ntp = model::ntp("default", "test", 0);
     auto log = mgr
-                 .manage(storage::ntp_config(
-                   ntp,
-                   mgr.config().base_dir,
-                   std::make_unique<storage::ntp_config::default_overrides>(
-                     overrides)))
+                 .manage(
+                   storage::ntp_config(
+                     ntp,
+                     mgr.config().base_dir,
+                     std::make_unique<storage::ntp_config::default_overrides>(
+                       overrides)))
                  .get();
 
     auto* disk_log = static_cast<storage::disk_log_impl*>(log.get());
@@ -5351,12 +5248,9 @@ FIXTURE_TEST(dirty_ratio, storage_test_fixture) {
         auto expected_dirty_ratio
           = static_cast<double>(dirty_segments_size_bytes)
             / static_cast<double>(closed_segments_size_bytes);
-        BOOST_REQUIRE_EQUAL(
-          disk_log->dirty_segment_bytes(), dirty_segments_size_bytes);
-        BOOST_REQUIRE_EQUAL(
-          disk_log->closed_segment_bytes(), closed_segments_size_bytes);
-        BOOST_REQUIRE_CLOSE(
-          disk_log->dirty_ratio(), expected_dirty_ratio, tolerance);
+        ASSERT_EQ(disk_log->dirty_segment_bytes(), dirty_segments_size_bytes);
+        ASSERT_EQ(disk_log->closed_segment_bytes(), closed_segments_size_bytes);
+        ASSERT_NEAR(disk_log->dirty_ratio(), expected_dirty_ratio, tolerance);
     };
 
     auto compact_and_assert = [&disk_log,
@@ -5365,61 +5259,59 @@ FIXTURE_TEST(dirty_ratio, storage_test_fixture) {
                                &as]() {
         // Perform sliding window compaction, which will fully cleanly compact
         // the log.
-        static const storage::compaction_config compact_cfg(
-          model::offset::max(), std::nullopt, ss::default_priority_class(), as);
+        static const compaction::compaction_config compact_cfg(
+          model::offset::max(), std::nullopt, std::nullopt, as);
         disk_log->sliding_window_compact(compact_cfg).get();
 
         dirty_segments_size_bytes = 0;
 
-        BOOST_REQUIRE_EQUAL(
-          disk_log->dirty_segment_bytes(), dirty_segments_size_bytes);
-        BOOST_REQUIRE_EQUAL(
-          disk_log->closed_segment_bytes(), closed_segments_size_bytes);
-        BOOST_REQUIRE_CLOSE(disk_log->dirty_ratio(), 0.0, tolerance);
+        ASSERT_EQ(disk_log->dirty_segment_bytes(), dirty_segments_size_bytes);
+        ASSERT_EQ(disk_log->closed_segment_bytes(), closed_segments_size_bytes);
+        ASSERT_NEAR(disk_log->dirty_ratio(), 0.0, tolerance);
     };
 
     add_segment(2_MiB, model::term_id(1));
-    disk_log->force_roll(ss::default_priority_class()).get();
-    BOOST_REQUIRE_EQUAL(disk_log->segment_count(), 2);
+    disk_log->force_roll().get();
+    ASSERT_EQ(disk_log->segment_count(), 2);
     assert_on_new_segment(0);
     compact_and_assert();
 
     add_segment(2_MiB, model::term_id(1));
-    disk_log->force_roll(ss::default_priority_class()).get();
-    BOOST_REQUIRE_EQUAL(disk_log->segment_count(), 3);
+    disk_log->force_roll().get();
+    ASSERT_EQ(disk_log->segment_count(), 3);
     assert_on_new_segment(1);
     compact_and_assert();
 
     add_segment(5_MiB, model::term_id(1));
-    disk_log->force_roll(ss::default_priority_class()).get();
-    BOOST_REQUIRE_EQUAL(disk_log->segment_count(), 4);
+    disk_log->force_roll().get();
+    ASSERT_EQ(disk_log->segment_count(), 4);
     assert_on_new_segment(2);
     compact_and_assert();
 
     add_segment(16_KiB, model::term_id(1));
-    disk_log->force_roll(ss::default_priority_class()).get();
-    BOOST_REQUIRE_EQUAL(disk_log->segment_count(), 5);
+    disk_log->force_roll().get();
+    ASSERT_EQ(disk_log->segment_count(), 5);
     assert_on_new_segment(3);
     compact_and_assert();
 
     add_segment(16_KiB, model::term_id(1));
-    disk_log->force_roll(ss::default_priority_class()).get();
-    BOOST_REQUIRE_EQUAL(disk_log->segment_count(), 6);
+    disk_log->force_roll().get();
+    ASSERT_EQ(disk_log->segment_count(), 6);
     assert_on_new_segment(4);
     compact_and_assert();
 
     // Add more segments, don't perform compaction to allow dirty_segment_bytes
     // to remain non-zero.
     add_segment(2_MiB, model::term_id(1));
-    disk_log->force_roll(ss::default_priority_class()).get();
+    disk_log->force_roll().get();
     assert_on_new_segment(5);
 
     add_segment(16_KiB, model::term_id(1));
-    disk_log->force_roll(ss::default_priority_class()).get();
+    disk_log->force_roll().get();
     assert_on_new_segment(6);
 
     add_segment(16_KiB, model::term_id(1));
-    disk_log->force_roll(ss::default_priority_class()).get();
+    disk_log->force_roll().get();
     assert_on_new_segment(7);
 
     std::vector<model::offset> base_offsets;
@@ -5438,28 +5330,25 @@ FIXTURE_TEST(dirty_ratio, storage_test_fixture) {
     // Gradually truncate the log and see that dirty/closed segment bytes
     // have decreased.
     for (const auto& base_offset : base_offsets) {
-        disk_log
-          ->truncate(
-            storage::truncate_config(base_offset, ss::default_priority_class()))
-          .get();
+        disk_log->truncate(storage::truncate_config(base_offset)).get();
 
         auto new_dirty_segment_bytes = disk_log->dirty_segment_bytes();
         auto new_closed_segment_bytes = disk_log->dirty_segment_bytes();
         auto new_dirty_ratio = disk_log->dirty_ratio();
-        BOOST_REQUIRE_LE(new_dirty_segment_bytes, prev_dirty_segment_bytes);
-        BOOST_REQUIRE_LE(new_closed_segment_bytes, prev_closed_segment_bytes);
-        BOOST_REQUIRE_LE(new_dirty_ratio, prev_dirty_ratio);
+        ASSERT_LE(new_dirty_segment_bytes, prev_dirty_segment_bytes);
+        ASSERT_LE(new_closed_segment_bytes, prev_closed_segment_bytes);
+        ASSERT_LE(new_dirty_ratio, prev_dirty_ratio);
         prev_dirty_segment_bytes = new_dirty_segment_bytes;
         prev_closed_segment_bytes = new_closed_segment_bytes;
         prev_dirty_ratio = new_dirty_ratio;
     }
 
-    BOOST_REQUIRE_EQUAL(disk_log->dirty_segment_bytes(), 0);
-    BOOST_REQUIRE_EQUAL(disk_log->closed_segment_bytes(), 0);
-    BOOST_REQUIRE_CLOSE(disk_log->dirty_ratio(), 0.0, tolerance);
+    ASSERT_EQ(disk_log->dirty_segment_bytes(), 0);
+    ASSERT_EQ(disk_log->closed_segment_bytes(), 0);
+    ASSERT_NEAR(disk_log->dirty_ratio(), 0.0, tolerance);
 }
 
-FIXTURE_TEST(dirty_and_closed_bytes_bookkeeping, storage_test_fixture) {
+TEST_F(storage_test_fixture, dirty_and_closed_bytes_bookkeeping) {
     auto log_cfg = default_log_config(test_dir);
     using namespace storage;
 
@@ -5489,7 +5378,8 @@ FIXTURE_TEST(dirty_and_closed_bytes_bookkeeping, storage_test_fixture) {
       1,
       model::offset::max(),
       std::nullopt,
-      ss::default_priority_class(),
+      std::nullopt,
+      0ms,
       abs};
 
     // add a segment with random keys until a certain size
@@ -5509,9 +5399,7 @@ FIXTURE_TEST(dirty_and_closed_bytes_bookkeeping, storage_test_fixture) {
     };
 
     // Force rolls the log.
-    auto force_roll_func = [&]() {
-        disk_log->force_roll(ss::default_priority_class()).get();
-    };
+    auto force_roll_func = [&]() { disk_log->force_roll().get(); };
 
     // Restarts the log manager- this has the added benefit of forcing recovery
     // from the existing segment set.
@@ -5529,7 +5417,9 @@ FIXTURE_TEST(dirty_and_closed_bytes_bookkeeping, storage_test_fixture) {
     };
 
     auto adjacent_merge_func = [&]() {
-        disk_log->adjacent_merge_compact(cfg.compact).get();
+        disk_log
+          ->adjacent_merge_compact(disk_log->segments().copy(), cfg.compact)
+          .get();
     };
 
     auto sliding_window_func = [&]() {
@@ -5540,9 +5430,7 @@ FIXTURE_TEST(dirty_and_closed_bytes_bookkeeping, storage_test_fixture) {
     auto prefix_truncate_func = [&]() {
         auto dirty_offset = disk_log->offsets().dirty_offset;
         auto offset = random_generators::get_int(1L, dirty_offset());
-        disk_log
-          ->truncate_prefix(truncate_prefix_config(
-            model::offset(offset), ss::default_priority_class()))
+        disk_log->truncate_prefix(truncate_prefix_config(model::offset(offset)))
           .get();
     };
 
@@ -5550,9 +5438,7 @@ FIXTURE_TEST(dirty_and_closed_bytes_bookkeeping, storage_test_fixture) {
     auto truncate_func = [&]() {
         auto dirty_offset = disk_log->offsets().dirty_offset;
         auto offset = random_generators::get_int(1L, dirty_offset());
-        disk_log
-          ->truncate(storage::truncate_config(
-            model::offset{offset}, ss::default_priority_class()))
+        disk_log->truncate(storage::truncate_config(model::offset{offset}))
           .get();
     };
 
@@ -5592,8 +5478,7 @@ FIXTURE_TEST(dirty_and_closed_bytes_bookkeeping, storage_test_fixture) {
     }
 }
 
-FIXTURE_TEST(
-  negative_dirty_and_closed_bytes_triggers_reset, storage_test_fixture) {
+TEST_F(storage_test_fixture, negative_dirty_and_closed_bytes_triggers_reset) {
     using namespace storage;
     disk_log_builder b;
     b | start();
@@ -5607,51 +5492,49 @@ FIXTURE_TEST(
         b | add_segment(offset)
           | add_random_batch(
             offset, records_per_seg, maybe_compress_batches::yes);
-        disk_log.force_roll(ss::default_priority_class()).get();
+        disk_log.force_roll().get();
     }
 
     auto saved_dirty_segment_bytes = disk_log.dirty_segment_bytes();
     auto saved_closed_segment_bytes = disk_log.closed_segment_bytes();
-    BOOST_REQUIRE_EQUAL(disk_log.size_bytes(), saved_dirty_segment_bytes);
-    BOOST_REQUIRE_EQUAL(saved_dirty_segment_bytes, saved_closed_segment_bytes);
+    ASSERT_EQ(disk_log.size_bytes(), saved_dirty_segment_bytes);
+    ASSERT_EQ(saved_dirty_segment_bytes, saved_closed_segment_bytes);
 
     // Add a large negative number to dirty segment bytes.
     ssize_t large_negative_number
       = -5 * static_cast<ssize_t>(disk_log.size_bytes());
     b.add_dirty_segment_bytes(large_negative_number);
 
-    BOOST_REQUIRE_LT(disk_log.dirty_segment_bytes(), 0);
+    ASSERT_LT(disk_log.dirty_segment_bytes(), 0);
     // Calling disk_log.dirty_ratio() will trigger
     // disk_log_impl::reset_dirty_and_closed_bytes(), a safety hatch that should
     // reset the dirty segment bytes to the proper value.
     auto dirty_ratio = disk_log.dirty_ratio();
 
     static const double epsilon = 1.0e-6;
-    BOOST_REQUIRE_CLOSE(dirty_ratio, 1.0, epsilon);
+    ASSERT_NEAR(dirty_ratio, 1.0, epsilon);
 
     // Dirty segment bytes should be equal to its value before the bogus
     // negative amount was added.
-    BOOST_REQUIRE_EQUAL(
-      saved_dirty_segment_bytes, disk_log.dirty_segment_bytes());
+    ASSERT_EQ(saved_dirty_segment_bytes, disk_log.dirty_segment_bytes());
 
     // We can repeat the same process with the closed segment bytes.
     b.add_closed_segment_bytes(large_negative_number);
 
-    BOOST_REQUIRE_LT(disk_log.closed_segment_bytes(), 0);
+    ASSERT_LT(disk_log.closed_segment_bytes(), 0);
 
     // Trigger the safety hatch again.
     dirty_ratio = disk_log.dirty_ratio();
 
-    BOOST_REQUIRE_CLOSE(dirty_ratio, 1.0, epsilon);
+    ASSERT_NEAR(dirty_ratio, 1.0, epsilon);
 
-    BOOST_REQUIRE_EQUAL(
-      saved_closed_segment_bytes, disk_log.closed_segment_bytes());
+    ASSERT_EQ(saved_closed_segment_bytes, disk_log.closed_segment_bytes());
 }
 
-FIXTURE_TEST(compaction_scheduling, storage_test_fixture) {
+TEST_F(storage_test_fixture, compaction_scheduling) {
     using log_manager_accessor = storage::testing_details::log_manager_accessor;
     storage::log_manager mgr = make_log_manager();
-    info("Configuration: {}", mgr.config());
+    SUCCEED() << fmt::format("Configuration: {}", mgr.config());
     auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
     std::vector<ss::shared_ptr<storage::log>> logs;
 
@@ -5662,11 +5545,13 @@ FIXTURE_TEST(compaction_scheduling, storage_test_fixture) {
 
     for (const auto& topic : {"tapioca", "cassava", "kudzu"}) {
         auto ntp = model::ntp("kafka", topic, 0);
-        auto log
-          = mgr
-              .manage(storage::ntp_config(
-                ntp, mgr.config().base_dir, std::make_unique<overrides_t>(ov)))
-              .get();
+        auto log = mgr
+                     .manage(
+                       storage::ntp_config(
+                         ntp,
+                         mgr.config().base_dir,
+                         std::make_unique<overrides_t>(ov)))
+                     .get();
         logs.push_back(log);
     }
 
@@ -5683,32 +5568,31 @@ FIXTURE_TEST(compaction_scheduling, storage_test_fixture) {
 
     auto append_and_force_roll = [this](auto& log, int num_batches = 10) {
         auto headers = append_random_batches<linear_int_kv_batch_generator>(
-          log, num_batches);
-        log->force_roll(ss::default_priority_class()).get();
+          log, num_batches, model::term_id{0}, model::timestamp::now());
+        log->force_roll().get();
     };
 
     // Attempt a housekeeping scan with no partitions to compact
     log_manager_accessor::housekeeping_scan(mgr).get();
 
     for (const auto& meta : meta_list) {
-        BOOST_REQUIRE(is_set(meta.flags, bflags::lifetime_checked));
-        BOOST_REQUIRE(!is_set(meta.flags, bflags::compacted));
+        ASSERT_TRUE(is_set(meta.flags, bflags::lifetime_checked));
+        ASSERT_TRUE(!is_set(meta.flags, bflags::compacted));
     }
 
     // Append batches and force roll with first log- it should be the only one
     // compacted
     append_and_force_roll(logs[0], 30);
-    BOOST_REQUIRE_CLOSE(logs[0]->dirty_ratio(), 1.0, tol);
+    ASSERT_NEAR(logs[0]->dirty_ratio(), 1.0, tol);
 
     log_manager_accessor::housekeeping_scan(mgr).get();
 
     for (const auto& meta : meta_list) {
         bool expect_compacted = meta.handle->config().ntp()
                                 == logs[0]->config().ntp();
-        BOOST_REQUIRE(is_set(meta.flags, bflags::lifetime_checked));
-        BOOST_REQUIRE(is_set(meta.flags, bflags::compaction_checked));
-        BOOST_REQUIRE_EQUAL(
-          expect_compacted, is_set(meta.flags, bflags::compacted));
+        ASSERT_TRUE(is_set(meta.flags, bflags::lifetime_checked));
+        ASSERT_TRUE(is_set(meta.flags, bflags::compaction_checked));
+        ASSERT_EQ(expect_compacted, is_set(meta.flags, bflags::compacted));
         auto batches = read_and_validate_all_batches(logs[0]);
         linear_int_kv_batch_generator::validate_post_compaction(
           std::move(batches));
@@ -5717,17 +5601,16 @@ FIXTURE_TEST(compaction_scheduling, storage_test_fixture) {
     // Append fewer batches and force roll with second log- it should be the
     // only one compacted
     append_and_force_roll(logs[1], 20);
-    BOOST_REQUIRE_CLOSE(logs[1]->dirty_ratio(), 1.0, tol);
+    ASSERT_NEAR(logs[1]->dirty_ratio(), 1.0, tol);
 
     log_manager_accessor::housekeeping_scan(mgr).get();
 
     for (const auto& meta : meta_list) {
         bool expect_compacted = meta.handle->config().ntp()
                                 == logs[1]->config().ntp();
-        BOOST_REQUIRE(is_set(meta.flags, bflags::lifetime_checked));
-        BOOST_REQUIRE(is_set(meta.flags, bflags::compaction_checked));
-        BOOST_REQUIRE_EQUAL(
-          expect_compacted, is_set(meta.flags, bflags::compacted));
+        ASSERT_TRUE(is_set(meta.flags, bflags::lifetime_checked));
+        ASSERT_TRUE(is_set(meta.flags, bflags::compaction_checked));
+        ASSERT_EQ(expect_compacted, is_set(meta.flags, bflags::compacted));
         auto batches = read_and_validate_all_batches(logs[1]);
         linear_int_kv_batch_generator::validate_post_compaction(
           std::move(batches));
@@ -5738,9 +5621,9 @@ FIXTURE_TEST(compaction_scheduling, storage_test_fixture) {
         append_and_force_roll(log, 10);
     }
 
-    BOOST_REQUIRE_GE(logs[0]->dirty_ratio(), 1.0 / 3.0);
-    BOOST_REQUIRE_GE(logs[1]->dirty_ratio(), 1.0 / 2.0);
-    BOOST_REQUIRE_CLOSE(logs[2]->dirty_ratio(), 1.0, tol);
+    ASSERT_GE(logs[0]->dirty_ratio(), 1.0 / 3.0);
+    ASSERT_GE(logs[1]->dirty_ratio(), 1.0 / 2.0);
+    ASSERT_NEAR(logs[2]->dirty_ratio(), 1.0, tol);
 
     log_manager_accessor::housekeeping_scan(mgr).get();
 
@@ -5748,12 +5631,11 @@ FIXTURE_TEST(compaction_scheduling, storage_test_fixture) {
     // (descending) post compaction
     auto log_it = logs.rbegin();
     for (const auto& meta : meta_list) {
-        BOOST_REQUIRE(is_set(meta.flags, bflags::lifetime_checked));
-        BOOST_REQUIRE(is_set(meta.flags, bflags::compaction_checked));
-        BOOST_REQUIRE(is_set(meta.flags, bflags::should_compact));
-        BOOST_REQUIRE(is_set(meta.flags, bflags::compacted));
-        BOOST_REQUIRE_EQUAL(
-          meta.handle->config().ntp(), (*log_it)->config().ntp());
+        ASSERT_TRUE(is_set(meta.flags, bflags::lifetime_checked));
+        ASSERT_TRUE(is_set(meta.flags, bflags::compaction_checked));
+        ASSERT_TRUE(is_set(meta.flags, bflags::should_compact));
+        ASSERT_TRUE(is_set(meta.flags, bflags::compacted));
+        ASSERT_EQ(meta.handle->config().ntp(), (*log_it)->config().ntp());
         ++log_it;
     }
 
@@ -5762,13 +5644,145 @@ FIXTURE_TEST(compaction_scheduling, storage_test_fixture) {
     }
 }
 
+TEST_F(storage_test_fixture, max_compaction_lag) {
+    using log_manager_accessor = storage::testing_details::log_manager_accessor;
+    storage::log_manager mgr = make_log_manager();
+    auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
+    std::vector<ss::shared_ptr<storage::log>> logs;
+
+    using overrides_t = storage::ntp_config::default_overrides;
+    overrides_t ov;
+    ov.cleanup_policy_bitflags = model::cleanup_policy_bitflags::compaction;
+    ov.min_cleanable_dirty_ratio = tristate<double>{1.0};
+    ov.max_compaction_lag_ms = 1000ms;
+
+    auto ntp = model::ntp("kafka", "tapioca", 0);
+    auto log
+      = mgr
+          .manage(
+            storage::ntp_config(
+              ntp, mgr.config().base_dir, std::make_unique<overrides_t>(ov)))
+          .get();
+
+    using bflags = storage::log_housekeeping_meta::bitflags;
+    static constexpr auto is_set = [](bflags var, auto flag) {
+        return (var & flag) == flag;
+    };
+
+    auto append_and_force_roll = [this, &log](int num_batches = 10) {
+        auto headers = append_random_batches<linear_int_kv_batch_generator>(
+          log, num_batches);
+        log->force_roll().get();
+    };
+
+    // Append and close one segment, then compact.
+    // The one closed segment is compacted because the log is 100% dirty.
+    auto start = std::chrono::steady_clock::now();
+    append_and_force_roll();
+    ASSERT_EQ(log->dirty_ratio(), 1.0);
+    log_manager_accessor::housekeeping_scan(mgr).get();
+
+    auto& meta = log_manager_accessor::logs_list(mgr).front();
+    ASSERT_TRUE(is_set(meta.flags, bflags::lifetime_checked));
+    ASSERT_TRUE(is_set(meta.flags, bflags::compaction_checked));
+    ASSERT_TRUE(is_set(meta.flags, bflags::compacted));
+    read_and_validate_all_batches(log);
+
+    // Append more batches and compact.
+    // Now the log is half-dirty, which isn't dirty enough to compact.
+    append_and_force_roll();
+    ASSERT_LT(log->dirty_ratio(), 1.0);
+    log_manager_accessor::housekeeping_scan(mgr).get();
+
+    ASSERT_TRUE(is_set(meta.flags, bflags::lifetime_checked));
+    ASSERT_TRUE(is_set(meta.flags, bflags::compaction_checked));
+    // This test should run fast enough that the log is not compacted,
+    // but on the rare occasion it doesn't, let's not fail.
+    ASSERT_TRUE(
+      !is_set(meta.flags, bflags::compacted)
+      || (std::chrono::steady_clock::now() - start >= ov.max_compaction_lag_ms.value()));
+    read_and_validate_all_batches(log);
+
+    // Wait for the max lag to pass, then compact.
+    // Compaction should happen despite the low dirty ratio.
+    ss::sleep(ov.max_compaction_lag_ms.value() + 50ms).get();
+    log_manager_accessor::housekeeping_scan(mgr).get();
+
+    ASSERT_TRUE(is_set(meta.flags, bflags::lifetime_checked));
+    ASSERT_TRUE(is_set(meta.flags, bflags::compaction_checked));
+    ASSERT_TRUE(is_set(meta.flags, bflags::compacted));
+    read_and_validate_all_batches(log);
+}
+
+TEST_F(storage_test_fixture, min_compaction_lag) {
+    using log_manager_accessor = storage::testing_details::log_manager_accessor;
+    storage::log_manager mgr = make_log_manager();
+    auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
+
+    using overrides_t = storage::ntp_config::default_overrides;
+    overrides_t ov;
+    ov.cleanup_policy_bitflags = model::cleanup_policy_bitflags::compaction;
+    // Surely, no test could run this slow...
+    ov.min_compaction_lag_ms = 100000s;
+
+    auto ntp = model::ntp("kafka", "tapioca", 0);
+    auto log
+      = mgr
+          .manage(
+            storage::ntp_config(
+              ntp, mgr.config().base_dir, std::make_unique<overrides_t>(ov)))
+          .get();
+
+    using bflags = storage::log_housekeeping_meta::bitflags;
+    static constexpr auto is_set = [](bflags var, auto flag) {
+        return (var & flag) == flag;
+    };
+
+    auto append_and_force_roll = [this, &log]() {
+        auto headers = append_random_batches<linear_int_kv_batch_generator>(
+          log, 10);
+        log->force_roll().get();
+    };
+
+    // Append and close one segment, then compact.
+    // Because of min lag, no segments should be compacted.
+    append_and_force_roll();
+    log_manager_accessor::housekeeping_scan(mgr).get();
+
+    auto& meta = log_manager_accessor::logs_list(mgr).front();
+    ASSERT_TRUE(is_set(meta.flags, bflags::lifetime_checked));
+    ASSERT_TRUE(is_set(meta.flags, bflags::compaction_checked));
+    // The log was compacted, but no segments were eligible due to min lag.
+    ASSERT_TRUE(is_set(meta.flags, bflags::compacted));
+    for (const auto& batch : read_and_validate_all_batches(log)) {
+        // The batches should not have been compacted.
+        ASSERT_EQ(
+          batch.record_count(),
+          linear_int_kv_batch_generator::records_per_batch);
+    }
+
+    // Roll to reset compaction checks. Appending more batches breaks
+    // the batch generator's expectation after compacting.
+    log->force_roll().get();
+    overrides_t ov2;
+    ov2.cleanup_policy_bitflags = model::cleanup_policy_bitflags::compaction;
+    ov2.min_compaction_lag_ms = 0s; // The default.
+    log->set_overrides(ov2);
+
+    log_manager_accessor::housekeeping_scan(mgr).get();
+    ASSERT_TRUE(is_set(meta.flags, bflags::lifetime_checked));
+    ASSERT_TRUE(is_set(meta.flags, bflags::compaction_checked));
+    ASSERT_TRUE(is_set(meta.flags, bflags::compacted));
+    auto batches = read_and_validate_all_batches(log);
+    linear_int_kv_batch_generator::validate_post_compaction(std::move(batches));
+}
+
 // Ensures that the log_housekeeping_meta level locking/concurrency in
 // the log_manager is race free during ntp removal, addition, and housekeeping.
 // By allowing regular housekeeping to run on a quick interval and also
 // triggering urgent garbage collection, we create contention over a log_meta's
 // housekeeping lock, all while ntps are being concurrently removed.
-FIXTURE_TEST(
-  log_manager_concurrent_housekeeping_and_removal, storage_test_fixture) {
+TEST_F(storage_test_fixture, log_manager_concurrent_housekeeping_and_removal) {
 #ifdef NDEBUG
     int num_rounds = 100;
 #else
@@ -5813,8 +5827,9 @@ FIXTURE_TEST(
           auto ntp = model::random_ntp();
           ntp.ns = model::kafka_namespace;
           return mgr
-            .manage(storage::ntp_config(
-              ntp, mgr.config().base_dir, std::make_unique<overrides_t>(ov)))
+            .manage(
+              storage::ntp_config(
+                ntp, mgr.config().base_dir, std::make_unique<overrides_t>(ov)))
             .then([]([[maybe_unused]] auto log) {
                 return ss::sleep(manage_func_sleep);
             });
@@ -5850,9 +5865,9 @@ FIXTURE_TEST(
       .get();
 }
 
-FIXTURE_TEST(disk_usage_with_log_throwing_exception, storage_test_fixture) {
+TEST_F(storage_test_fixture, disk_usage_with_log_throwing_exception) {
     storage::log_manager mgr = make_log_manager();
-    info("Configuration: {}", mgr.config());
+    SUCCEED() << fmt::format("Configuration: {}", mgr.config());
     auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
     auto ntp_a = model::ntp("kafka", "a", 0);
     auto log_a
@@ -5868,8 +5883,1218 @@ FIXTURE_TEST(disk_usage_with_log_throwing_exception, storage_test_fixture) {
 
     // Check that the disk usage is still collected, even if one of the logs
     // throws an exception for some reason.
-    BOOST_REQUIRE_NO_THROW(mgr.disk_usage().get());
+    ASSERT_NO_THROW(mgr.disk_usage().get());
 
     // Reassign the gate so there is no double close().
     disk_log->gate() = ss::gate{};
 };
+
+TEST_F(storage_test_fixture, prefix_truncate_offset_range_size) {
+    auto cfg = default_log_config(test_dir);
+    ss::abort_source as;
+    storage::log_manager mgr = make_log_manager(cfg);
+    SUCCEED() << fmt::format("Configuration: {}", mgr.config());
+    auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
+    auto ntp = model::ntp("kafka", "test-topic", 0);
+
+    storage::ntp_config::default_overrides overrides{
+      .cleanup_policy_bitflags = model::cleanup_policy_bitflags::deletion,
+    };
+    storage::ntp_config ntp_cfg(
+      ntp,
+      mgr.config().base_dir,
+      std::make_unique<storage::ntp_config::default_overrides>(overrides));
+
+    auto log = mgr.manage(std::move(ntp_cfg)).get();
+
+    size_t num_segments = 1;
+    for (size_t i = 0; i < num_segments; i++) {
+        append_random_batches(
+          log,
+          10,
+          model::term_id(0),
+          std::nullopt,
+          key_limited_random_batch_generator());
+        log->force_roll().get();
+    }
+
+    auto dirty_offset = log->offsets().dirty_offset;
+    auto new_start_offset = model::offset{
+      random_generators::get_int(dirty_offset())};
+
+    SUCCEED() << fmt::format(
+      "Prefix truncating at offset {}", new_start_offset);
+
+    log->truncate_prefix(storage::truncate_prefix_config(new_start_offset))
+      .get();
+
+    auto lstat = log->offsets();
+    ASSERT_EQ(lstat.start_offset, new_start_offset);
+
+    for (int64_t o = model::next_offset(new_start_offset)(); o < dirty_offset();
+         ++o) {
+        // Expect that no errors are thrown by querying the offset range size
+        // for any offset.
+        ASSERT_NO_THROW(log
+                          ->offset_range_size(
+                            model::offset{o},
+                            storage::log::offset_range_size_requirements_t{
+                              .target_size = 0x10000,
+                              .min_size = 1,
+                            })
+                          .get());
+    }
+}
+
+TEST_F(storage_test_fixture, log_compaction_enable_sliding_window) {
+    // Simulate enabling sliding window after starting Redpanda with it disabled
+    // by setting the compaction_reserved_memory in the memory group to 0.
+    auto& mem_groups = memory_groups();
+    testing::system_memory_groups_accessor::compaction_reserved_memory(
+      mem_groups)
+      = 0;
+    storage::log_manager mgr = make_log_manager();
+    SUCCEED() << fmt::format("Configuration: {}", mgr.config());
+    auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
+    auto ntp = model::ntp("kafka", "a", 0);
+    using overrides_t = storage::ntp_config::default_overrides;
+    overrides_t ov;
+    ov.cleanup_policy_bitflags = model::cleanup_policy_bitflags::compaction;
+
+    auto log
+      = mgr
+          .manage(
+            storage::ntp_config(
+              ntp, mgr.config().base_dir, std::make_unique<overrides_t>(ov)))
+          .get();
+
+    auto add_segment = [log](size_t size, model::term_id term) {
+        do {
+            append_single_record_batch(log, 1, term, 16_KiB, true);
+        } while (log->segments().back()->size_bytes() < size);
+    };
+
+    // Add a few segments.
+    auto num_segments = 5;
+    for (int i = 0; i < num_segments; ++i) {
+        add_segment(2_MiB, model::term_id(0));
+        log->force_roll().get();
+    }
+
+    // config::shard_local_cfg().log_compaction_use_sliding_window is still
+    // `true` at this point. Assert this call doesn't crash when a map with
+    // capacity 0 is used.
+    storage::testing_details::log_manager_accessor::housekeeping_scan(mgr)
+      .get();
+}
+
+struct segment_fields {
+    ssize_t size;
+    model::term_id term;
+    bool mark_as_stable;
+    std::optional<model::offset> base_offset_override{std::nullopt};
+    std::optional<model::offset> dirty_offset_override{std::nullopt};
+};
+
+struct sliding_ranges_test_case {
+    ss::sstring desc;
+    std::vector<segment_fields> segment_fields;
+    std::optional<model::offset> new_start_offset{std::nullopt};
+    std::optional<uint32_t> max_segment_count{std::nullopt};
+    std::optional<uint32_t> max_range_count{std::nullopt};
+    // These ranges have the same inclusivity as the iterator
+    // constructor for std::vector, i.e [first, last).
+    std::vector<std::pair<size_t, size_t>> expected_ranges;
+};
+
+TEST_F(storage_test_fixture, find_sliding_ranges) {
+    scoped_config test_local_cfg;
+    auto log_cfg = default_log_config(test_dir);
+    log_cfg.max_compacted_segment_size = config::mock_binding<size_t>(1_MiB);
+    storage::ntp_config::default_overrides overrides;
+    overrides.cleanup_policy_bitflags
+      = model::cleanup_policy_bitflags::compaction;
+
+    ss::abort_source as;
+    storage::log_manager mgr = make_log_manager(log_cfg);
+
+    auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
+
+    // add a segment with random keys until a certain size
+    auto add_segment = [](auto& log, size_t size, model::term_id term) {
+        do {
+            append_single_record_batch(log, 1, term, 1, true);
+        } while (log->segments().back()->size_bytes() < size);
+    };
+
+    static constexpr int64_t u32_max = std::numeric_limits<uint32_t>::max();
+    // Don't forget that the active segment will occupy the last index
+    // beyond the segment fields detailed below.
+    // clang-format off
+    std::vector<sliding_ranges_test_case> test_cases = {
+      sliding_ranges_test_case{
+	  .desc="Mix of ranges due to raft terms and max size",
+	  .segment_fields={
+	    {5_KiB, model::term_id{0}, true},     // 0 A
+	    {100_KiB, model::term_id{0}, true},   // 1 A
+	    {500_KiB, model::term_id{0}, true},   // 2 A
+	    {1024_KiB, model::term_id{0}, true},  // 3  -
+	    {1_KiB, model::term_id{1}, true},     // 4   B
+	    {2_KiB, model::term_id{1}, true},     // 5   B
+	    {3_KiB, model::term_id{1}, true},     // 6   B
+	    {100_KiB, model::term_id{1}, true},   // 7   B
+	    {50_KiB, model::term_id{2}, true},    // 8    -
+	    {50_KiB, model::term_id{3}, true},    // 9    -
+	    {50_KiB, model::term_id{4}, true},    // 10   -
+	    {50_KiB, model::term_id{5}, true},    // 11   -
+	    {1024_KiB, model::term_id{5}, true}}, // 12   -
+	                                          // 13   - (Active)
+	  .expected_ranges = {
+	    {0, 3}, {4, 8}}},
+      sliding_ranges_test_case{
+	  .desc="Some unstable segments creating gap in ranges",
+	  .segment_fields={
+	    {5_KiB, model::term_id{0}, true},    // 0 -
+	    {100_KiB, model::term_id{0}, false}, // 1 -
+	    {500_KiB, model::term_id{0}, false}, // 2 -
+	    {1024_KiB, model::term_id{0}, true}, // 3 -
+	    {1_KiB, model::term_id{1}, true},    // 4  A
+	    {2_KiB, model::term_id{1}, true},    // 5  A
+	    {3_KiB, model::term_id{1}, true},    // 6  A
+	    {100_KiB, model::term_id{1}, true}}, // 7  A
+	                                         // 8   - (Active)
+	  .expected_ranges = {{4, 8}}},
+      sliding_ranges_test_case{
+	  .desc="One unstable segment",
+	  .segment_fields={
+	    {5_KiB, model::term_id{0}, false}}, // 0 -
+	                                        // 1 - (Active)
+	  .expected_ranges = {}},
+      sliding_ranges_test_case{
+	  .desc="One stable segment",
+	  .segment_fields={
+	    {5_KiB, model::term_id{0}, true}}, // 0 -
+	                                       // 1 - (Active)
+	  .expected_ranges = {}},
+      sliding_ranges_test_case{
+	  .desc="All stable segments of the same term with total size less than max compacted segment size",
+	  .segment_fields={
+	    {5_KiB, model::term_id{0}, true},    // 0 A
+	    {100_KiB, model::term_id{0}, true},  // 1 A
+	    {100_KiB, model::term_id{0}, true}}, // 2 A
+	                                         // 3  - (Active)
+	  .expected_ranges = {{0, 3}}},
+      sliding_ranges_test_case{
+	  .desc="Alternating stable and unstable segments",
+	  .segment_fields={
+	    {5_KiB, model::term_id{0}, true},     // 0 -
+	    {100_KiB, model::term_id{0}, false},  // 1 -
+	    {100_KiB, model::term_id{0}, true},   // 2 -
+	    {100_KiB, model::term_id{0}, false},  // 3 -
+	    {100_KiB, model::term_id{0}, true},   // 4 -
+	    {100_KiB, model::term_id{0}, false}}, // 5 -
+	                                          // 6 - (Active)
+	  .expected_ranges = {}},
+      sliding_ranges_test_case{
+	  .desc="All unstable segments",
+	  .segment_fields={
+	    {5_KiB, model::term_id{0}, false},    // 0 -
+	    {100_KiB, model::term_id{0}, false},  // 1 -
+	    {100_KiB, model::term_id{0}, false},  // 2 -
+	    {100_KiB, model::term_id{0}, false},  // 3 -
+	    {100_KiB, model::term_id{0}, false},  // 4 -
+	    {100_KiB, model::term_id{0}, false}}, // 5 -
+	                                          // 6 - (Active)
+	  .expected_ranges = {}},
+      sliding_ranges_test_case{
+	  .desc="All unique segment terms",
+	  .segment_fields={
+	    {5_KiB, model::term_id{0}, true},    // 0 -
+	    {100_KiB, model::term_id{1}, true},  // 1 -
+	    {100_KiB, model::term_id{2}, true},  // 2 -
+	    {100_KiB, model::term_id{3}, true},  // 3 -
+	    {100_KiB, model::term_id{4}, true},  // 4 -
+	    {100_KiB, model::term_id{5}, true}}, // 5 -
+	                                         // 6 - (Active)
+	  .expected_ranges = {}},
+      sliding_ranges_test_case{
+	  .desc="All stable segments with boundaries set by max compacted segment size",
+	  .segment_fields={
+	    {500_KiB, model::term_id{0}, true},        // 0 A
+	    {500_KiB, model::term_id{0}, true},        // 1 A
+	    {100_KiB, model::term_id{0}, true},        // 2  -
+	    {1_MiB - 10_KiB, model::term_id{0}, true}, // 3   B
+	    {5_KiB, model::term_id{0}, true},          // 4   B
+	    {100_KiB, model::term_id{0}, true}},       // 5    -
+	                                               // 6    - (Active)
+	  .expected_ranges = {{0, 2}, {3, 5}}},
+      sliding_ranges_test_case{
+	  .desc="Just one valid segment at the end",
+	  .segment_fields={
+	    {5_KiB, model::term_id{0}, false},   // 0 -
+	    {100_KiB, model::term_id{0}, false}, // 1 -
+	    {100_KiB, model::term_id{0}, false}, // 2 -
+	    {100_KiB, model::term_id{0}, false}, // 3 -
+	    {100_KiB, model::term_id{0}, false}, // 4 -
+	    {100_KiB, model::term_id{0}, true}}, // 5 -
+	                                         // 6 - (Active)
+	  .expected_ranges = {}},
+      sliding_ranges_test_case{
+	  .desc="uint32_t max boundary allowing segment merging",
+	  .segment_fields={
+	    {5_KiB, model::term_id{0}, true},                                          // 0 A
+	    {100_KiB, model::term_id{0}, true, std::nullopt, model::offset{u32_max}}}, // 1 A
+	                                                                               // 2 - (Active)
+	  .expected_ranges = {{0, 2}}},
+      sliding_ranges_test_case{
+	  .desc="one past uint32_t max boundary preventing segment merging",
+	  .segment_fields={
+	    {5_KiB, model::term_id{0}, true},                                            // 0 -
+	    {100_KiB, model::term_id{0}, true, std::nullopt, model::offset{u32_max+1}}}, // 1 -
+	                                                                                 // 2 - (Active)
+	  .expected_ranges = {}},
+      sliding_ranges_test_case{
+	  .desc="Mergable segments below new_start_offset should be ignored",
+	  .segment_fields={
+	    {5_KiB, model::term_id{0}, true},     // 0 -
+	    {100_KiB, model::term_id{0}, true},   // 1 -
+	    {500_KiB, model::term_id{0}, true}},  // 2 -
+	                                          // 3 - (Active)
+	  .new_start_offset=model::offset::max(),
+	  .expected_ranges = {}},
+      sliding_ranges_test_case{
+	  .desc="Some mergable segment ranges above and below new_start_offset.",
+	  .segment_fields={
+	    {5_KiB, model::term_id{0}, true, model::offset{0}},      // 0 -
+	    {100_KiB, model::term_id{0}, true, model::offset{1}},    // 1 -
+	    {500_KiB, model::term_id{0}, true, model::offset{2}},    // 2 -
+	    {5_KiB, model::term_id{0}, true, model::offset{101}},    // 3  A
+	    {100_KiB, model::term_id{0}, true, model::offset{102}},  // 4  A
+	    {500_KiB, model::term_id{0}, true, model::offset{103}}}, // 5  A
+	                                                             // 6   - (Active)
+	  .new_start_offset=model::offset{100},
+	  .expected_ranges = {{3, 6}}},
+      sliding_ranges_test_case{
+	  .desc="All mergeable segments, but number of max segments is limited to 0 via cluster config.",
+	  .segment_fields={
+	    {1_KiB, model::term_id{0}, true},  // 0 -
+	    {1_KiB, model::term_id{0}, true},  // 1 -
+	    {1_KiB, model::term_id{0}, true},  // 2 -
+	    {1_KiB, model::term_id{0}, true},  // 3 -
+	    {1_KiB, model::term_id{0}, true},  // 4 -
+	    {1_KiB, model::term_id{0}, true}}, // 5 -
+	                                       // 6 - (Active)
+	  .max_segment_count = 0,
+	  .expected_ranges = {}},
+      sliding_ranges_test_case{
+	  .desc="All mergeable segments, but number of max segments is limited to 1 via cluster config.",
+	  .segment_fields={
+	    {1_KiB, model::term_id{0}, true},  // 0 -
+	    {1_KiB, model::term_id{0}, true},  // 1 -
+	    {1_KiB, model::term_id{0}, true},  // 2 -
+	    {1_KiB, model::term_id{0}, true},  // 3 -
+	    {1_KiB, model::term_id{0}, true},  // 4 -
+	    {1_KiB, model::term_id{0}, true}}, // 5 -
+	                                       // 6 - (Active)
+	  .max_segment_count = 1,
+	  .expected_ranges = {}},
+      sliding_ranges_test_case{
+	  .desc="All mergeable segments, but number of max segments is limited to 2 via cluster config.",
+	  .segment_fields={
+	    {1_KiB, model::term_id{0}, true},  // 0 A
+	    {1_KiB, model::term_id{0}, true},  // 1 A
+	    {1_KiB, model::term_id{0}, true},  // 2  B
+	    {1_KiB, model::term_id{0}, true},  // 3  B
+	    {1_KiB, model::term_id{0}, true},  // 4   C
+	    {1_KiB, model::term_id{0}, true}}, // 5   C
+	                                       // 6    - (Active)
+	  .max_segment_count = 2,
+	  .expected_ranges = {{0, 2}, {2, 4}, {4, 6}}},
+      sliding_ranges_test_case{
+	  .desc="Mergeable pairs of segments with ascending raft terms, but number of max ranges is limited to 0 via cluster config.",
+	  .segment_fields={
+	    {1_KiB, model::term_id{0}, true},  // 0 -
+	    {1_KiB, model::term_id{0}, true},  // 1 -
+	    {1_KiB, model::term_id{1}, true},  // 2 -
+	    {1_KiB, model::term_id{1}, true},  // 3 -
+	    {1_KiB, model::term_id{2}, true},  // 4 -
+	    {1_KiB, model::term_id{2}, true}}, // 5 -
+	                                       // 6 - (Active)
+	  .max_range_count = 0,
+	  .expected_ranges = {}},
+      sliding_ranges_test_case{
+	  .desc="Mergeable pairs of segments with ascending raft terms, but number of max ranges is limited to 1 via cluster config.",
+	  .segment_fields={
+	    {1_KiB, model::term_id{0}, true},  // 0 A
+	    {1_KiB, model::term_id{0}, true},  // 1 A
+	    {1_KiB, model::term_id{1}, true},  // 2  -
+	    {1_KiB, model::term_id{1}, true},  // 3  -
+	    {1_KiB, model::term_id{2}, true},  // 4  -
+	    {1_KiB, model::term_id{2}, true}}, // 5  -
+	                                       // 6  - (Active)
+	  .max_range_count = 1,
+	  .expected_ranges = {{0, 2}}},
+      sliding_ranges_test_case{
+	  .desc="Mergeable pairs of segments with ascending raft terms, but number of max ranges is limited to 2 via cluster config.",
+	  .segment_fields={
+	    {1_KiB, model::term_id{0}, true},  // 0 A
+	    {1_KiB, model::term_id{0}, true},  // 1 A
+	    {1_KiB, model::term_id{1}, true},  // 2  B
+	    {1_KiB, model::term_id{1}, true},  // 3  B
+	    {1_KiB, model::term_id{2}, true},  // 4  -
+	    {1_KiB, model::term_id{2}, true}}, // 5  -
+	                                       // 6  - (Active)
+	  .max_range_count = 2,
+	  .expected_ranges = {{0, 2}, {2, 4}}},
+      sliding_ranges_test_case{
+	  .desc="Mergeable pairs of segments with ascending raft terms, but number of max ranges is limited to 3 via cluster config.",
+	  .segment_fields={
+	    {1_KiB, model::term_id{0}, true},  // 0 A
+	    {1_KiB, model::term_id{0}, true},  // 1 A
+	    {1_KiB, model::term_id{1}, true},  // 2  B
+	    {1_KiB, model::term_id{1}, true},  // 3  B
+	    {1_KiB, model::term_id{2}, true},  // 4   C
+	    {1_KiB, model::term_id{2}, true}}, // 5   C
+	                                       // 6    - (Active)
+	  .max_range_count = 3,
+	  .expected_ranges = {{0, 2}, {2, 4}, {4, 6}}},
+      sliding_ranges_test_case{
+	  .desc="segment_count=2, range_count = 1 means only one pair of segments merged at a time.",
+	  .segment_fields={
+	    {1_KiB, model::term_id{0}, true},  // 0 A
+	    {1_KiB, model::term_id{0}, true},  // 1 A
+	    {1_KiB, model::term_id{0}, true},  // 2  -
+	    {1_KiB, model::term_id{1}, true},  // 3  -
+	    {1_KiB, model::term_id{1}, true},  // 4  -
+	    {1_KiB, model::term_id{1}, true}}, // 5  -
+	                                       // 6   - (Active)
+	  .max_segment_count = 2,
+	  .max_range_count = 1,
+	  .expected_ranges = {{0, 2}}},
+      sliding_ranges_test_case{
+	  .desc="Mixture of max range and segment count restricting range space.",
+	  .segment_fields={
+	    {1_KiB, model::term_id{0}, true},  // 0 A
+	    {1_KiB, model::term_id{0}, true},  // 1 A
+	    {1_KiB, model::term_id{0}, true},  // 2 A
+	    {1_KiB, model::term_id{0}, true},  // 3  B
+	    {1_KiB, model::term_id{0}, true},  // 4  B
+	    {2_MiB, model::term_id{1}, true},  // 5   -
+	    {1_KiB, model::term_id{1}, true},  // 6   -
+	    {1_KiB, model::term_id{2}, true},  // 7    C
+	    {1_KiB, model::term_id{2}, true},  // 8    C
+	    {1_KiB, model::term_id{2}, true},  // 9    C
+	    {1_KiB, model::term_id{2}, true},  // 10    -
+	    {1_KiB, model::term_id{3}, true},  // 11    -
+	    {1_KiB, model::term_id{3}, true}}, // 12    -
+	                                       // 13     - (Active)
+	  .max_segment_count = 3,
+	  .max_range_count = 3,
+	  .expected_ranges = {{0, 3}, {3, 5}, {7, 10}}},
+    };
+    // clang-format on
+
+    for (int test_case_index = 0; const auto& test_case : test_cases) {
+        vlog(e2e_test_log.info, "Running test case: {}", test_case.desc);
+        const auto& segment_fields = test_case.segment_fields;
+        const auto& expected_ranges = test_case.expected_ranges;
+        test_local_cfg.get("log_compaction_merge_max_segments_per_range")
+          .set_value(test_case.max_segment_count);
+        test_local_cfg.get("log_compaction_merge_max_ranges")
+          .set_value(test_case.max_range_count);
+        auto ntp = model::ntp(
+          "default", fmt::format("test-{}", test_case_index++), 0);
+        auto log
+          = mgr
+              .manage(
+                storage::ntp_config(
+                  ntp,
+                  mgr.config().base_dir,
+                  std::make_unique<storage::ntp_config::default_overrides>(
+                    overrides)))
+              .get();
+
+        auto* disk_log = static_cast<storage::disk_log_impl*>(log.get());
+
+        for (const auto& segment_field : segment_fields) {
+            add_segment(log, segment_field.size, segment_field.term);
+            disk_log->force_roll().get();
+        }
+
+        compaction::compaction_config cfg(
+          model::offset::max(), std::nullopt, std::nullopt, as);
+
+        for (size_t i = 0; i < segment_fields.size(); ++i) {
+            auto& seg = disk_log->segments()[i];
+            if (segment_fields[i].mark_as_stable) {
+                // We need to self compact segments before they are
+                // considered in the adjacent compaction ranges
+                seg->index().maybe_set_self_compact_timestamp(
+                  model::timestamp::now());
+            }
+
+            auto& ot = const_cast<storage::segment::offset_tracker&>(
+              seg->offsets());
+            if (segment_fields[i].dirty_offset_override.has_value()) {
+                // Override the dirty offset of the segment, if specified
+                ot.set_offset(
+                  storage::segment::offset_tracker::dirty_offset_t{
+                    *segment_fields[i].dirty_offset_override});
+            }
+            if (segment_fields[i].base_offset_override.has_value()) {
+                // Override the base offset of the segment, if specified
+                storage::testing_details::offset_tracker_accessor::base_offset(
+                  ot)
+                  = *segment_fields[i].base_offset_override;
+            }
+        }
+
+        std::unordered_map<ss::sstring, size_t> segment_filename_index_map;
+        for (size_t i = 0; const auto& segment : disk_log->segments()) {
+            segment_filename_index_map[segment->filename()] = i++;
+        }
+
+        auto adjacent_ranges = disk_log->find_adjacent_compaction_ranges(
+          cfg, test_case.new_start_offset);
+        if (!expected_ranges.empty()) {
+            ASSERT_TRUE(adjacent_ranges.has_value());
+            ASSERT_EQ(adjacent_ranges->size(), expected_ranges.size());
+            for (size_t expected_ranges_index = 0;
+                 const auto& seg_it : *adjacent_ranges) {
+                auto first_index = segment_filename_index_map.at(
+                  (*seg_it.first)->filename());
+                ASSERT_EQ(
+                  first_index, expected_ranges[expected_ranges_index].first);
+                auto second_index = segment_filename_index_map.at(
+                  (*seg_it.second)->filename());
+                ASSERT_EQ(
+                  second_index, expected_ranges[expected_ranges_index].second);
+                ++expected_ranges_index;
+            }
+        } else {
+            ASSERT_TRUE(!adjacent_ranges.has_value());
+        }
+    }
+}
+
+TEST_F(storage_test_fixture, segment_cached_disk_usage_set_after_compaction) {
+    storage::log_manager mgr = make_log_manager();
+    auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
+    auto ntp = model::ntp("kafka", "a", 0);
+    using overrides_t = storage::ntp_config::default_overrides;
+    overrides_t ov;
+    ov.cleanup_policy_bitflags = model::cleanup_policy_bitflags::compaction;
+
+    auto log
+      = mgr
+          .manage(
+            storage::ntp_config(
+              ntp, mgr.config().base_dir, std::make_unique<overrides_t>(ov)))
+          .get();
+
+    auto add_segment = [log](size_t size, model::term_id term) {
+        do {
+            append_single_record_batch(log, 1, term, 16_KiB, true);
+        } while (log->segments().back()->size_bytes() < size);
+    };
+
+    auto add_segment_func = [&]() {
+        auto size = random_generators::get_int(4_KiB, 10_MiB);
+        add_segment(size, model::term_id(0));
+        log->force_roll().get();
+    };
+
+    add_segment_func();
+    add_segment_func();
+
+    ss::abort_source as;
+    compaction::compaction_config cfg(
+      model::offset::max(), std::nullopt, std::nullopt, as);
+    auto& disk_log = dynamic_cast<storage::disk_log_impl&>(*log);
+
+    auto check_cached_sizes = [](auto& seg) {
+        auto disk
+          = storage::testing_details::segment_accessor::data_disk_usage_size(
+            *seg);
+        auto cidx
+          = storage::testing_details::segment_accessor::compaction_index_size(
+            *seg);
+        auto sidx = storage::segment_index_observer::disk_usage_size(
+          seg->index());
+        ASSERT_TRUE(disk.has_value());
+        ASSERT_TRUE(cidx.has_value());
+        ASSERT_TRUE(sidx.has_value());
+
+        ASSERT_EQ(disk.value(), ss::file_size(seg->path().string()).get());
+        ASSERT_EQ(
+          cidx.value(),
+          ss::file_size(seg->path().to_compacted_index().string()).get());
+        ASSERT_EQ(
+          sidx.value(), ss::file_size(seg->path().to_index().string()).get());
+    };
+
+    auto& segs = log->segments();
+
+    // Test self-compaction
+    {
+        auto& s = segs[0];
+        // Freshly rolled segment should have cached sizes set.
+        check_cached_sizes(s);
+        disk_log.segment_self_compact(cfg, s).get();
+        check_cached_sizes(s);
+    }
+
+    // Test adjacent compaction
+    {
+        disk_log.adjacent_merge_compact(segs.copy(), cfg).get();
+        for (auto& s : segs) {
+            if (s->has_self_compact_timestamp()) {
+                check_cached_sizes(s);
+            }
+        }
+    }
+
+    // Test sliding window compaction
+    {
+        disk_log.sliding_window_compact(cfg).get();
+        for (auto& s : segs) {
+            if (s->has_self_compact_timestamp()) {
+                ASSERT_TRUE(s->has_clean_compact_timestamp());
+                check_cached_sizes(s);
+            }
+        }
+    }
+}
+
+TEST_F(storage_test_fixture, delete_retention_ms_with_ts) {
+    auto cfg = default_log_config(test_dir);
+    storage::log_manager mgr = make_log_manager(cfg);
+    using overrides_t = storage::ntp_config::default_overrides;
+    overrides_t ov;
+    auto delete_retention_ms = 10ms;
+    ov.cleanup_policy_bitflags = model::cleanup_policy_bitflags::compaction;
+    ov.delete_retention_ms = tristate<std::chrono::milliseconds>(
+      delete_retention_ms);
+    ov.shadow_indexing_mode = model::shadow_indexing_mode::full;
+    auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
+    auto ntp = model::ntp("default", "test", 0);
+
+    storage::ntp_config ntp_cfg(
+      ntp, mgr.config().base_dir, std::make_unique<overrides_t>(ov));
+
+    auto log = mgr.manage(std::move(ntp_cfg)).get();
+
+    // tombstone_retention_ms should be nullopt
+    ASSERT_EQ(log->config().tombstone_retention_ms(), std::nullopt);
+
+    // tx_retention_ms should have value
+    auto tx_retention_ms = log->config().tx_retention_ms();
+    ASSERT_TRUE(tx_retention_ms.has_value());
+    ASSERT_EQ(tx_retention_ms.value(), delete_retention_ms);
+};
+
+TEST_F(storage_test_fixture, delete_retention_ms_without_ts) {
+    auto cfg = default_log_config(test_dir);
+    storage::log_manager mgr = make_log_manager(cfg);
+    using overrides_t = storage::ntp_config::default_overrides;
+    overrides_t ov;
+    auto delete_retention_ms = 10ms;
+    ov.cleanup_policy_bitflags = model::cleanup_policy_bitflags::compaction;
+    ov.delete_retention_ms = tristate<std::chrono::milliseconds>(
+      delete_retention_ms);
+    ov.shadow_indexing_mode = model::shadow_indexing_mode::disabled;
+    auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
+    auto ntp = model::ntp("default", "test", 0);
+
+    storage::ntp_config ntp_cfg(
+      ntp, mgr.config().base_dir, std::make_unique<overrides_t>(ov));
+    auto log = mgr.manage(std::move(ntp_cfg)).get();
+
+    // tombstone_retention_ms should have value
+    auto tombstone_retention_ms = log->config().tombstone_retention_ms();
+    ASSERT_TRUE(tombstone_retention_ms.has_value());
+    ASSERT_EQ(tombstone_retention_ms.value(), delete_retention_ms);
+
+    // tx_retention_ms should have value
+    auto tx_retention_ms = log->config().tx_retention_ms();
+    ASSERT_TRUE(tx_retention_ms.has_value());
+    ASSERT_EQ(tx_retention_ms.value(), delete_retention_ms);
+};
+
+TEST_F(storage_test_fixture, earliest_removable_timestamp) {
+    using namespace storage;
+    struct test_case {
+        struct segment_spec {
+            int num_records;
+            bool has_tombstones;
+            bool has_txs;
+            std::optional<model::timestamp> self_compact_timestamp;
+            std::optional<model::timestamp> clean_compact_timestamp;
+
+            void set_segment_state(ss::lw_shared_ptr<segment> s) const {
+                s->index().set_may_have_tombstone_records(has_tombstones);
+                s->index().set_has_transaction_batches(has_txs);
+
+                if (self_compact_timestamp.has_value()) {
+                    s->index().maybe_set_self_compact_timestamp(
+                      self_compact_timestamp.value());
+                }
+                if (clean_compact_timestamp.has_value()) {
+                    s->index().maybe_set_clean_compact_timestamp(
+                      clean_compact_timestamp.value());
+                }
+            }
+        };
+
+        model::offset o;
+        std::optional<model::timestamp> expected_removable_timestamp;
+        std::vector<segment_spec> segments;
+        ss::sstring desc;
+    };
+
+    // clang-format off
+    std::vector<test_case>
+        test_cases = {
+      test_case{
+	.o = model::offset{0},
+	.expected_removable_timestamp = std::nullopt,
+	.segments = {test_case::segment_spec{.num_records = 100,
+					     .has_tombstones = true,
+					     .has_txs = true,
+					     .self_compact_timestamp = std::nullopt,
+					     .clean_compact_timestamp = std::nullopt},
+		     test_case::segment_spec{.num_records = 100,
+					     .has_tombstones = true,
+					     .has_txs = true,
+					     .self_compact_timestamp = std::nullopt,
+					     .clean_compact_timestamp = std::nullopt}},
+	.desc = "No segments with currently removable tombstones or transactions"},
+      test_case{
+	.o = model::offset{50},
+	.expected_removable_timestamp = std::nullopt,
+	.segments = {test_case::segment_spec{.num_records = 10,
+					     .has_tombstones = true,
+					     .has_txs = true,
+					     .self_compact_timestamp = model::timestamp{1},
+					     .clean_compact_timestamp = model::timestamp{1}},
+		     test_case::segment_spec{.num_records = 100,
+					     .has_tombstones = true,
+					     .has_txs = true,
+					     .self_compact_timestamp = std::nullopt,
+					     .clean_compact_timestamp = std::nullopt}},
+	.desc = "No segments with currently removable tombstones or transactions above the provided offset"},
+      test_case{
+	.o = model::offset{50},
+	.expected_removable_timestamp = std::nullopt,
+	.segments = {test_case::segment_spec{.num_records = 10,
+					     .has_tombstones = true,
+					     .has_txs = true,
+					     .self_compact_timestamp = model::timestamp{1},
+					     .clean_compact_timestamp = model::timestamp{1}},
+		     test_case::segment_spec{.num_records = 100,
+					     .has_tombstones = true,
+					     .has_txs = true,
+					     .self_compact_timestamp = std::nullopt,
+					     .clean_compact_timestamp = std::nullopt}},
+	.desc = "No segments with currently removable tombstones or transactions above the provided offset"},
+      test_case{
+	.o = model::offset{20},
+	.expected_removable_timestamp = std::nullopt,
+	.segments = {test_case::segment_spec{.num_records = 30,
+					     .has_tombstones = false,
+					     .has_txs = false,
+					     .self_compact_timestamp = model::timestamp{1},
+					     .clean_compact_timestamp = model::timestamp{2}}},
+	.desc = "Segment without any removable data."},
+      test_case{
+	.o = model::offset{20},
+	.expected_removable_timestamp = model::timestamp{1},
+	.segments = {test_case::segment_spec{.num_records = 30,
+					     .has_tombstones = true,
+					     .has_txs = false,
+					     .self_compact_timestamp = std::nullopt,
+					     .clean_compact_timestamp = model::timestamp{1}}},
+	.desc = "Segment with a removable tombstone."},
+      test_case{
+	.o = model::offset{20},
+	.expected_removable_timestamp = model::timestamp{1},
+	.segments = {test_case::segment_spec{.num_records = 30,
+					     .has_tombstones = false,
+					     .has_txs = true,
+					     .self_compact_timestamp = model::timestamp{1},
+					     .clean_compact_timestamp = std::nullopt}},
+	.desc = "Segment with removable transaction data."},
+      test_case{
+	.o = model::offset{0},
+	.expected_removable_timestamp = model::timestamp{3},
+	.segments = {test_case::segment_spec{.num_records = 10,
+					     .has_tombstones = false,
+					     .has_txs = false,
+					     .self_compact_timestamp = model::timestamp{1},
+					     .clean_compact_timestamp = model::timestamp{2}},
+		     test_case::segment_spec{.num_records = 10,
+					     .has_tombstones = true,
+					     .has_txs = true,
+					     .self_compact_timestamp = model::timestamp{3},
+					     .clean_compact_timestamp = model::timestamp{4}},
+		     test_case::segment_spec{.num_records = 10,
+					     .has_tombstones = true,
+					     .has_txs = true,
+					     .self_compact_timestamp = model::timestamp{5},
+					     .clean_compact_timestamp = model::timestamp{6}}},
+	.desc = "Multiple segments with removable data should return the earliest timestamp."},
+    };
+    // clang-format on
+
+    using overrides_t = ntp_config::default_overrides;
+    overrides_t ov;
+    auto delete_retention_ms = 10ms;
+    ov.cleanup_policy_bitflags = model::cleanup_policy_bitflags::compaction;
+    ov.delete_retention_ms = tristate<std::chrono::milliseconds>(
+      delete_retention_ms);
+    for (const auto& test : test_cases) {
+        disk_log_builder b;
+        auto ntp_cfg = ntp_config(
+          storage::log_builder_ntp(),
+          b.get_log_config().base_dir,
+          std::make_unique<overrides_t>(ov));
+
+        b | start(std::move(ntp_cfg));
+        auto cleanup = ss::defer([&] { b.stop().get(); });
+
+        auto& disk_log = b.get_disk_log_impl();
+        auto offset = 0;
+        for (const auto& segment_spec : test.segments) {
+            b | add_segment(offset)
+              | add_random_batch(offset, segment_spec.num_records);
+            segment_spec.set_segment_state(disk_log.segments().back());
+            disk_log.force_roll().get();
+            offset += segment_spec.num_records;
+        }
+        auto earliest_removable_ts = disk_log.earliest_removable_timestamp(
+          test.o);
+        ASSERT_EQ(test.expected_removable_timestamp, earliest_removable_ts);
+    }
+}
+
+TEST_F(storage_test_fixture, test_get_file_offset_lock_precheck) {
+    // - Generate a few segments
+    // - Acquire read locks from each (simulating internals of
+    //   offset_range_size)
+    // - Queue up a write lock behind one of them, in the background
+    // - Then call get_file_offset on that segment
+    // - get_file_offset  should throw ss::semaphore_timed_out
+
+    constexpr size_t num_segments = 5;
+    ss::gate gate{};
+
+    auto cfg = default_log_config(test_dir);
+    ss::abort_source as;
+    storage::log_manager mgr = make_log_manager(cfg);
+    SUCCEED() << fmt::format("Configuration: {}", mgr.config());
+    auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
+    auto ntp = model::ntp("redpanda", "test-topic", 0);
+
+    storage::ntp_config ntp_cfg(ntp, mgr.config().base_dir);
+
+    auto log = mgr.manage(std::move(ntp_cfg)).get();
+
+    model::offset first_segment_last_offset;
+    for (size_t i = 0; i < num_segments; i++) {
+        append_random_batches(
+          log,
+          10,
+          model::term_id(0),
+          std::nullopt,
+          custom_ts_batch_generator(model::timestamp::now()));
+        if (first_segment_last_offset == model::offset{}) {
+            first_segment_last_offset = log->offsets().dirty_offset;
+        }
+        log->force_roll().get();
+    }
+
+    auto& segments = log->segments();
+
+    {
+        std::vector<ss::future<ss::rwlock::holder>> f_locks;
+        f_locks.reserve(segments.size());
+        for (auto& s : segments) {
+            f_locks.emplace_back(s->read_lock());
+        }
+
+        auto seg = *std::next(segments.begin(), num_segments / 2);
+
+        ssx::spawn_with_gate(gate, [seg] {
+            return seg->write_lock().then([](auto) { return ss::now(); });
+        });
+
+        EXPECT_THROW(
+          dynamic_cast<storage::disk_log_impl*>(log.get())
+            ->get_file_offset(
+              seg,
+              std::nullopt,
+              seg->offsets().get_committed_offset(),
+              storage::boundary_type::exclusive)
+            .get(),
+          ss::timed_out_error);
+    }
+}
+
+TEST_F(storage_test_fixture, test_offset_range_size_lock_timeout) {
+    // similar to above, offset_range_size should time out in this scenario if
+    // we provide a sensible deadline
+
+    constexpr size_t num_segments = 5;
+    ss::gate gate{};
+
+    auto cfg = default_log_config(test_dir);
+    ss::abort_source as;
+    storage::log_manager mgr = make_log_manager(cfg);
+    SUCCEED() << fmt::format("Configuration: {}", mgr.config());
+    auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
+    auto ntp = model::ntp("redpanda", "test-topic", 0);
+
+    storage::ntp_config ntp_cfg(ntp, mgr.config().base_dir);
+
+    auto log = mgr.manage(std::move(ntp_cfg)).get();
+
+    model::offset first_segment_last_offset;
+    for (size_t i = 0; i < num_segments; i++) {
+        append_random_batches(
+          log,
+          10,
+          model::term_id(0),
+          std::nullopt,
+          custom_ts_batch_generator(model::timestamp::now()));
+        if (first_segment_last_offset == model::offset{}) {
+            first_segment_last_offset = log->offsets().dirty_offset;
+        }
+        log->force_roll().get();
+    }
+
+    auto& segments = log->segments();
+
+    {
+        std::vector<ss::future<ss::rwlock::holder>> f_locks;
+        f_locks.reserve(segments.size());
+        for (auto& s : segments) {
+            f_locks.emplace_back(s->read_lock());
+        }
+
+        auto seg = *std::next(segments.begin(), num_segments / 2);
+
+        ssx::spawn_with_gate(gate, [seg] {
+            return seg->write_lock().then([](auto) { return ss::now(); });
+        });
+
+        EXPECT_THROW(
+          log
+            ->offset_range_size(
+              seg->offsets().get_base_offset(),
+              seg->offsets().get_committed_offset(),
+              ss::semaphore::clock::now() + 1s)
+            .get(),
+          ss::timed_out_error);
+    }
+}
+
+TEST_F(storage_test_fixture, test_max_eligible_for_compacted_reupload_offset) {
+    constexpr size_t num_segments = 2;
+    auto cfg = default_log_config(test_dir);
+    ss::abort_source as;
+    storage::log_manager mgr = make_log_manager(cfg);
+    SUCCEED() << fmt::format("Configuration: {}", mgr.config());
+    auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
+    auto ntp = model::ntp("kafka", "test-topic", 0);
+
+    storage::ntp_config::default_overrides overrides{
+      .cleanup_policy_bitflags = model::cleanup_policy_bitflags::compaction,
+    };
+    storage::ntp_config ntp_cfg(
+      ntp,
+      mgr.config().base_dir,
+      std::make_unique<storage::ntp_config::default_overrides>(overrides));
+
+    auto log = mgr.manage(std::move(ntp_cfg)).get();
+
+    model::offset first_segment_last_offset;
+    for (size_t i = 0; i < num_segments; i++) {
+        append_random_batches(
+          log,
+          10,
+          model::term_id(i),
+          model::timestamp::now(),
+          key_limited_random_batch_generator());
+        if (first_segment_last_offset == model::offset{}) {
+            first_segment_last_offset = log->offsets().dirty_offset;
+        }
+        log->force_roll().get();
+    }
+
+    ss::sleep(1s).get(); // ensure time separation for max.compaction.lag.ms
+
+    auto& segments = log->segments();
+    auto first = *std::next(segments.begin(), 0);
+    auto second = *std::next(segments.begin(), 1);
+
+    auto mco = [&log](model::offset from) {
+        return log->max_eligible_for_compacted_reupload_offset(from);
+    };
+
+    EXPECT_FALSE(mco(first->offsets().get_base_offset()).has_value());
+    EXPECT_FALSE(mco(second->offsets().get_base_offset()).has_value());
+    EXPECT_FALSE(mco(first->offsets().get_committed_offset()).has_value());
+    EXPECT_FALSE(mco(model::offset::max()).has_value());
+    EXPECT_FALSE(mco(model::offset::min()).has_value());
+
+    {
+        // Compact the first segment only
+        vlog(e2e_test_log.info, "Starting compaction");
+        storage::housekeeping_config h_cfg(
+          model::timestamp::min(),
+          std::nullopt,
+          first->offsets().get_committed_offset(),
+          std::nullopt,
+          std::nullopt,
+          0ms,
+          as);
+        log->housekeeping(h_cfg).get();
+
+        EXPECT_TRUE(mco(first->offsets().get_base_offset()).has_value());
+        EXPECT_EQ(
+          mco(first->offsets().get_base_offset()),
+          first->offsets().get_committed_offset());
+        EXPECT_FALSE(mco(second->offsets().get_base_offset()).has_value());
+        EXPECT_TRUE(mco(first->offsets().get_committed_offset()).has_value());
+        EXPECT_EQ(
+          mco(first->offsets().get_committed_offset()),
+          first->offsets().get_committed_offset());
+    }
+
+    {
+        // Now the rest of the topic
+        vlog(e2e_test_log.info, "Starting compaction");
+        storage::housekeeping_config h_cfg(
+          model::timestamp::min(),
+          std::nullopt,
+          log->offsets().committed_offset,
+          std::nullopt,
+          std::nullopt,
+          0ms,
+          as);
+        log->housekeeping(h_cfg).get();
+
+        EXPECT_TRUE(mco(first->offsets().get_base_offset()).has_value());
+        EXPECT_EQ(
+          mco(first->offsets().get_base_offset()),
+          second->offsets().get_committed_offset());
+        EXPECT_TRUE(mco(second->offsets().get_base_offset()).has_value());
+        EXPECT_EQ(
+          mco(second->offsets().get_base_offset()),
+          second->offsets().get_committed_offset());
+
+        EXPECT_TRUE(mco(first->offsets().get_committed_offset()).has_value());
+        EXPECT_EQ(
+          mco(first->offsets().get_committed_offset()),
+          second->offsets().get_committed_offset());
+    }
+}
+
+TEST_F(storage_test_fixture, test_eligible_for_compacted_reupload) {
+    using namespace storage;
+    disk_log_builder b;
+    b | start();
+    auto cleanup = ss::defer([&] { b.stop().get(); });
+    auto& disk_log = b.get_disk_log_impl();
+    const auto num_segs = 2;
+    const auto start_offset = 0;
+    const auto records_per_seg = 150;
+    for (int i = 0; i < num_segs; ++i) {
+        auto offset = start_offset + i * records_per_seg;
+        b | add_segment(offset)
+          | add_random_batch(
+            offset, records_per_seg, maybe_compress_batches::yes);
+        disk_log.force_roll().get();
+    }
+
+    auto& seg1 = b.get_segment(0);
+    auto& seg2 = b.get_segment(1);
+
+    for (auto s : std::array{&seg1, &seg2}) {
+        s->mark_as_compacted_segment();
+        ASSERT_FALSE(s->has_self_compact_timestamp());
+        ASSERT_FALSE(s->has_clean_compact_timestamp());
+    }
+
+    auto efcr = [&disk_log](model::offset f, model::offset l) {
+        return disk_log.eligible_for_compacted_reupload(f, l);
+    };
+
+    // segments are initially not eligible for upload (no timestamps or marks)
+    ASSERT_FALSE(efcr(
+      seg1.offsets().get_base_offset(), seg2.offsets().get_committed_offset()));
+
+    auto set_sliding_window = [](bool v) -> scoped_config {
+        scoped_config cfg;
+        cfg.get("log_compaction_use_sliding_window").set_value(v);
+        return cfg;
+    };
+
+    {
+        auto loc_cfg = set_sliding_window(false);
+
+        ASSERT_FALSE(efcr(
+          seg1.offsets().get_base_offset(),
+          seg1.offsets().get_committed_offset()));
+
+        seg1.index().maybe_set_self_compact_timestamp(model::timestamp::now());
+
+        ASSERT_TRUE(efcr(
+          seg1.offsets().get_base_offset(),
+          seg1.offsets().get_committed_offset()));
+
+        ASSERT_FALSE(efcr(
+          seg1.offsets().get_base_offset(),
+          seg2.offsets().get_committed_offset()));
+
+        seg2.index().maybe_set_self_compact_timestamp(model::timestamp::now());
+
+        ASSERT_TRUE(efcr(
+          seg1.offsets().get_base_offset(),
+          seg2.offsets().get_committed_offset()));
+    }
+
+    {
+        auto loc_cfg = set_sliding_window(true);
+        ASSERT_FALSE(efcr(
+          seg1.offsets().get_base_offset(),
+          seg2.offsets().get_committed_offset()));
+    }
+
+    auto set_collectable = [](bool v) {
+        scoped_config cfg;
+        model::cleanup_policy_bitflags policy;
+        if (v) {
+            std::istringstream{"compact,delete"} >> policy;
+        } else {
+            std::istringstream{"compact"} >> policy;
+        }
+        cfg.get("log_cleanup_policy").set_value(policy);
+        return cfg;
+    };
+
+    auto sliding_window_cfg = set_sliding_window(true);
+
+    {
+        auto loc_cfg = set_collectable(true);
+
+        ASSERT_FALSE(efcr(
+          seg1.offsets().get_base_offset(),
+          seg1.offsets().get_committed_offset()));
+
+        seg1.mark_as_finished_windowed_compaction();
+
+        ASSERT_TRUE(efcr(
+          seg1.offsets().get_base_offset(),
+          seg1.offsets().get_committed_offset()));
+
+        ASSERT_FALSE(efcr(
+          seg1.offsets().get_base_offset(),
+          seg2.offsets().get_committed_offset()));
+
+        seg2.mark_as_finished_windowed_compaction();
+
+        ASSERT_TRUE(efcr(
+          seg1.offsets().get_base_offset(),
+          seg2.offsets().get_committed_offset()));
+    }
+
+    {
+        auto loc_cfg = set_collectable(false);
+        ASSERT_FALSE(efcr(
+          seg1.offsets().get_base_offset(),
+          seg2.offsets().get_committed_offset()));
+
+        seg1.index().maybe_set_clean_compact_timestamp(model::timestamp::now());
+        ASSERT_TRUE(efcr(
+          seg1.offsets().get_base_offset(),
+          seg1.offsets().get_committed_offset()));
+
+        ASSERT_FALSE(efcr(
+          seg1.offsets().get_base_offset(),
+          seg2.offsets().get_committed_offset()));
+
+        seg2.index().maybe_set_clean_compact_timestamp(model::timestamp::now());
+
+        ASSERT_TRUE(efcr(
+          seg1.offsets().get_base_offset(),
+          seg2.offsets().get_committed_offset()));
+    }
+
+    ASSERT_TRUE(efcr(
+      seg1.offsets().get_base_offset(), seg2.offsets().get_committed_offset()));
+
+    ASSERT_FALSE(efcr(
+      seg1.offsets().get_base_offset(),
+      model::next_offset(seg2.offsets().get_committed_offset())));
+
+    seg1.unmark_as_compacted_segment();
+
+    ASSERT_FALSE(efcr(
+      seg1.offsets().get_base_offset(), seg2.offsets().get_committed_offset()));
+}
+
+TEST_F(storage_test_fixture, adjacent_merge_compaction_advances_generation_id) {
+    storage::log_manager mgr = make_log_manager();
+    auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
+    auto ntp = model::ntp("kafka", "a", 0);
+    using overrides_t = storage::ntp_config::default_overrides;
+    overrides_t ov;
+    ov.cleanup_policy_bitflags = model::cleanup_policy_bitflags::compaction;
+
+    auto log
+      = mgr
+          .manage(
+            storage::ntp_config(
+              ntp, mgr.config().base_dir, std::make_unique<overrides_t>(ov)))
+          .get();
+
+    auto add_segment = [log](size_t size, model::term_id term) {
+        do {
+            append_single_record_batch(log, 1, term, 16_KiB, true);
+        } while (log->segments().back()->size_bytes() < size);
+    };
+
+    auto add_segment_func = [&]() {
+        auto size = random_generators::get_int(4_KiB, 10_MiB);
+        add_segment(size, model::term_id(0));
+        log->force_roll().get();
+    };
+
+    add_segment_func();
+    add_segment_func();
+
+    ss::abort_source as;
+    compaction::compaction_config cfg(
+      model::offset::max(), std::nullopt, std::nullopt, as);
+    auto& disk_log = dynamic_cast<storage::disk_log_impl&>(*log);
+
+    auto& segs = log->segments();
+    ASSERT_EQ(segs.size(), 3);
+
+    // Self compact the front segment which will be the target segment for the
+    // adjacent merge so that we already account for the generation_id
+    // advancement from that operation.
+    disk_log.segment_self_compact(cfg, segs.front()).get();
+
+    auto gen_id_before = segs.front()->get_generation_id();
+
+    {
+        disk_log.adjacent_merge_compact(segs.copy(), cfg).get();
+    }
+    ASSERT_EQ(segs.size(), 2);
+
+    auto gen_id_after = segs.front()->get_generation_id();
+
+    ASSERT_EQ(gen_id_after(), gen_id_before() + 1);
+}

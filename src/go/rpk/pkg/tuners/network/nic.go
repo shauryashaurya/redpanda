@@ -40,17 +40,40 @@ const (
 	NTupleNotSupported
 )
 
+type IrqInfo struct {
+	Num      int
+	ProcLine string
+	// IndexFunc returns the queue index for a given IRQ
+	// This will effectively always parse the queue index out of the name from the proc line
+	indexFunc func(IrqInfo) int
+}
+
+func (irqInfo *IrqInfo) QueueIndex() int {
+	return irqInfo.indexFunc(*irqInfo)
+}
+
+func IrqInfosToIDs(irqs []IrqInfo) []int {
+	ids := make([]int, 0, len(irqs))
+	for _, irq := range irqs {
+		ids = append(ids, irq.Num)
+	}
+	return ids
+}
+
 type Nic interface {
 	IsHwInterface() bool
 	IsBondIface() bool
 	Slaves() ([]Nic, error)
-	GetIRQs() ([]int, error)
+	GetIRQs() ([]IrqInfo, error)
 	GetMaxRxQueueCount() (int, error)
 	GetRxQueueCount() (int, error)
 	GetRpsCPUFiles() ([]string, error)
 	GetXpsCPUFiles() ([]string, error)
 	GetRpsLimitFiles() ([]string, error)
 	GetNTupleStatus() (NTupleStatus, error)
+	// Do we support lowering RX queues
+	// Mostly returns false when driver is unknown
+	SupportsRxTxQueueLowering() (bool, error)
 	Name() string
 }
 
@@ -124,9 +147,48 @@ func (n *nic) IsHwInterface() bool {
 	return exists
 }
 
-func (n *nic) GetIRQs() ([]int, error) {
+type driverSupport struct {
+	name           string
+	indexFuncMaker func(numIRQs int) func(IrqInfo) int
+}
+
+var supportedDrivers = []driverSupport{
+	{"ena", func(_ int) func(IrqInfo) int { return intelIrqToQueueIdx }},
+	{"virtio", func(_ int) func(IrqInfo) int { return virtioIrqToQueueIdx }},
+	{"gve", func(numIRQs int) func(IrqInfo) int {
+		return func(irq IrqInfo) int { return gvnicIrqToQueueIdx(irq, numIRQs) }
+	}},
+}
+
+func getQueueIndexFunc(driverName string, numIRQs int) func(IrqInfo) int {
+	for _, driver := range supportedDrivers {
+		if strings.HasPrefix(driverName, driver.name) {
+			return driver.indexFuncMaker(numIRQs)
+		}
+	}
+
+	// Use intel func as the default as that's what we always did and what perf_tune does
+	return intelIrqToQueueIdx
+}
+
+func (n *nic) SupportsRxTxQueueLowering() (bool, error) {
+	driverName, err := n.ethtool.DriverName(n.name)
+	if err != nil {
+		return false, err
+	}
+
+	for _, driver := range supportedDrivers {
+		if strings.HasPrefix(driverName, driver.name) {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+func (n *nic) GetIRQs() ([]IrqInfo, error) {
 	zap.L().Sugar().Debugf("Getting NIC '%s' IRQs", n.name)
-	IRQs, err := n.irqDeviceInfo.GetIRQs(fmt.Sprintf("/sys/class/net/%s/device", n.name),
+	IRQNums, err := n.irqDeviceInfo.GetIRQs(fmt.Sprintf("/sys/class/net/%s/device", n.name),
 		n.name)
 	if err != nil {
 		return nil, err
@@ -135,30 +197,50 @@ func (n *nic) GetIRQs() ([]int, error) {
 	if err != nil {
 		return nil, err
 	}
-	fastPathIRQsPattern := regexp.MustCompile(`-TxRx-|-fp-|-Tx-Rx-|mlx\d+-\d+@`)
-	var fastPathIRQs []int
-	for _, irq := range IRQs {
+
+	driverName, err := n.ethtool.DriverName(n.name)
+	if err != nil {
+		return nil, err
+	}
+
+	fastPathIRQsPattern := regexp.MustCompile(`-TxRx-|-fp-|virtio\d+-(input|output)|ntfy-block|gve-ntfy-blk|-Tx-Rx-|mlx\d+-\d+@`)
+	var fastPathIRQNums []int
+	for _, irq := range IRQNums {
 		if fastPathIRQsPattern.MatchString(procFileLines[irq]) {
-			fastPathIRQs = append(fastPathIRQs, irq)
+			fastPathIRQNums = append(fastPathIRQNums, irq)
 		}
 	}
+
+	var fastPathIRQs []IrqInfo
+	fastPathIndexFunc := getQueueIndexFunc(driverName, len(fastPathIRQNums))
+	for _, irq := range fastPathIRQNums {
+		fastPathIRQs = append(fastPathIRQs, IrqInfo{Num: irq, ProcLine: procFileLines[irq], indexFunc: fastPathIndexFunc})
+	}
+
 	if len(fastPathIRQs) > 0 {
+		// Because not all IRQs might be active we want them to be sorted by queue index
+		// see nics.go:GetHwInterfaceIRQsDistribution()
 		sort.Slice(fastPathIRQs,
 			func(i, j int) bool {
-				return intelIrqToQueueIdx(fastPathIRQs[i], procFileLines) < intelIrqToQueueIdx(fastPathIRQs[j], procFileLines)
+				return fastPathIRQs[i].QueueIndex() < fastPathIRQs[j].QueueIndex()
 			})
 		return fastPathIRQs, nil
+	}
+
+	var IRQs []IrqInfo
+	indexFunc := getQueueIndexFunc(driverName, len(IRQNums))
+	for _, irq := range IRQNums {
+		IRQs = append(IRQs, IrqInfo{Num: irq, ProcLine: procFileLines[irq], indexFunc: indexFunc})
 	}
 	return IRQs, nil
 }
 
-func intelIrqToQueueIdx(irq int, procFileLines map[int]string) int {
+func intelIrqToQueueIdx(irq IrqInfo) int {
 	intelFastPathIrqPattern := regexp.MustCompile(`-TxRx-(\d+)`)
 	fdirPattern := regexp.MustCompile(`fdir-TxRx-\d+`)
-	procLine := procFileLines[irq]
 
-	intelFastPathMatch := intelFastPathIrqPattern.FindStringSubmatch(procLine)
-	fdirPatternMatch := fdirPattern.FindStringSubmatch(procLine)
+	intelFastPathMatch := intelFastPathIrqPattern.FindStringSubmatch(irq.ProcLine)
+	fdirPatternMatch := fdirPattern.FindStringSubmatch(irq.ProcLine)
 
 	if len(intelFastPathMatch) > 0 && len(fdirPatternMatch) == 0 {
 		idx, _ := strconv.Atoi(intelFastPathMatch[1])
@@ -167,7 +249,41 @@ func intelIrqToQueueIdx(irq int, procFileLines map[int]string) int {
 	return MaxInt
 }
 
+func virtioIrqToQueueIdx(irq IrqInfo) int {
+	virtioFastPathIrqPattern := regexp.MustCompile(`virtio\d+-(input|output)\.(\d+)$`)
+
+	virtioMatch := virtioFastPathIrqPattern.FindStringSubmatch(irq.ProcLine)
+	if len(virtioMatch) == 3 {
+		idx, _ := strconv.Atoi(virtioMatch[2])
+		return idx
+	}
+	return MaxInt
+}
+
+func gvnicIrqToQueueIdx(irq IrqInfo, numIRQs int) int {
+	// legacy pattern: eth%d-ntfy-block.30
+	// New pattern: gve-ntfy-blk30@pci:0000:00:08.0
+	newPattern := regexp.MustCompile(`gve-ntfy-blk(\d+)`)
+
+	virtioMatch := newPattern.FindStringSubmatch(irq.ProcLine)
+	if len(virtioMatch) == 0 {
+		// try the legacy pattern
+		legacyPattern := regexp.MustCompile(`ntfy-block\.(\d+)$`)
+		virtioMatch = legacyPattern.FindStringSubmatch(irq.ProcLine)
+	}
+	if len(virtioMatch) == 2 {
+		idx, _ := strconv.Atoi(virtioMatch[1])
+		// https://github.com/torvalds/linux/blob/v6.17/drivers/net/ethernet/google/gve/gve.h#L1082-L1094
+		// TX is the lower half, RX the upper half of the IRQs
+		return idx % (numIRQs / 2)
+	}
+	return MaxInt
+}
+
 func (n *nic) GetMaxRxQueueCount() (int, error) {
+	// Apparently some NICs advertise more Rx queues but only a subset of them is RSS queues
+	// Limited background in https://github.com/scylladb/seastar/commit/d3c6a3685ba695bb2850172f91c8c889a0391e03
+
 	// Networking drivers serving HW with the known maximum RSS queue limitation (due to lack of RSS bits):
 
 	// ixgbe:   PF NICs support up to 16 RSS queues.

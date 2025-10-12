@@ -12,7 +12,6 @@
 
 #include "config/configuration.h"
 #include "datalake/logger.h"
-#include "resource_mgmt/io_priority.h"
 #include "ssx/watchdog.h"
 #include "utils/retry_chain_node.h"
 #include "utils/to_string.h"
@@ -84,13 +83,6 @@ partition_translator::partition_translator(
   , _term(_data_source->term())
   , _logger(
       datalake_log, fmt::format("{}-term-{}", _data_source->ntp(), _term)) {}
-
-void partition_translator::reconcile_properties() noexcept {
-    if (_gate.is_closed()) {
-        return;
-    }
-    _translation_ctx->reconcile_properties();
-}
 
 ss::future<coordinator::fetch_latest_translated_offset_reply>
 partition_translator::fetch_latest_translated_offset(retry_chain_node& rcn) {
@@ -166,7 +158,14 @@ partition_translator::fetch_translation_offsets(retry_chain_node& rcn) {
     // if we reach this point before the most recent batch of files has
     // been committed, the commit lag metric will be out of sync at
     // least until 'wait_for_data' returns and we re-enter the loop.
-    _data_source->update_commit_lag(last_committed_offset);
+    auto max_translatable_offset = _data_source->max_offset_for_translation();
+    if (
+      max_translatable_offset.value_or(kafka::offset::min())
+      >= kafka::offset{0}) {
+        int64_t lag = max_translatable_offset.value()
+                      - last_committed_offset.value_or(kafka::offset{-1});
+        _translation_ctx->report_commit_lag(lag);
+    }
 
     auto next_start_offset = result.last_added_offset
                                ? kafka::next_offset(*result.last_added_offset)
@@ -210,7 +209,13 @@ partition_translator::fetch_translation_offsets(retry_chain_node& rcn) {
     if (
       !current_translation_lto || checkpointed_lto > current_translation_lto) {
         _lag_tracking->notify_data_translated(checkpointed_lto);
-        _data_source->update_translation_lag(checkpointed_lto);
+        if (
+          max_translatable_offset.value_or(kafka::offset::min())
+          >= kafka::offset{0}) {
+            int64_t lag = max_translatable_offset.value()
+                          - std::max(checkpointed_lto, kafka::offset{-1});
+            _translation_ctx->report_translation_lag(lag);
+        }
         current_translation_lto = checkpointed_lto;
     }
 
@@ -261,8 +266,7 @@ partition_translator::run_one_translation_iteration(
          * change such as finishing the on-going translation.
          */
         as.check();
-        auto reader = co_await _data_source->make_log_reader(
-          begin_offset, datalake_priority(), as);
+        auto reader = co_await _data_source->make_log_reader(begin_offset, as);
         if (!reader) {
             co_return result;
         }

@@ -18,6 +18,7 @@
 #include "bytes/scattered_message.h"
 #include "cluster/types.h"
 #include "config/configuration.h"
+#include "config/node_config.h"
 #include "kafka/protocol/sasl_authenticate.h"
 #include "kafka/server/datalake_throttle_manager.h"
 #include "kafka/server/handlers/fetch.h"
@@ -31,7 +32,9 @@
 #include "kafka/server/sasl_probe.h"
 #include "kafka/server/server.h"
 #include "kafka/server/snc_quota_manager.h"
+#include "model/fundamental.h"
 #include "net/exceptions.h"
+#include "security/authorizer.h"
 #include "security/exceptions.h"
 
 #include <seastar/core/coroutine.hh>
@@ -88,9 +91,10 @@ parse_vcluster_connection_id(const std::string& hex_str) {
     auto match = std::regex_match(
       hex_str.cbegin(), hex_str.cend(), matches, hex_characters_regexp);
     if (!match) {
-        throw invalid_virtual_connection_id(fmt::format(
-          "virtual cluster connection id '{}' is not a hexadecimal integer",
-          hex_str));
+        throw invalid_virtual_connection_id(
+          fmt::format(
+            "virtual cluster connection id '{}' is not a hexadecimal integer",
+            hex_str));
     }
 
     vcluster_connection_id cid;
@@ -124,19 +128,21 @@ parse_virtual_connection_id(const kafka::request_header& header) {
     }
 
     if (header.client_id->size() < v_connection_id_size) {
-        throw invalid_virtual_connection_id(fmt::format(
-          "virtual connection client id size must contain at least {} "
-          "characters. Current size: {}",
-          v_connection_id_size,
-          header.client_id_buffer.size()));
+        throw invalid_virtual_connection_id(
+          fmt::format(
+            "virtual connection client id size must contain at least {} "
+            "characters. Current size: {}",
+            v_connection_id_size,
+            header.client_id_buffer.size()));
     }
     try {
         virtual_connection_id connection_id{
           .virtual_cluster_id = xid::from_string(
             std::string_view(header.client_id->begin(), xid::str_size)),
-          .connection_id = parse_vcluster_connection_id(std::string(
-            std::next(header.client_id_buffer.begin(), xid::str_size),
-            connection_id_str_size))};
+          .connection_id = parse_vcluster_connection_id(
+            std::string(
+              std::next(header.client_id_buffer.begin(), xid::str_size),
+              connection_id_str_size))};
 
         return virtual_connection_client_id{
           .v_connection_id = connection_id,
@@ -193,8 +199,9 @@ ss::future<> connection_context::start() {
                     klog.debug,
                     "Connection input_shutdown; aborting operations for {}",
                     conn->addr);
-                  return _as.request_abort_ex(std::system_error(
-                    std::make_error_code(std::errc::connection_aborted)));
+                  return _as.request_abort_ex(
+                    std::system_error(
+                      std::make_error_code(std::errc::connection_aborted)));
               })
               .finally([this]() { _wait_input_shutdown.set_value(); });
     } else {
@@ -225,46 +232,61 @@ ss::future<> connection_context::stop() {
 
 template<typename T>
 security::auth_result connection_context::authorized(
-  security::acl_operation operation, const T& name, authz_quiet quiet) {
+  security::acl_operation operation,
+  const T& name,
+  authz_quiet quiet,
+  superuser_required superuser_required) {
     // authorization disabled?
     if (!_enable_authorizer) {
         return security::auth_result::authz_disabled(
           get_principal(), security::acl_host(_client_addr), operation, name);
     }
 
-    return authorized_user(get_principal(), operation, name, quiet);
+    return authorized_user(
+      get_principal(), operation, name, quiet, superuser_required);
 }
 
 template security::auth_result connection_context::authorized<model::topic>(
   security::acl_operation operation,
   const model::topic& name,
-  authz_quiet quiet);
+  authz_quiet quiet,
+  superuser_required);
 
 template security::auth_result connection_context::authorized<kafka::group_id>(
   security::acl_operation operation,
   const kafka::group_id& name,
-  authz_quiet quiet);
+  authz_quiet quiet,
+  superuser_required);
 
 template security::auth_result
 connection_context::authorized<kafka::transactional_id>(
   security::acl_operation operation,
   const kafka::transactional_id& name,
-  authz_quiet quiet);
+  authz_quiet quiet,
+  superuser_required);
 
 template security::auth_result
 connection_context::authorized<security::acl_cluster_name>(
   security::acl_operation operation,
   const security::acl_cluster_name& name,
-  authz_quiet quiet);
+  authz_quiet quiet,
+  superuser_required);
 
 template<typename T>
 security::auth_result connection_context::authorized_user(
   security::acl_principal principal,
   security::acl_operation operation,
   const T& name,
-  authz_quiet quiet) {
+  authz_quiet quiet,
+  superuser_required superuser_required) {
     auto authorized = _server.authorizer().authorized(
-      name, operation, principal, security::acl_host(_client_addr));
+      name,
+      operation,
+      principal,
+      security::acl_host(_client_addr),
+      security::superuser_required{
+        superuser_required ? security::superuser_required::yes
+                           : security::superuser_required::no});
 
     if (!authorized) {
         if (_sasl) {
@@ -318,28 +340,32 @@ connection_context::authorized_user<model::topic>(
   security::acl_principal principal,
   security::acl_operation operation,
   const model::topic& name,
-  authz_quiet quiet);
+  authz_quiet quiet,
+  superuser_required);
 
 template security::auth_result
 connection_context::authorized_user<kafka::group_id>(
   security::acl_principal principal,
   security::acl_operation operation,
   const kafka::group_id& name,
-  authz_quiet quiet);
+  authz_quiet quiet,
+  superuser_required);
 
 template security::auth_result
 connection_context::authorized_user<kafka::transactional_id>(
   security::acl_principal principal,
   security::acl_operation operation,
   const kafka::transactional_id& name,
-  authz_quiet quiet);
+  authz_quiet quiet,
+  superuser_required);
 
 template security::auth_result
 connection_context::authorized_user<security::acl_cluster_name>(
   security::acl_principal principal,
   security::acl_operation operation,
   const security::acl_cluster_name& name,
-  authz_quiet quiet);
+  authz_quiet quiet,
+  superuser_required);
 
 ss::future<> connection_context::revoke_credentials(std::string_view name) {
     if (
@@ -355,6 +381,14 @@ ss::future<> connection_context::revoke_credentials(std::string_view name) {
     _server.sasl_probe().session_revoked();
     conn->shutdown_input();
     return ss::now();
+}
+
+bool connection_context::has_superuser_access() const {
+    if (!_enable_authorizer) {
+        return true;
+    }
+    return std::ranges::contains(
+      config::shard_local_cfg().superusers(), get_principal().name());
 }
 
 ss::future<> connection_context::process() {
@@ -374,10 +408,11 @@ ss::future<> connection_context::process_one_request() {
     }
 
     if (sz.value() > _max_request_size()) {
-        throw net::invalid_request_error(fmt::format(
-          "request size {} is larger than the configured max {}",
-          sz,
-          _max_request_size()));
+        throw net::invalid_request_error(
+          fmt::format(
+            "request size {} is larger than the configured max {}",
+            sz,
+            _max_request_size()));
     }
 
     /*
@@ -500,17 +535,18 @@ ss::future<> connection_context::handle_auth_v0(const size_t size) {
 
     sasl_authenticate_response response;
     {
+        auto rres = ss::make_lw_shared<request_resources>();
         auto ctx = request_context(
           shared_from_this(),
+          rres,
           request_header{
             .key = sasl_authenticate_api::key,
             .version = version,
           },
           std::move(request_buf),
           0s);
-        auto sres = session_resources{};
         auto resp = co_await kafka::process_request(
-                      std::move(ctx), _server.smp_group(), sres)
+                      std::move(ctx), _server.smp_group(), *rres)
                       .response;
         auto data = std::move(*resp).release();
         response.decode(std::move(data), version);
@@ -617,7 +653,7 @@ connection_context::record_tp_and_calculate_throttle(
     co_return delay_t{.request = delay_request, .enforce = delay_enforce};
 }
 
-ss::future<session_resources> connection_context::throttle_request(
+ss::future<request_resources> connection_context::throttle_request(
   const request_data r_data, size_t request_size) {
     // note that when throttling is first determined, the request is
     // allowed to pass through, and only subsequent requests are
@@ -647,7 +683,7 @@ ss::future<session_resources> connection_context::throttle_request(
     auto& h_probe = _server.handler_probe(r_data.request_key);
     auto tracker = std::make_unique<request_tracker>(_server.probe(), h_probe);
     auto track = track_latency(r_data.request_key);
-    session_resources r{
+    request_resources r{
       .backpressure_delay = delay.request,
       .memlocks = std::move(mem_units),
       .queue_units = std::move(qd_units),
@@ -671,11 +707,12 @@ connection_context::reserve_request_units(api_key key, size_t size) {
                                 : default_memory_estimate(size);
     if (unlikely(mem_estimate >= (size_t)std::numeric_limits<int32_t>::max())) {
         // TODO: Create error response using the specific API?
-        throw std::runtime_error(fmt::format(
-          "request too large > 1GB (size: {}, estimate: {}, API: {})",
-          size,
-          mem_estimate,
-          handler ? (*handler)->name() : "<bad key>"));
+        throw std::runtime_error(
+          fmt::format(
+            "request too large > 1GB (size: {}, estimate: {}, API: {})",
+            size,
+            mem_estimate,
+            handler ? (*handler)->name() : "<bad key>"));
     }
     auto fut = ss::get_units(_server.memory(), mem_estimate);
     if (_server.memory().waiters()) {
@@ -713,7 +750,7 @@ connection_context::dispatch_method_once(request_header hdr, size_t size) {
         co_await ss::coroutine::switch_to(_server.get_request_handler_sg());
     }
 
-    auto sres_in = co_await throttle_request(std::move(r_data), size);
+    auto rres_in = co_await throttle_request(std::move(r_data), size);
     if (abort_requested()) {
         // protect against shutdown behavior
         co_return;
@@ -733,7 +770,7 @@ connection_context::dispatch_method_once(request_header hdr, size_t size) {
         }
     }
 
-    auto sres = ss::make_lw_shared(std::move(sres_in));
+    auto rres = ss::make_lw_shared(std::move(rres_in));
 
     auto remaining = size - request_header_size - hdr.client_id_buffer.size()
                      - hdr.tags_size_bytes;
@@ -744,7 +781,7 @@ connection_context::dispatch_method_once(request_header hdr, size_t size) {
     }
     auto self = shared_from_this();
     auto rctx = request_context(
-      self, std::move(hdr), std::move(buf), sres->backpressure_delay);
+      self, rres, std::move(hdr), std::move(buf), rres->backpressure_delay);
 
     /**
      * Not virtualized connection, simply forward to protocol state for request
@@ -754,7 +791,7 @@ connection_context::dispatch_method_once(request_header hdr, size_t size) {
       !_is_virtualized_connection
       || rctx.header().client_id == multi_proxy_initial_client_id) {
         co_return co_await _protocol_state.process_request(
-          shared_from_this(), std::move(rctx), sres);
+          shared_from_this(), std::move(rctx), rres);
     }
     auto client_connection_id = parse_virtual_connection_id(rctx.header());
     rctx.override_client_id(client_connection_id.client_id);
@@ -773,24 +810,53 @@ connection_context::dispatch_method_once(request_header hdr, size_t size) {
     }
 
     co_await it->second->process_request(
-      shared_from_this(), std::move(rctx), sres);
+      shared_from_this(), std::move(rctx), rres);
+}
+
+proto::admin::kafka_connection connection_context::to_proto() const {
+    using proto::admin::kafka_connection_state;
+
+    auto res = proto::admin::kafka_connection{};
+    res.set_shard_id(ss::this_shard_id());
+    res.set_node_id(
+      config::node().node_id.value().value_or(model::unassigned_node_id));
+    res.set_listener_name(ss::sstring{listener()});
+    res.set_state(
+      _as.abort_requested() ? kafka_connection_state::aborting
+                            : kafka_connection_state::open);
+
+    auto src = proto::admin::source{};
+    src.set_ip_address(fmt::format("{}", client_host()));
+    src.set_port(client_port());
+    res.set_source(std::move(src));
+
+    auto tls_info = proto::admin::tls_info{};
+    tls_info.set_enabled(conn->tls_enabled());
+    res.set_tls_info(std::move(tls_info));
+
+    auto auth_info = proto::admin::authentication_info{};
+    auth_info.set_user_principal(ss::sstring{get_principal().name()});
+
+    // TODO: fill out the response with the remaining fields
+
+    return res;
 }
 
 ss::future<> connection_context::virtual_connection_state::process_request(
   ss::lw_shared_ptr<connection_context> connection_ctx,
   request_context rctx,
-  ss::lw_shared_ptr<session_resources> sres) {
+  ss::lw_shared_ptr<request_resources> rres) {
     auto u = co_await _lock.get_units();
     ssx::spawn_with_gate(
       connection_ctx->_gate,
       [this,
        rctx = std::move(rctx),
-       sres,
+       rres,
        u = std::move(u),
        connection_ctx]() mutable {
           _last_request_timestamp = ss::lowres_clock::now();
           return _state
-            .process_request(std::move(connection_ctx), std::move(rctx), sres)
+            .process_request(std::move(connection_ctx), std::move(rctx), rres)
             .finally([u = std::move(u)] {});
       });
 }
@@ -798,7 +864,7 @@ ss::future<> connection_context::virtual_connection_state::process_request(
 ss::future<> connection_context::client_protocol_state::process_request(
   ss::lw_shared_ptr<connection_context> connection_ctx,
   request_context rctx,
-  ss::lw_shared_ptr<session_resources> sres) {
+  ss::lw_shared_ptr<request_resources> rres) {
     /*
      * we process requests in order since all subsequent requests
      * are dependent on authentication having completed.
@@ -822,7 +888,7 @@ ss::future<> connection_context::client_protocol_state::process_request(
     const sequence_id seq = _seq_idx;
     _seq_idx = _seq_idx + sequence_id(1);
     auto res = kafka::process_request(
-      std::move(rctx), connection_ctx->server().smp_group(), *sres);
+      std::move(rctx), connection_ctx->server().smp_group(), *rres);
 
     /*
      * first stage processed in a foreground.
@@ -847,10 +913,21 @@ ss::future<> connection_context::client_protocol_state::process_request(
               std::current_exception());
         }
         connection_ctx->conn->shutdown_input();
-        sres->tracker->mark_errored();
+        rres->tracker->mark_errored();
         co_return;
     }
-
+    /**
+     * If the gate is closed, then we are shutting down and need to wait for the
+     * response future in the foreground.
+     */
+    if (connection_ctx->_server.conn_gate().is_closed()) {
+        co_return co_await handle_response(
+          std::move(connection_ctx),
+          std::move(res.response),
+          rres,
+          seq,
+          correlation);
+    }
     /**
      * second stage processed in background.
      */
@@ -858,26 +935,26 @@ ss::future<> connection_context::client_protocol_state::process_request(
       connection_ctx->_server.conn_gate(),
       [this,
        f = std::move(res.response),
-       sres,
+       rres,
        seq,
        correlation,
        cctx = connection_ctx]() mutable {
           return handle_response(
-            std::move(cctx), std::move(f), sres, seq, correlation);
+            std::move(cctx), std::move(f), rres, seq, correlation);
       });
 }
 
 ss::future<> connection_context::client_protocol_state::handle_response(
   ss::lw_shared_ptr<connection_context> connection_ctx,
   ss::future<response_ptr> f,
-  ss::lw_shared_ptr<session_resources> sres,
+  ss::lw_shared_ptr<request_resources> rres,
   sequence_id seq,
   correlation_id correlation) {
     std::exception_ptr e;
     try {
         auto r = co_await std::move(f);
         r->set_correlation(correlation);
-        response_and_resources randr{std::move(r), sres};
+        response_and_resources randr{std::move(r), rres};
         _responses.insert({seq, std::move(randr)});
         co_return co_await maybe_process_responses(connection_ctx);
     } catch (...) {
@@ -903,7 +980,7 @@ ss::future<> connection_context::client_protocol_state::handle_response(
         vlog(klog.warn, "Error processing request: {}", e);
     }
 
-    sres->tracker->mark_errored();
+    rres->tracker->mark_errored();
     connection_ctx->conn->shutdown_input();
 }
 

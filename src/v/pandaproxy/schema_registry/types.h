@@ -89,6 +89,41 @@ from_string_view<schema_type>(std::string_view sv) {
 
 std::ostream& operator<<(std::ostream& os, const schema_type& v);
 
+enum class output_format { none = 0, resolved, ignore_extensions, serialized };
+
+constexpr std::string_view to_string_view(output_format of) {
+    switch (of) {
+    case output_format::resolved:
+        return "resolved";
+    case output_format::ignore_extensions:
+        return "ignore_extensions";
+    case output_format::serialized:
+        return "serialized";
+    case output_format::none:
+        break;
+    }
+    return "";
+}
+
+template<>
+inline std::optional<output_format>
+from_string_view<output_format>(std::string_view sv) {
+    return string_switch<std::optional<output_format>>(sv)
+      .match(to_string_view(output_format::none), output_format::none)
+      .match(to_string_view(output_format::resolved), output_format::resolved)
+      .match(
+        to_string_view(output_format::ignore_extensions),
+        output_format::ignore_extensions)
+      .match(
+        to_string_view(output_format::serialized), output_format::serialized)
+      .default_match(std::nullopt);
+}
+
+std::ostream& operator<<(std::ostream& os, const output_format& of);
+
+///\brief Type representing a global resource for ACLs.
+using registry_resource = named_type<ss::sstring, struct registry_resource_tag>;
+
 ///\brief A subject is the name under which a schema is registered.
 ///
 /// Typically it will be "<topic>-key" or "<topic>-value".
@@ -226,7 +261,8 @@ public:
       : _impl{std::move(p)}
       , _refs(std::move(refs)) {}
 
-    schema_definition::raw_string raw() const;
+    schema_definition::raw_string
+    raw(output_format format = output_format::none) const;
     const schema_definition::references& refs() const { return _refs; };
 
     const impl& operator()() const { return *_impl; }
@@ -239,10 +275,6 @@ public:
     operator<<(std::ostream& os, const protobuf_schema_definition& rhs);
 
     constexpr schema_type type() const { return schema_type::protobuf; }
-
-    explicit operator schema_definition() const {
-        return {raw(), type(), refs()};
-    }
 
     ::result<ss::sstring, kafka::error_code>
     name(const std::vector<int>& fields) const;
@@ -448,6 +480,21 @@ struct stored_schema {
     }
 };
 
+///\brief A mapping of version and schema id for a subject.
+struct subject_version_entry {
+    subject_version_entry(
+      schema_version version, schema_id id, is_deleted deleted)
+      : version{version}
+      , id{id}
+      , deleted(deleted) {}
+
+    schema_version version;
+    schema_id id;
+    is_deleted deleted{is_deleted::no};
+
+    std::vector<seq_marker> written_at;
+};
+
 enum class compatibility_level {
     none = 0,
     backward,
@@ -517,8 +564,8 @@ struct compatibility_result {
 
 template<>
 struct fmt::formatter<pandaproxy::schema_registry::schema_reference> {
-    constexpr auto
-    parse(fmt::format_parse_context& ctx) -> decltype(ctx.begin()) {
+    constexpr auto parse(fmt::format_parse_context& ctx)
+      -> decltype(ctx.begin()) {
         auto it = ctx.begin();
         auto end = ctx.end();
         if (it != end && (*it == 'l' || *it == 'e')) {

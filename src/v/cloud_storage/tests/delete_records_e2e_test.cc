@@ -8,6 +8,7 @@
  * https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
  */
 
+#include "absl/container/flat_hash_set.h"
 #include "cloud_io/tests/s3_imposter.h"
 #include "cloud_storage/spillover_manifest.h"
 #include "cloud_storage/tests/produce_utils.h"
@@ -23,11 +24,9 @@
 #include "redpanda/tests/fixture.h"
 #include "storage/disk_log_impl.h"
 #include "test_utils/async.h"
+#include "test_utils/boost_fixture.h"
 #include "test_utils/scoped_config.h"
 
-#include <seastar/core/io_priority_class.hh>
-
-#include <absl/container/flat_hash_set.h>
 #include <boost/algorithm/string/predicate.hpp>
 #include <boost/test/tools/old/interface.hpp>
 
@@ -118,6 +117,7 @@ public:
         auto archiver_ref = partition->archiver();
         BOOST_REQUIRE(archiver_ref.has_value());
         archiver = &archiver_ref.value().get();
+        archiver->initialize_probe();
     }
 
     // Truncates by space, expecting the override offset is removed.
@@ -126,6 +126,7 @@ public:
         props.retention_bytes = tristate<size_t>(bytes);
         partition->update_configuration(std::move(props)).get();
         auto& new_archiver = partition->archiver()->get();
+        new_archiver.initialize_probe();
         new_archiver.housekeeping().get();
         BOOST_REQUIRE_EQUAL(
           new_archiver.manifest().get_start_kafka_offset_override(),
@@ -142,6 +143,7 @@ public:
 
 FIXTURE_TEST(test_timequery_below_deleted_offset, delete_records_e2e_fixture) {
     tests::remote_segment_generator gen(make_kafka_client().get(), *partition);
+    auto deferred_g_close = ss::defer([&gen] { gen.stop().get(); });
     // Use a starting timestamp and make sure each batch gets a different
     // timestamp.
     BOOST_REQUIRE_EQUAL(
@@ -159,6 +161,7 @@ FIXTURE_TEST(test_timequery_below_deleted_offset, delete_records_e2e_fixture) {
     auto first_seg_max_ts = first_seg->max_timestamp;
     tests::kafka_list_offsets_transport lister(make_kafka_client().get());
     lister.start().get();
+    auto deferred_l_close = ss::defer([&lister] { lister.stop().get(); });
 
     // Sanity check: timequery the end of the first cloud segment.
     auto offset = lister
@@ -173,6 +176,7 @@ FIXTURE_TEST(test_timequery_below_deleted_offset, delete_records_e2e_fixture) {
     // Delete into the second segment.
     kafka_delete_records_transport deleter(make_kafka_client("deleter").get());
     deleter.start().get();
+    auto deferred_d_close = ss::defer([&deleter] { deleter.stop().get(); });
     auto second_seg_end_offset = kafka::offset_cast(
       second_seg->last_kafka_offset());
     auto lwm
@@ -222,6 +226,7 @@ FIXTURE_TEST(
         wait_for_leader(ntp, 10s).get();
         tests::remote_segment_generator gen(
           make_kafka_client().get(), *partition);
+        auto deferred_g_close = ss::defer([&gen] { gen.stop().get(); });
         BOOST_REQUIRE_EQUAL(
           9,
           // 3 segments each with 3 batches, + 1 segment for the leadership
@@ -230,6 +235,7 @@ FIXTURE_TEST(
     }
     tests::kafka_offset_for_epoch_transport offer(make_kafka_client().get());
     offer.start().get();
+    auto deferred_o_close = ss::defer([&offer] { offer.stop().get(); });
     auto last_in_term_2 = offer
                             .offset_for_leader_partition(
                               topic_name,
@@ -239,6 +245,7 @@ FIXTURE_TEST(
     BOOST_REQUIRE_EQUAL(model::offset(9), last_in_term_2);
     kafka_delete_records_transport deleter(make_kafka_client().get());
     deleter.start().get();
+    auto deferred_d_close = ss::defer([&deleter] { deleter.stop().get(); });
     auto lwm = deleter
                  .delete_records_from_partition(
                    topic_name, model::partition_id(0), model::offset(13), 5s)
@@ -258,6 +265,7 @@ FIXTURE_TEST(
 FIXTURE_TEST(test_delete_from_stm_consume, delete_records_e2e_fixture) {
     // Create a segment with three distinct batches.
     tests::remote_segment_generator gen(make_kafka_client().get(), *partition);
+    auto deferred_g_close = ss::defer([&gen] { gen.stop().get(); });
     BOOST_REQUIRE_EQUAL(
       9, gen.num_segments(3).batches_per_segment(3).produce().get());
     BOOST_REQUIRE_EQUAL(3, archiver->manifest().size());
@@ -265,6 +273,7 @@ FIXTURE_TEST(test_delete_from_stm_consume, delete_records_e2e_fixture) {
     // Delete in the middle of a segment.
     kafka_delete_records_transport deleter(make_kafka_client("deleter").get());
     deleter.start().get();
+    auto deferred_d_close = ss::defer([&deleter] { deleter.stop().get(); });
     auto lwm = deleter
                  .delete_records_from_partition(
                    topic_name, model::partition_id(0), model::offset(1), 5s)
@@ -275,6 +284,7 @@ FIXTURE_TEST(test_delete_from_stm_consume, delete_records_e2e_fixture) {
 
     kafka_consume_transport consumer(make_kafka_client().get());
     consumer.start().get();
+    auto deferred_c_close = ss::defer([&consumer] { consumer.stop().get(); });
     auto consumed_records = consumer
                               .consume_from_partition(
                                 topic_name,
@@ -292,11 +302,13 @@ FIXTURE_TEST(test_delete_from_stm_consume, delete_records_e2e_fixture) {
 FIXTURE_TEST(test_delete_from_archive_consume, delete_records_e2e_fixture) {
     auto partition = app.partition_manager.local().get(ntp);
     auto& archiver = partition->archiver()->get();
+    archiver.initialize_probe();
     archiver.sync_for_tests().get();
 
     const auto records_per_seg = 5;
     const auto num_segs = 40;
     tests::remote_segment_generator gen(make_kafka_client().get(), *partition);
+    auto deferred_g_close = ss::defer([&gen] { gen.stop().get(); });
     auto total_records = gen.num_segments(num_segs)
                            .batches_per_segment(records_per_seg)
                            .produce()
@@ -319,8 +331,10 @@ FIXTURE_TEST(test_delete_from_archive_consume, delete_records_e2e_fixture) {
     // Delete at every offset, ensuring we consume properly at each offset.
     kafka_delete_records_transport deleter(make_kafka_client().get());
     deleter.start().get();
+    auto deferred_d_close = ss::defer([&deleter] { deleter.stop().get(); });
     kafka_consume_transport consumer(make_kafka_client().get());
     consumer.start().get();
+    auto deferred_c_close = ss::defer([&consumer] { consumer.stop().get(); });
     for (int i = 1; i < total_records; i++) {
         auto lwm = deleter
                      .delete_records_from_partition(
@@ -346,6 +360,7 @@ FIXTURE_TEST(test_delete_from_archive_consume, delete_records_e2e_fixture) {
 FIXTURE_TEST(
   test_delete_from_local_storage_truncation, delete_records_e2e_fixture) {
     tests::remote_segment_generator gen(make_kafka_client().get(), *partition);
+    auto deferred_g_close = ss::defer([&gen] { gen.stop().get(); });
     size_t records_per_seg = 5;
     BOOST_REQUIRE_GE(
       250,
@@ -363,6 +378,7 @@ FIXTURE_TEST(
     // DeleteRecords to just before the end of the local log.
     kafka_delete_records_transport deleter(make_kafka_client().get());
     deleter.start().get();
+    auto deferred_d_close = ss::defer([&deleter] { deleter.stop().get(); });
     auto new_start_offset = kafka::offset(245);
     BOOST_REQUIRE_EQUAL(
       new_start_offset,
@@ -412,7 +428,7 @@ FIXTURE_TEST(
           tests::kv_t::sequence(0, records_per_seg))
         .get());
     log->flush().get();
-    log->force_roll(ss::default_priority_class()).get();
+    log->force_roll().get();
     BOOST_REQUIRE_GT(produced_kafka_base_offset, new_start_offset);
     while (produced_kafka_base_offset > stm_manifest.get_next_kafka_offset()) {
         BOOST_REQUIRE(archiver->sync_for_tests().get());
@@ -449,6 +465,7 @@ FIXTURE_TEST(
 // DeleteRecords request lands in the STM manifest.
 FIXTURE_TEST(test_delete_from_stm_truncation, delete_records_e2e_fixture) {
     tests::remote_segment_generator gen(make_kafka_client().get(), *partition);
+    auto deferred_g_close = ss::defer([&gen] { gen.stop().get(); });
     size_t records_per_seg = 5;
     BOOST_REQUIRE_GE(
       250,
@@ -464,6 +481,7 @@ FIXTURE_TEST(test_delete_from_stm_truncation, delete_records_e2e_fixture) {
     BOOST_REQUIRE_EQUAL(stm_manifest.size(), segs_per_spill);
     kafka_delete_records_transport deleter(make_kafka_client().get());
     deleter.start().get();
+    auto deferred_d_close = ss::defer([&deleter] { deleter.stop().get(); });
 
     // Truncate within the STM at the bound, leaving one segment.
     auto stm_truncate_offset
@@ -517,6 +535,7 @@ FIXTURE_TEST(test_delete_from_stm_truncation, delete_records_e2e_fixture) {
 // DeleteRecords request lands in the archive.
 FIXTURE_TEST(test_delete_from_archive_truncation, delete_records_e2e_fixture) {
     tests::remote_segment_generator gen(make_kafka_client().get(), *partition);
+    auto deferred_g_close = ss::defer([&gen] { gen.stop().get(); });
     size_t records_per_seg = 5;
     BOOST_REQUIRE_GE(
       250,
@@ -532,7 +551,7 @@ FIXTURE_TEST(test_delete_from_archive_truncation, delete_records_e2e_fixture) {
     BOOST_REQUIRE_EQUAL(stm_manifest.size(), segs_per_spill);
     kafka_delete_records_transport deleter(make_kafka_client().get());
     deleter.start().get();
-
+    auto deferred_d_close = ss::defer([&deleter] { deleter.stop().get(); });
     // Truncate within the bounds of the first archive segment. Nothing should
     // be removed.
     auto& spillover = stm_manifest.get_spillover_map();

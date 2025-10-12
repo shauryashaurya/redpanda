@@ -89,7 +89,7 @@ public:
      * Returns a snapshot of an STM state with requested last included offset
      */
     virtual ss::future<iobuf>
-    take_snapshot(model::offset last_included_offset) = 0;
+    take_raft_snapshot(model::offset last_included_offset) = 0;
 
     /**
      * Last successfully applied offset
@@ -168,22 +168,24 @@ class no_at_offset_snapshot_stm_base : public state_machine_base {
     /**
      * Method that will be called whenever a raft snapshot is required
      */
-    virtual ss::future<iobuf> take_snapshot() = 0;
+    virtual ss::future<iobuf> take_raft_snapshot() = 0;
 
     snapshot_at_offset_supported supports_snapshot_at_offset() const final {
         return snapshot_at_offset_supported::no;
     }
 
-    ss::future<iobuf> take_snapshot(model::offset offset) final {
+    ss::future<iobuf> take_raft_snapshot(model::offset offset) final {
         if (offset != last_applied_offset()) {
-            throw std::logic_error(fmt::format(
-              "State machine that do not support taking snapshot at arbitrary "
-              "offset can to take snapshot at requested offset: {}, current "
-              "last applied offset: {}",
-              offset,
-              last_applied_offset()));
+            throw std::logic_error(
+              fmt::format(
+                "State machine that do not support taking snapshot at "
+                "arbitrary "
+                "offset can to take snapshot at requested offset: {}, current "
+                "last applied offset: {}",
+                offset,
+                last_applied_offset()));
         }
-        return take_snapshot();
+        return take_raft_snapshot();
     }
 };
 

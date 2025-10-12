@@ -27,6 +27,8 @@
 #include <seastar/core/smp.hh>
 #include <seastar/net/socket_defs.hh>
 
+#include <memory>
+
 namespace cluster {
 class controller;
 }
@@ -37,6 +39,7 @@ class service : public ss::peering_sharded_service<service> {
 public:
     service(
       const YAML::Node& config,
+      const YAML::Node& client_config,
       ss::smp_service_group smp_sg,
       size_t max_memory,
       ss::sharded<kafka::client::client>& client,
@@ -49,15 +52,21 @@ public:
     ss::future<> stop();
 
     configuration& config();
-    kafka::client::configuration& client_config();
     ss::sharded<kafka::client::client>& client() { return _client; }
     seq_writer& writer() { return _writer.local(); }
     sharded_store& schema_store() { return _store; }
     request_authenticator& authenticator() { return _auth; }
+    security::authorizer& authorizor();
     ss::future<> mitigate_error(std::exception_ptr);
     ss::future<> ensure_started() { return _ensure_started(); }
     security::audit::audit_log_manager& audit_mgr() {
         return _audit_mgr.local();
+    }
+
+    std::unique_ptr<cluster::controller>& controller() { return _controller; }
+
+    bool has_ephemeral_credentials() const {
+        return _has_ephemeral_credentials;
     }
 
 private:
@@ -68,6 +77,7 @@ private:
     ss::future<> create_internal_topic();
     ss::future<> fetch_internal_topic();
     configuration _config;
+    kafka::client::configuration _client_config;
     ssx::semaphore _mem_sem;
     adjustable_semaphore _inflight_sem;
     config::binding<size_t> _inflight_config_binding;

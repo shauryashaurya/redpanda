@@ -16,6 +16,7 @@ import (
 	"strconv"
 
 	"github.com/lorenzosaino/go-sysctl"
+	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/config"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/tuners/ethtool"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/tuners/irq"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/tuners/network"
@@ -25,13 +26,15 @@ import (
 )
 
 type NetCheckersFactory interface {
-	NewNicIRQAffinityStaticChecker(interfaces []string) Checker
+	NewNicRxTxQueueCountCheckers(interfaces []string, mode irq.Mode, cpuMask string) []Checker
+	NewNicRxTxQueueCountChecker(nic network.Nic, mode irq.Mode, cpuMask string) Checker
+	NewNicIRQBalanceChecker(interfaces []string) Checker
 	NewNicIRQAffinityCheckers(interfaces []string, mode irq.Mode, mask string) []Checker
 	NewNicIRQAffinityChecker(nic network.Nic, mode irq.Mode, mask string) Checker
 	NewNicRpsSetCheckers(interfaces []string, mode irq.Mode, mask string) []Checker
 	NewNicRpsSetChecker(nic network.Nic, mode irq.Mode, mask string) Checker
-	NewNicRfsCheckers(interfaces []string) []Checker
-	NewNicRfsChecker(nic network.Nic) Checker
+	NewNicRfsCheckers(interfaces []string, mode irq.Mode, mask string) []Checker
+	NewNicRfsChecker(nic network.Nic, mode irq.Mode, mask string) Checker
 	NewNicNTupleCheckers(interfaces []string) []Checker
 	NewNicNTupleChecker(nic network.Nic) Checker
 	NewNicXpsCheckers(interfaces []string) []Checker
@@ -39,10 +42,14 @@ type NetCheckersFactory interface {
 	NewRfsTableSizeChecker() Checker
 	NewListenBacklogChecker() Checker
 	NewSynBacklogChecker() Checker
+	// Check if all the interfaces run in dedicated mode and return the mask for
+	// computations if so. Empty string otherwise.
+	DedicatedMaskForComputations(interfaces []string) string
 }
 
 type netCheckersFactory struct {
 	fs             afero.Fs
+	t              config.RpkNodeTuners
 	irqProcFile    irq.ProcFile
 	irqDeviceInfo  irq.DeviceInfo
 	ethtool        ethtool.EthtoolWrapper
@@ -52,6 +59,7 @@ type netCheckersFactory struct {
 
 func NewNetCheckersFactory(
 	fs afero.Fs,
+	t config.RpkNodeTuners,
 	irqProcFile irq.ProcFile,
 	irqDeviceInfo irq.DeviceInfo,
 	ethtool ethtool.EthtoolWrapper,
@@ -60,6 +68,7 @@ func NewNetCheckersFactory(
 ) NetCheckersFactory {
 	return &netCheckersFactory{
 		fs:             fs,
+		t:              t,
 		irqProcFile:    irqProcFile,
 		irqDeviceInfo:  irqDeviceInfo,
 		ethtool:        ethtool,
@@ -68,12 +77,78 @@ func NewNetCheckersFactory(
 	}
 }
 
-func (f *netCheckersFactory) NewNicIRQAffinityStaticChecker(
+func (f *netCheckersFactory) DedicatedMaskForComputations(interfaces []string) string {
+	for _, ifaceName := range interfaces {
+		nic := network.NewNic(f.fs, f.irqProcFile, f.irqDeviceInfo, f.ethtool, ifaceName)
+		mode, err := network.GetDefaultMode(nic, "all", f.cpuMasks, f.t)
+		if err != nil {
+			return ""
+		}
+		if mode != irq.Dedicated {
+			return ""
+		}
+	}
+
+	mask, err := f.cpuMasks.CPUMaskForComputations(irq.Dedicated, "all", f.t)
+	if err != nil {
+		return ""
+	}
+	return mask
+}
+
+func (f *netCheckersFactory) NewNicRxTxQueueCountChecker(
+	nic network.Nic, mode irq.Mode, cpuMask string,
+) Checker {
+	return NewEqualityChecker(
+		NicRxTxQueueCountChecker,
+		fmt.Sprintf("NIC %s RX/TX queue count set", nic.Name()),
+		Warning,
+		true,
+		func() (interface{}, error) {
+			if !f.t.GetAllowRxTxQueueTuner() {
+				zap.L().Sugar().Debugf("Skipping RX/TX Queue Tuner as it's disabled by configuration")
+				return true, nil
+			}
+
+			supportsIrqLowering, err := nic.SupportsRxTxQueueLowering()
+			if err != nil {
+				return false, err
+			}
+			if !supportsIrqLowering {
+				zap.L().Sugar().Debugf("Skipping RX/TX Queue Tuner as using an unknown driver")
+				return true, nil
+			}
+
+			currentChannels, targetChannels, err := network.GetCurrentAndTargetChannels(nic, mode, cpuMask, f.cpuMasks, f.t, f.ethtool)
+			if err != nil {
+				return false, err
+			}
+
+			rxCheck := currentChannels.RxCount == targetChannels.RxCount
+			txCheck := currentChannels.TxCount == targetChannels.TxCount
+			combinedCheck := currentChannels.CombinedCount == targetChannels.CombinedCount
+
+			// We need all to be true because for the not in use one the check will always be true (0 == 0)
+			return rxCheck && txCheck && combinedCheck, nil
+		},
+	)
+}
+
+func (f *netCheckersFactory) NewNicRxTxQueueCountCheckers(
+	interfaces []string, mode irq.Mode, cpuMask string,
+) []Checker {
+	return f.forNonVirtualInterfaces(interfaces,
+		func(nic network.Nic) Checker {
+			return f.NewNicRxTxQueueCountChecker(nic, mode, cpuMask)
+		})
+}
+
+func (f *netCheckersFactory) NewNicIRQBalanceChecker(
 	interfaces []string,
 ) Checker {
 	return NewEqualityChecker(
-		NicIRQsAffinitStaticChecker,
-		"NIC IRQs affinity static",
+		NicIRQBalanceChecker,
+		"NIC IRQs excluded in irqbalance",
 		Warning,
 		true,
 		func() (interface{}, error) {
@@ -102,7 +177,7 @@ func (f *netCheckersFactory) NewNicIRQAffinityChecker(
 		func() (interface{}, error) {
 			return isSet(nic, func(currentNic network.Nic) (bool, error) {
 				dist, err := network.GetHwInterfaceIRQsDistribution(
-					currentNic, mode, cpuMask, f.cpuMasks)
+					currentNic, mode, cpuMask, f.cpuMasks, f.t)
 				if err != nil {
 					return false, err
 				}
@@ -157,7 +232,7 @@ func (f *netCheckersFactory) NewNicRpsSetChecker(
 				if err != nil {
 					return false, err
 				}
-				rfsMask, err := network.GetRpsCPUMask(nic, mode, cpuMask, f.cpuMasks)
+				rfsMask, err := network.GetRpsCPUMask(nic, mode, cpuMask, f.cpuMasks, f.t)
 				if err != nil {
 					return false, err
 				}
@@ -180,11 +255,14 @@ func (f *netCheckersFactory) NewNicRpsSetChecker(
 	)
 }
 
-func (f *netCheckersFactory) NewNicRfsCheckers(interfaces []string) []Checker {
-	return f.forNonVirtualInterfaces(interfaces, f.NewNicRfsChecker)
+func (f *netCheckersFactory) NewNicRfsCheckers(interfaces []string, mode irq.Mode, cpuMask string) []Checker {
+	return f.forNonVirtualInterfaces(interfaces,
+		func(nic network.Nic) Checker {
+			return f.NewNicRfsChecker(nic, mode, cpuMask)
+		})
 }
 
-func (f *netCheckersFactory) NewNicRfsChecker(nic network.Nic) Checker {
+func (f *netCheckersFactory) NewNicRfsChecker(nic network.Nic, mode irq.Mode, cpuMask string) Checker {
 	return NewEqualityChecker(
 		NicRfsChecker,
 		fmt.Sprintf("NIC %s RFS set", nic.Name()),
@@ -193,7 +271,10 @@ func (f *netCheckersFactory) NewNicRfsChecker(nic network.Nic) Checker {
 		func() (interface{}, error) {
 			return isSet(nic, func(currentNic network.Nic) (bool, error) {
 				limits, err := currentNic.GetRpsLimitFiles()
-				queueLimit := network.OneRPSQueueLimit(limits)
+				if err != nil {
+					return false, err
+				}
+				queueLimit, err := network.OneRPSQueueLimit(limits, nic, mode, cpuMask, f.cpuMasks, f.t)
 				if err != nil {
 					return false, err
 				}

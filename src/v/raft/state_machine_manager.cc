@@ -23,6 +23,7 @@
 #include "serde/rw/rw.h"
 #include "ssx/future-util.h"
 #include "ssx/semaphore.h"
+#include "ssx/watchdog.h"
 #include "storage/snapshot.h"
 #include "storage/types.h"
 #include "utils/mutex.h"
@@ -159,14 +160,17 @@ state_machine_manager::named_stm::named_stm(ss::sstring name, stm_ptr stm)
   , stm(std::move(stm)) {}
 
 state_machine_manager::state_machine_manager(
-  consensus* raft, std::vector<named_stm> stms, ss::scheduling_group apply_sg)
+  consensus* raft,
+  std::vector<named_stm> stms,
+  ss::scheduling_group apply_sg,
+  config::binding<std::chrono::milliseconds> stm_shutdown_timeout)
   : _raft(raft)
   , _log(ctx_log(_raft->group(), _raft->ntp()))
   , _apply_sg(apply_sg)
   , _initial_recovery_snapshot_mgr(
       std::filesystem::path(_raft->log_config().work_directory()),
-      "stm_manager.snapshot",
-      ss::default_priority_class()) {
+      "stm_manager.snapshot")
+  , _stm_shutdown_timeout(std::move(stm_shutdown_timeout)) {
     for (auto& n_stm : stms) {
         _supports_snapshot_at_offset
           = _supports_snapshot_at_offset
@@ -231,6 +235,19 @@ ss::future<> state_machine_manager::start() {
     });
 }
 
+ss::future<> state_machine_manager::do_stop_stm(entry_ptr entry) {
+    ssx::watchdog wd(
+      _stm_shutdown_timeout(), [ntp = _raft->ntp(), name = entry->name] {
+          vlog(
+            raftlog.error,
+            "[{}] Timedout waiting for {} state machine to stop",
+            ntp,
+            name);
+      });
+    // stop the state machine
+    co_await entry->stm->stop();
+}
+
 ss::future<> state_machine_manager::stop() {
     vlog(
       _log.debug,
@@ -241,7 +258,7 @@ ss::future<> state_machine_manager::stop() {
 
     auto gate_f = _gate.close();
     co_await ss::coroutine::parallel_for_each(
-      _machines, [](auto p) { return p.second->stm->stop(); });
+      _machines, [this](auto p) { return do_stop_stm(p.second); });
     co_await std::move(gate_f);
 }
 
@@ -517,8 +534,8 @@ ss::future<> state_machine_manager::try_apply_in_foreground() {
          * Use default priority for now, it is going to be unified with apply
          * scheduling group soon
          */
-        storage::log_reader_config config(
-          _next, _raft->committed_offset(), ss::default_priority_class());
+        auto config = storage::local_log_reader_config(
+          _next, _raft->committed_offset());
 
         model::record_batch_reader reader = co_await _raft->make_reader(config);
 
@@ -553,7 +570,7 @@ ss::future<> state_machine_manager::try_apply_in_foreground() {
     }
 }
 
-ss::future<> state_machine_manager::apply() {
+ss::future<> state_machine_manager::apply() noexcept {
     /**
      * If any of the state machine is behind, dispatch background apply fibers
      */
@@ -587,8 +604,21 @@ void state_machine_manager::maybe_start_background_apply(
         return entry->background_apply_mutex.get_units().then(
           [this, entry](auto u) {
               return ss::with_scheduling_group(
-                _apply_sg, [this, entry, u = std::move(u)]() mutable {
-                    return background_apply_fiber(entry, std::move(u));
+                       _apply_sg,
+                       [this, entry, u = std::move(u)]() mutable {
+                           return background_apply_fiber(entry, std::move(u));
+                       })
+                .handle_exception([this](const std::exception_ptr& e) {
+                    if (ssx::is_shutdown_exception(e)) {
+                        vlog(
+                          _log.debug,
+                          "background_apply_fiber exited due to shutdown "
+                          "exception {}",
+                          e);
+                    } else {
+                        vlog(
+                          _log.warn, "unexpected error in the bg fiber: {}", e);
+                    }
                 });
           });
     });
@@ -624,17 +654,17 @@ ss::future<> state_machine_manager::background_apply_fiber(
             if (fut.failed()) {
                 const auto e = fut.get_exception();
                 // do not log known shutdown exceptions as errors
-                if (!ssx::is_shutdown_exception(e)) {
+                if (ssx::is_shutdown_exception(e)) {
+                    std::rethrow_exception(e);
+                } else {
                     vlog(_log.error, "error applying raft snapshot - {}", e);
+                    co_await ss::sleep_abortable(100ms, _as);
                 }
-                std::rethrow_exception(e);
             }
             continue;
         }
-        storage::log_reader_config config(
-          entry->stm->next(),
-          model::prev_offset(_next),
-          ss::default_priority_class());
+        auto config = storage::local_log_reader_config(
+          entry->stm->next(), model::prev_offset(_next));
 
         vlog(
           _log.debug,
@@ -689,11 +719,12 @@ state_machine_manager::take_snapshot(model::offset last_included_offset) {
       "taking snapshot with last included offset: {}",
       last_included_offset);
     if (last_included_offset < _raft->start_offset()) {
-        throw std::logic_error(fmt::format(
-          "Can not take snapshot of a state from before raft start offset. "
-          "Requested offset: {}, start offset: {}",
-          last_included_offset,
-          _raft->start_offset()));
+        throw std::logic_error(
+          fmt::format(
+            "Can not take snapshot of a state from before raft start offset. "
+            "Requested offset: {}, start offset: {}",
+            last_included_offset,
+            _raft->start_offset()));
     }
     auto holder = _gate.hold();
     // wait for all STMs to be on the same page
@@ -706,7 +737,8 @@ state_machine_manager::take_snapshot(model::offset last_included_offset) {
     managed_snapshot snapshot;
     co_await ss::coroutine::parallel_for_each(
       _machines, [last_included_offset, &snapshot](auto entry_pair) {
-          return entry_pair.second->stm->take_snapshot(last_included_offset)
+          return entry_pair.second->stm
+            ->take_raft_snapshot(last_included_offset)
             .then([&snapshot, key = entry_pair.first](auto snapshot_part) {
                 snapshot.snapshot_map.try_emplace(
                   key, std::move(snapshot_part));
@@ -725,11 +757,12 @@ state_machine_manager::take_snapshot() {
 
     auto u = co_await _apply_mutex.get_units();
     if (last_applied() < _raft->start_offset()) {
-        throw std::logic_error(fmt::format(
-          "Can not take snapshot of a state from before raft start offset. "
-          "Requested offset: {}, start offset: {}",
-          last_applied(),
-          _raft->start_offset()));
+        throw std::logic_error(
+          fmt::format(
+            "Can not take snapshot of a state from before raft start offset. "
+            "Requested offset: {}, start offset: {}",
+            last_applied(),
+            _raft->start_offset()));
     }
     // wait once again for all state machines to finish applying batches
     co_await wait(last_applied(), model::no_timeout, _as);
@@ -739,7 +772,7 @@ state_machine_manager::take_snapshot() {
     managed_snapshot snapshot;
     co_await ss::coroutine::parallel_for_each(
       _machines, [snapshot_offset, &snapshot](auto entry_pair) {
-          return entry_pair.second->stm->take_snapshot(snapshot_offset)
+          return entry_pair.second->stm->take_raft_snapshot(snapshot_offset)
             .then([&snapshot, key = entry_pair.first](auto snapshot_part) {
                 snapshot.snapshot_map.try_emplace(
                   key, std::move(snapshot_part));

@@ -9,6 +9,7 @@
 
 #include "bytes/iobuf.h"
 
+#include "base/units.h"
 #include "base/vassert.h"
 #include "bytes/details/io_allocation_size.h"
 
@@ -58,6 +59,7 @@ iobuf iobuf_copy(iobuf::iterator_consumer& in, size_t len) {
     return ret;
 }
 
+iobuf iobuf::share() { return share(0, size_bytes()); }
 iobuf iobuf::share(size_t pos, size_t len) {
     iobuf ret;
     size_t left = len;
@@ -81,6 +83,23 @@ iobuf iobuf::share(size_t pos, size_t len) {
         pos = 0;
     }
     return ret;
+}
+
+iobuf iobuf::tail(size_t size) {
+    if (size > _size) [[unlikely]] {
+        throw std::out_of_range(
+          fmt::format(
+            "iobuf::tail requested size {} larger than iobuf size {}",
+            size,
+            _size));
+    }
+    iobuf out;
+    for (auto it = rbegin(); it != rend() && size > 0; ++it) {
+        size_t amt = std::min(size, it->size());
+        size -= amt;
+        out.prepend(it->share(it->size() - amt, amt));
+    }
+    return out;
 }
 
 bool iobuf::operator==(const iobuf& o) const {
@@ -140,7 +159,7 @@ bool iobuf::operator==(std::string_view o) const {
     bool are_equal = true;
     std::string_view::size_type n = 0;
     auto in = iobuf::iterator_consumer(cbegin(), cend());
-    (void)in.consume(
+    std::ignore = in.consume(
       size_bytes(), [&are_equal, &o, &n](const char* src, size_t fg_sz) {
           /// Both strings are equiv in total size, so its safe to assume the
           /// next chunk to compare is the remaining to cmp or the fragment size
@@ -152,6 +171,24 @@ bool iobuf::operator==(std::string_view o) const {
           return !are_equal ? ss::stop_iteration::yes : ss::stop_iteration::no;
       });
     return are_equal;
+}
+
+std::strong_ordering iobuf::operator<=>(std::string_view o) const {
+    std::strong_ordering cmp = std::strong_ordering::equal;
+    auto in = iobuf::iterator_consumer(cbegin(), cend());
+    std::string_view other = o;
+    std::ignore = in.consume(
+      std::min(size_bytes(), o.size()),
+      [&cmp, &other](const char* src, size_t fg_sz) {
+          cmp = std::string_view(src, fg_sz) <=> other;
+          other.remove_prefix(std::min(fg_sz, other.size()));
+          return cmp == std::strong_ordering::equal ? ss::stop_iteration::yes
+                                                    : ss::stop_iteration::no;
+      });
+    if (cmp == std::strong_ordering::equal) {
+        cmp = size_bytes() <=> o.size();
+    }
+    return cmp;
 }
 
 /**
@@ -241,4 +278,18 @@ iobuf::placeholder iobuf::reserve(size_t sz) {
     placeholder p(back, back.size(), sz);
     back.reserve(sz);
     return p;
+}
+
+ss::sstring iobuf::linearize_to_string() const {
+    constexpr static size_t max_size = 128_KiB;
+    if (size_bytes() > max_size) {
+        throw std::runtime_error(
+          fmt::format("string too big: {}", size_bytes()));
+    }
+    ss::sstring out{ss::sstring::initialized_later{}, size_bytes()};
+    auto it = out.begin();
+    for (const auto& frag : *this) {
+        it = std::copy_n(frag.get(), frag.size(), it);
+    }
+    return out;
 }

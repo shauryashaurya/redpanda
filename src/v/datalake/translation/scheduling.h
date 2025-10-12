@@ -9,6 +9,7 @@
  */
 #pragma once
 
+#include "absl/container/btree_map.h"
 #include "config/property.h"
 #include "container/chunked_hash_map.h"
 #include "container/intrusive_list_helpers.h"
@@ -18,8 +19,6 @@
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/condition-variable.hh>
 #include <seastar/core/gate.hh>
-
-#include <absl/container/btree_map.h>
 
 namespace datalake::translation::scheduling {
 
@@ -185,11 +184,6 @@ public:
      * Maybe concurrently called with \ref translator::start.
      */
     virtual ss::future<> close() noexcept = 0;
-
-    /**
-     * Invoked when any of the translation related properties are altered.
-     */
-    virtual void reconcile_properties() noexcept = 0;
 
     /**
      * Current status of the translation.

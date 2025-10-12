@@ -11,6 +11,9 @@
 
 #include "pandaproxy/schema_registry/protobuf.h"
 
+#include "absl/container/flat_hash_set.h"
+#include "absl/strings/ascii.h"
+#include "absl/strings/escaping.h"
 #include "base/vlog.h"
 #include "bytes/streambuf.h"
 #include "kafka/protocol/errors.h"
@@ -23,12 +26,10 @@
 #include "utils/base64.h"
 
 #include <seastar/core/coroutine.hh>
+#include <seastar/core/memory.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/util/variant_utils.hh>
 
-#include <absl/container/flat_hash_set.h>
-#include <absl/strings/ascii.h>
-#include <absl/strings/escaping.h>
 #include <boost/algorithm/string/trim.hpp>
 #include <boost/range/combine.hpp>
 #include <confluent/meta.pb.h>
@@ -45,7 +46,7 @@
 #include <google/protobuf/empty.pb.h>
 #include <google/protobuf/field_mask.pb.h>
 #include <google/protobuf/io/tokenizer.h>
-#include <google/protobuf/io/zero_copy_stream.h>
+#include <google/protobuf/io/zero_copy_stream_impl.h>
 #include <google/protobuf/source_context.pb.h>
 #include <google/protobuf/struct.pb.h>
 #include <google/protobuf/timestamp.pb.h>
@@ -92,7 +93,7 @@ struct descriptor_hasher {
     using is_transparent = void;
 
     std::size_t operator()(const pb::FileDescriptor* s) const {
-        return absl::Hash<std::string>()(s->name());
+        return absl::Hash<std::string_view>()(s->name());
     }
     std::size_t operator()(const ss::sstring& s) const {
         return absl::Hash<ss::sstring>()(s);
@@ -186,13 +187,14 @@ public:
       const pb::Message* descriptor,
       ErrorLocation location,
       std::string_view message) final {
-        _errors.emplace_back(err{
-          level::error,
-          ss::sstring{filename},
-          ss::sstring{element_name},
-          descriptor,
-          location,
-          ss::sstring{message}});
+        _errors.emplace_back(
+          err{
+            level::error,
+            ss::sstring{filename},
+            ss::sstring{element_name},
+            descriptor,
+            location,
+            ss::sstring{message}});
     }
 
     void RecordWarning(
@@ -201,13 +203,14 @@ public:
       const pb::Message* descriptor,
       ErrorLocation location,
       std::string_view message) final {
-        _errors.emplace_back(err{
-          level::warn,
-          ss::sstring{filename},
-          ss::sstring{element_name},
-          descriptor,
-          location,
-          ss::sstring{message}});
+        _errors.emplace_back(
+          err{
+            level::warn,
+            ss::sstring{filename},
+            ss::sstring{element_name},
+            descriptor,
+            location,
+            ss::sstring{message}});
     }
 
     error_info error(std::string_view sub) const;
@@ -454,6 +457,7 @@ ss::future<pb::FileDescriptorProto> build_file_with_refs(
         }
     }
 
+    ss::memory::scoped_system_alloc_fallback fb;
     parser p;
     auto new_fdp = p.parse(schema);
     normalize_imports(new_fdp, norm);
@@ -513,7 +517,7 @@ struct protobuf_schema_definition::impl {
      * messages
      */
     ss::sstring debug_string() const {
-        // TODO BP: Prevent this linearization
+        ss::memory::scoped_system_alloc_fallback fb;
         auto s = fd->DebugString();
 
         // reordering not required if no package or no dependencies
@@ -546,13 +550,21 @@ struct protobuf_schema_definition::impl {
           "{}\n{}\n\n{}\n\n{}\n", header, package, imports, footer);
     }
 
-    schema_definition::raw_string raw() const {
+    schema_definition::raw_string raw(output_format format) const {
+        if (format == output_format::serialized) {
+            iobuf_ostream ios;
+            fdp.SerializeToOstream(&ios.ostream());
+
+            return schema_definition::raw_string{
+              iobuf_to_base64(std::move(ios).buf())};
+        }
         return schema_definition::raw_string{debug_string()};
     }
 };
 
-schema_definition::raw_string protobuf_schema_definition::raw() const {
-    return _impl->raw();
+schema_definition::raw_string
+protobuf_schema_definition::raw(output_format format) const {
+    return _impl->raw(format);
 }
 
 ::result<ss::sstring, kafka::error_code>
@@ -561,7 +573,7 @@ protobuf_schema_definition::name(const std::vector<int>& fields) const {
     if (d.has_error()) {
         return d.error();
     }
-    return d.value().get().full_name();
+    return ss::sstring(d.value().get().full_name());
 }
 
 ::result<
@@ -634,18 +646,40 @@ ss::future<protobuf_schema_definition> make_protobuf_schema_definition(
 }
 
 ss::future<schema_definition> validate_protobuf_schema(
-  sharded_store& store, subject_schema schema, normalize norm) {
+  sharded_store& store,
+  subject_schema schema,
+  normalize norm,
+  output_format format) {
     auto res = co_await make_protobuf_schema_definition(
       store, std::move(schema), norm);
-    co_return schema_definition{std::move(res)};
+    co_return schema_definition{res.raw(format), res.type(), res.refs()};
 }
 
 ss::future<subject_schema> make_canonical_protobuf_schema(
-  sharded_store& store, subject_schema schema, normalize norm) {
+  sharded_store& store,
+  subject_schema schema,
+  normalize norm,
+  output_format format) {
     subject sub = schema.sub();
     co_return subject_schema{
       std::move(sub),
-      co_await validate_protobuf_schema(store, std::move(schema), norm)};
+      co_await validate_protobuf_schema(
+        store, std::move(schema), norm, format)};
+}
+
+ss::future<schema_definition> format_protobuf_schema_definition(
+  sharded_store& store, schema_definition schema, output_format format) {
+    switch (format) {
+    case output_format::ignore_extensions:
+        throw as_exception(format_not_supported(format));
+    case output_format::serialized: {
+        auto serialized = co_await make_canonical_protobuf_schema(
+          store, {{}, std::move(schema)}, normalize::no, format);
+        co_return std::move(serialized).def();
+    }
+    default:
+        co_return std::move(schema);
+    }
 }
 
 namespace {

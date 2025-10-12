@@ -88,10 +88,14 @@ public:
       : sr(cloud_io::scoped_remote::create(10, conf))
       , storage(dummy_storage(feature_table))
       , catalog(remote(), bucket_name, ss::sstring(base_location))
-      , schema_mgr(catalog)
+      , schema_mgr(
+          catalog,
+          [this] {
+              feature_table.start().get();
+              return &feature_table.local();
+          }())
       , manifest_io(remote(), bucket_name)
       , committer(storage, catalog, manifest_io, config::mock_binding(false)) {
-        feature_table.start().get();
         feature_table
           .invoke_on_all(
             [](features::feature_table& f) { f.testing_activate_all(); })
@@ -306,10 +310,10 @@ TEST_P(FileCommitterPartitionTest, TestFilesGetPartitionKey) {
                         int min_hour,
                         int max_hour,
                         chunked_vector<manifest_file>& ret) {
-        auto load_res = catalog
-                          .load_table(iceberg::table_identifier{
-                            {"redpanda"}, "test-topic"})
-                          .get();
+        auto load_res
+          = catalog
+              .load_table(iceberg::table_identifier{{"redpanda"}, "test-topic"})
+              .get();
         ASSERT_FALSE(load_res.has_error());
         auto lb_matcher = [min_hour, max_hour](const manifest_file& file) {
             auto val = std::get<int_value>(
@@ -494,11 +498,12 @@ TEST_F(FileCommitterTest, TestDeduplicateFromAncestor) {
       .partition = std::move(pk),
       .file_size_bytes = 1024,
     };
-    new_files.emplace_back(iceberg::file_to_append{
-      .file = std::move(icb_file),
-      .schema_id = tx.table().current_schema_id,
-      .partition_spec_id = tx.table().default_spec_id,
-    });
+    new_files.emplace_back(
+      iceberg::file_to_append{
+        .file = std::move(icb_file),
+        .schema_id = tx.table().current_schema_id,
+        .partition_spec_id = tx.table().default_spec_id,
+      });
     auto append_res = tx.merge_append(manifest_io, std::move(new_files)).get();
     ASSERT_FALSE(append_res.has_error());
     EXPECT_FALSE(

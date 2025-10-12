@@ -236,6 +236,7 @@ func (factory *tunersFactory) newNetworkTuner(
 	}
 	return tuners.NewNetTuner(
 		irq.ModeFromString(params.Mode),
+		factory.t,
 		params.CPUMask,
 		params.Nics,
 		factory.fs,
@@ -293,8 +294,8 @@ func (factory *tunersFactory) newBallastFileTuner(
 func MergeTunerParamsConfig(params *TunerParams, y *config.RedpandaYaml) (*TunerParams, error) {
 	if len(params.Nics) == 0 {
 		addrs := []string{y.Redpanda.RPCServer.Address}
-		if len(y.Redpanda.KafkaAPI) > 0 {
-			addrs = append(addrs, y.Redpanda.KafkaAPI[0].Address)
+		for _, address := range y.Redpanda.KafkaAPI {
+			addrs = append(addrs, address.Address)
 		}
 		nics, err := net.GetInterfacesByIps(
 			addrs...,
@@ -312,8 +313,8 @@ func MergeTunerParamsConfig(params *TunerParams, y *config.RedpandaYaml) (*Tuner
 
 func FillTunerParamsWithValuesFromConfig(params *TunerParams, y *config.RedpandaYaml) error {
 	addrs := []string{y.Redpanda.RPCServer.Address}
-	if len(y.Redpanda.KafkaAPI) > 0 {
-		addrs = append(addrs, y.Redpanda.KafkaAPI[0].Address)
+	for _, address := range y.Redpanda.KafkaAPI {
+		addrs = append(addrs, address.Address)
 	}
 	nics, err := net.GetInterfacesByIps(
 		addrs...,

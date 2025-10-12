@@ -36,6 +36,14 @@ namespace features {
 
 std::string_view to_string_view(feature f) {
     switch (f) {
+    case feature::iceberg_schema_merging:
+        return "iceberg_schema_merging";
+    case feature::validated_batch_timestamps:
+        return "validated_batch_timestamps";
+    case feature::consumer_groups_migrations:
+        return "consumer_groups_migrations";
+    case feature::shadow_linking:
+        return "shadow_linking";
     case feature::cloud_retention:
         return "cloud_retention";
     case feature::node_isolation:
@@ -104,6 +112,16 @@ std::string_view to_string_view(feature f) {
         return "cloud_storage_metadata_rw_fence";
     case feature::node_restart_risk_assessment:
         return "node_restart_risk_assessment";
+    case feature::topic_ids:
+        return "topic_ids";
+    case feature::topic_ids_api:
+        return "topic_ids_api";
+    case feature::kafka_data_rpc:
+        return "kafka_data_rpc";
+    case feature::topic_locations_in_outbound_migrations:
+        return "topic_locations_in_outbound_migrations";
+    case feature::schema_registry_authz:
+        return "schema_registry_authz";
 
     /*
      * testing features
@@ -147,10 +165,10 @@ constexpr cluster_version latest_version = to_cluster_version(
 // a freshly initialized node will start at. All features up to this cluster
 // version will automatically be enabled when Redpanda starts.
 constexpr cluster_version earliest_version = to_cluster_version(
-  release_version::v24_1_1);
+  release_version::v25_2_1);
 
 static_assert(
-  latest_version - earliest_version == 3L,
+  latest_version - earliest_version == 1L,
   "Consider upgrading the earliest_version in lockstep whenever you increment "
   "the latest_version");
 
@@ -182,6 +200,8 @@ bool is_major_version_release(cluster::cluster_version version) {
     case release_version::v24_2_1:
     case release_version::v24_3_1:
     case release_version::v25_1_1:
+    case release_version::v25_2_1:
+    case release_version::v25_3_1:
         return true;
     }
     __builtin_unreachable();
@@ -269,8 +289,9 @@ public:
               [&ft = _parent]() {
                   return calculate_expiry_metric(ft.get_license());
               },
-              sm::description("Number of seconds remaining until the "
-                              "Enterprise license expires"))
+              sm::description(
+                "Number of seconds remaining until the "
+                "Enterprise license expires"))
               .aggregate({sm::shard_label}),
           });
     }
@@ -295,7 +316,7 @@ make_builtin_trial_license(security::license::clock::time_point start_time) {
 
     return security::license{
       .format_version = 0,
-      .type = security::license_type::free_trial,
+      ._type = security::license_type::free_trial,
       .organization = "Redpanda Built-In Evaluation Period",
       .expiry = expiry,
       .checksum = "",
@@ -764,10 +785,11 @@ feature_table::decode_version_fence(model::record_batch batch) {
     auto& rec = records.front();
     auto key = serde::from_iobuf<ss::sstring>(rec.release_key());
     if (key != version_fence_batch_key) {
-        throw std::runtime_error(fmt::format(
-          "Version fence batch does not contain expected key {}: found {}",
-          version_fence_batch_key,
-          key));
+        throw std::runtime_error(
+          fmt::format(
+            "Version fence batch does not contain expected key {}: found {}",
+            version_fence_batch_key,
+            key));
     }
     return serde::from_iobuf<version_fence>(rec.release_value());
 }

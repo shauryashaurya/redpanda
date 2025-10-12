@@ -9,14 +9,18 @@
  * by the Apache License, Version 2.0
  */
 #pragma once
+#include "absl/container/flat_hash_map.h"
+#include "absl/container/node_hash_map.h"
 #include "base/seastarx.h"
 #include "config/property.h"
 #include "container/chunked_hash_map.h"
 #include "kafka/server/fwd.h"
+#include "kafka/server/handlers/details/security.h"
 #include "kafka/server/handlers/handler_probe.h"
 #include "kafka/server/logger.h"
 #include "net/connection.h"
 #include "net/server_probe.h"
+#include "proto/redpanda/core/admin/v2/kafka_connections.proto.h"
 #include "security/acl.h"
 #include "security/authorizer.h"
 #include "security/mtls.h"
@@ -34,9 +38,6 @@
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/net/socket_defs.hh>
-
-#include <absl/container/flat_hash_map.h>
-#include <absl/container/node_hash_map.h>
 
 #include <functional>
 #include <memory>
@@ -58,13 +59,6 @@ public:
     explicit sasl_session_expired_exception(const std::string& m)
       : std::runtime_error(m) {}
 };
-
-/*
- * authz failures should be quiet or logged at a reduced severity level.
- */
-using authz_quiet = ss::bool_class<struct authz_quiet_tag>;
-
-using audit_authz_check = ss::bool_class<struct audit_authz_check_tag>;
 
 struct request_header;
 class request_context;
@@ -114,8 +108,8 @@ struct request_data {
 // The resources in particular should be not be destroyed until
 // the request is complete (e.g., all the information written to
 // the socket so that no userspace buffers remain).
-struct session_resources {
-    using pointer = ss::lw_shared_ptr<session_resources>;
+struct request_resources {
+    using pointer = ss::lw_shared_ptr<request_resources>;
 
     ss::lowres_clock::duration backpressure_delay;
     ssx::semaphore_units memlocks;
@@ -124,6 +118,7 @@ struct session_resources {
     std::unique_ptr<handler_probe::hist_t::measurement> handler_latency;
     std::unique_ptr<request_tracker> tracker;
     request_data request_data;
+    ss::deleter response_resource_deleter;
 };
 using vcluster_connection_id
   = named_type<uint32_t, struct vcluster_connection_id_tag>;
@@ -184,11 +179,17 @@ public:
 
     template<typename T>
     security::auth_result authorized(
-      security::acl_operation operation, const T& name, authz_quiet quiet);
+      security::acl_operation operation,
+      const T& name,
+      authz_quiet quiet,
+      superuser_required superuser_required);
 
     bool authorized_auditor() const {
         return get_principal() == security::audit_principal;
     }
+
+    // Returns true if the user is a superuser or if authz is disabled
+    bool has_superuser_access() const;
 
     ss::future<> process();
     ss::future<> process_one_request();
@@ -200,13 +201,16 @@ public:
 
     bool tls_enabled() const { return conn->tls_enabled(); }
 
+    proto::admin::kafka_connection to_proto() const;
+
 private:
     template<typename T>
     security::auth_result authorized_user(
       security::acl_principal principal,
       security::acl_operation operation,
       const T& name,
-      authz_quiet quiet);
+      authz_quiet quiet,
+      superuser_required superuser_required);
 
     security::acl_principal get_principal() const {
         if (_mtls_state) {
@@ -252,8 +256,8 @@ private:
     // currently.
     // When the returned future resolves, the throttling period is over and
     // the associated resouces have been obtained and are tracked by the
-    // contained session_resources object.
-    ss::future<session_resources>
+    // contained request_resources object.
+    ss::future<request_resources>
     throttle_request(request_data r_data, size_t sz);
 
     ss::future<> do_process(request_context);
@@ -266,7 +270,7 @@ private:
      */
     struct response_and_resources {
         response_ptr response;
-        session_resources::pointer resources;
+        request_resources::pointer resources;
     };
 
     using sequence_id = named_type<uint64_t, struct kafka_protocol_sequence>;
@@ -354,7 +358,7 @@ private:
         ss::future<> process_request(
           ss::lw_shared_ptr<connection_context>,
           request_context,
-          ss::lw_shared_ptr<session_resources>);
+          ss::lw_shared_ptr<request_resources>);
 
         /**
          * Checks if the request that currently is being processed is the first
@@ -384,7 +388,7 @@ private:
         ss::future<> handle_response(
           ss::lw_shared_ptr<connection_context>,
           ss::future<response_ptr>,
-          ss::lw_shared_ptr<session_resources>,
+          ss::lw_shared_ptr<request_resources>,
           sequence_id,
           correlation_id);
 
@@ -423,7 +427,7 @@ private:
         ss::future<> process_request(
           ss::lw_shared_ptr<connection_context>,
           request_context,
-          ss::lw_shared_ptr<session_resources>);
+          ss::lw_shared_ptr<request_resources>);
 
     private:
         client_protocol_state _state;

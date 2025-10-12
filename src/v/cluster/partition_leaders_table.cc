@@ -9,6 +9,7 @@
 
 #include "cluster/partition_leaders_table.h"
 
+#include "absl/container/btree_map.h"
 #include "cluster/cluster_utils.h"
 #include "cluster/logger.h"
 #include "cluster/topic_table.h"
@@ -22,20 +23,16 @@
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/coroutine/maybe_yield.hh>
 
-#include <absl/container/btree_map.h>
-
 #include <optional>
 
 namespace cluster {
 
 partition_leaders_table::partition_leaders_table(
-  ss::sharded<topic_table>& topic_table)
-  : _topic_table(topic_table) {}
+  ss::sharded<topic_table>& topic_table, ss::sharded<ss::abort_source>& as)
+  : _topic_table(topic_table)
+  , _as(as.local()) {}
 
-ss::future<> partition_leaders_table::stop() {
-    _as.request_abort();
-    return _gate.close();
-}
+ss::future<> partition_leaders_table::stop() { return _gate.close(); }
 
 std::optional<
   std::reference_wrapper<const partition_leaders_table::leader_meta>>
@@ -105,8 +102,7 @@ ss::future<> partition_leaders_table::update_with_node_report(
           = _topic_table.local().last_applied_revision();
         co_await ssx::async_for_each_counter(
           counter,
-          partitions.begin(),
-          partitions.end(),
+          partitions | std::views::values,
           [&](const partition_status& p) {
               if (!p.leader_id.has_value()) {
                   return;
@@ -316,7 +312,8 @@ ss::future<model::node_id> partition_leaders_table::wait_for_leader(
     auto holder = _gate.hold();
     auto promise = ss::make_lw_shared<expiring_promise<model::node_id>>();
     auto n_id = register_leadership_change_notification(
-      ntp, [promise](model::ntp, model::term_id, model::node_id leader_id) {
+      ntp,
+      [promise](const model::ntp&, model::term_id, model::node_id leader_id) {
           promise->set_value(leader_id);
       });
 

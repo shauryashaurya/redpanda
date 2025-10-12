@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "absl/container/flat_hash_map.h"
 #include "cluster/fwd.h"
 #include "cluster/state_machine_registry.h"
 #include "model/fundamental.h"
@@ -19,8 +20,6 @@
 #include "raft/persisted_stm.h"
 #include "raft/state_machine.h"
 #include "utils/mutex.h"
-
-#include <absl/container/flat_hash_map.h>
 
 namespace config {
 struct configuration;
@@ -44,7 +43,9 @@ public:
     ss::future<stm_allocation_result>
     allocate_id(model::timeout_clock::duration timeout);
 
-    ss::future<iobuf> take_snapshot(model::offset) final { co_return iobuf{}; }
+    ss::future<iobuf> take_raft_snapshot(model::offset) final {
+        co_return iobuf{};
+    }
 
     ss::future<stm_allocation_result>
     reset_next_id(int64_t, model::timeout_clock::duration timeout);
@@ -108,7 +109,7 @@ private:
     // Moves the state forward to the given value if the curent id is lower
     // than it.
     ss::future<stm_allocation_result>
-      advance_state(int64_t, model::timeout_clock::duration);
+    advance_state(int64_t, model::timeout_clock::duration);
 
     ss::future<> write_snapshot();
     ss::future<raft::local_snapshot_applied>

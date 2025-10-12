@@ -53,9 +53,23 @@ ss::httpd::migration_json::namespaced_topic to_admin_type(
     ss::httpd::migration_json::namespaced_topic ret;
     ret.ns = tp_ns.ns;
     ret.topic = cloud_storage_location
-                  ? ss::sstring(fmt::format(
-                      "{}/{}", tp_ns.tp, cloud_storage_location->hint))
+                  ? ss::sstring(
+                      fmt::format(
+                        "{}/{}", tp_ns.tp, cloud_storage_location->hint))
                   : tp_ns.tp;
+    return ret;
+}
+
+ss::httpd::migration_json::outbound_topic to_admin_type(
+  const model::topic_namespace& tp_ns,
+  const cluster::data_migrations::topic_location* tp_loc) {
+    ss::httpd::migration_json::outbound_topic ret;
+    ret.ns = tp_ns.ns;
+    ret.topic = tp_ns.tp;
+    if (tp_loc && tp_loc->location) {
+        ret.remote_location = ssx::sformat(
+          "{}/{}", tp_loc->remote_topic.tp, tp_loc->location->hint);
+    }
     return ret;
 }
 
@@ -87,8 +101,22 @@ to_admin_type(const cluster::data_migrations::outbound_migration& odm) {
     using migration_type_enum = ss::httpd::migration_json::outbound_migration::
       outbound_migration_migration_type;
     migration.migration_type = migration_type_enum::outbound;
-    for (auto& t : odm.topics) {
-        migration.topics.push(to_admin_type(t));
+
+    if (!(odm.topic_locations.empty()
+          || odm.topic_locations.size() == odm.topics.size())) {
+        // topic_locations should be either empty (written by pre-v25.2
+        // redpanda) or have the same size as topics
+        throw std::runtime_error(
+          fmt::format(
+            "unexpected migration topic locations size: {}, expected: {}",
+            odm.topic_locations.size(),
+            odm.topics.size()));
+    }
+
+    for (size_t i = 0; i < odm.topics.size(); ++i) {
+        const auto* loc = !odm.topic_locations.empty() ? &odm.topic_locations[i]
+                                                       : nullptr;
+        migration.topics.push(to_admin_type(odm.topics[i], loc));
     }
     for (auto& cg : odm.groups) {
         migration.consumer_groups.push(cg);
@@ -135,7 +163,7 @@ void write_migration_as_json(
 }
 
 json::validator make_migration_validator() {
-    const std::string schema = R"(
+    const std::string_view schema = R"(
 {
     "$schema": "http://json-schema.org/draft-04/schema#",
     "type": "object",

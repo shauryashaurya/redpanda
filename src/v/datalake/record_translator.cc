@@ -9,6 +9,7 @@
  */
 #include "datalake/record_translator.h"
 
+#include "absl/container/flat_hash_set.h"
 #include "base/vlog.h"
 #include "datalake/logger.h"
 #include "datalake/record_schema_resolver.h"
@@ -17,12 +18,12 @@
 #include "iceberg/compatibility_utils.h"
 #include "iceberg/conversion/conversion_outcome.h"
 #include "iceberg/conversion/values_avro.h"
+#include "iceberg/conversion/values_json.h"
 #include "iceberg/conversion/values_protobuf.h"
 #include "iceberg/datatypes.h"
 #include "iceberg/values.h"
 #include "model/fundamental.h"
 
-#include <absl/container/flat_hash_set.h>
 #include <avro/Generic.hh>
 #include <avro/GenericDatum.hh>
 
@@ -42,6 +43,16 @@ struct value_translating_visitor {
     ss::future<iceberg::optional_value_outcome>
     operator()(const avro::ValidSchema& s) {
         auto value = co_await iceberg::deserialize_avro(
+          std::move(parsable_buf), s);
+        if (value.has_error()) {
+            co_return iceberg::optional_value_outcome(value.error());
+        }
+        co_return std::move(value.value());
+    }
+
+    ss::future<iceberg::optional_value_outcome>
+    operator()(const iceberg::json_conversion_ir& s) {
+        auto value = co_await iceberg::deserialize_json(
           std::move(parsable_buf), s);
         if (value.has_error()) {
             co_return iceberg::optional_value_outcome(value.error());
@@ -147,8 +158,9 @@ default_translator::translate_data(
 
 record_type key_value_translator::build_type(std::optional<resolved_type>) {
     auto ret_type = schemaless_struct_type();
-    ret_type.fields.emplace_back(iceberg::nested_field::create(
-      10, "value", iceberg::field_required::no, iceberg::binary_type{}));
+    ret_type.fields.emplace_back(
+      iceberg::nested_field::create(
+        10, "value", iceberg::field_required::no, iceberg::binary_type{}));
     return record_type{
       .comps = record_schema_components{
           .key_identifier = std::nullopt,
@@ -223,8 +235,9 @@ structured_data_translator::build_type(std::optional<resolved_type> val_type) {
                 auto& system_fields = std::get<iceberg::struct_type>(
                   ret_type.fields[0]->type);
                 // Use the next id of the system defaults.
-                system_fields.fields.emplace_back(iceberg::nested_field::create(
-                  10, "data", field->required, std::move(field->type)));
+                system_fields.fields.emplace_back(
+                  iceberg::nested_field::create(
+                    10, "data", field->required, std::move(field->type)));
                 continue;
             }
             // Add the extra user-defined fields.
@@ -270,11 +283,9 @@ structured_data_translator::translate_data(
       val_type->schema.get_schema_ref());
     if (translated_val.has_error()) {
         vlog(
-          datalake_log.error,
+          datalake_log.warn,
           "Error converting buffer: {}",
           translated_val.error());
-        // TODO: metric for data translation errors.
-        // Either needs to drop the data or send it to a dead-letter queue.
         co_return errc::translation_error;
     }
 

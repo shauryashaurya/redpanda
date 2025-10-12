@@ -1,5 +1,6 @@
 load("@bazel_skylib//rules:run_binary.bzl", "run_binary")
 load("@bazel_skylib//rules:write_file.bzl", "write_file")
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
 load("//bazel:build.bzl", "redpanda_cc_binary")
 load("//bazel:test.bzl", "redpanda_cc_bench", "redpanda_cc_gtest")
 
@@ -198,7 +199,7 @@ redpanda_cc_bench(
     ],
     deps = [
         "//src/v/bytes:random",
-        "//src/v/container:fragmented_vector",
+        "//src/v/container:chunked_vector",
         "//src/v/random:generators",
         "//src/v/serde/parquet:column_writer",
         "//src/v/serde/parquet:schema",

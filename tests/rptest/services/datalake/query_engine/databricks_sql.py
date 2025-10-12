@@ -25,7 +25,9 @@ class DatabricksSQL(Service, QueryEngineBase):
         catalog_type: CatalogType,
         catalog_name: str,
     ):
-        assert catalog_type == CatalogType.DATABRICKS_UNITY, "Only DATABRICKS_UNITY catalog type is supported"
+        assert catalog_type == CatalogType.DATABRICKS_UNITY, (
+            "Only DATABRICKS_UNITY catalog type is supported"
+        )
 
         super().__init__(ctx, num_nodes=0)
 
@@ -52,8 +54,11 @@ class DatabricksSQL(Service, QueryEngineBase):
 
     def count_parquet_files(self, namespace: str, table: str) -> int:
         raise NotImplementedError(
-            "DatabricksSQL count_parquet_files is not implemented yet")
+            "DatabricksSQL count_parquet_files is not implemented yet"
+        )
 
     def optimize_parquet_files(self, namespace: str, table: str) -> None:
-        raise NotImplementedError(
-            "DatabricksSQL optimize_parquet_files is not implemented yet")
+        result = self.run_query_fetch_one(
+            f"OPTIMIZE {self.escape_identifier(namespace)}.{self.escape_identifier(table)}"
+        )
+        self.logger.debug(f"OPTIMIZE result: {result}")

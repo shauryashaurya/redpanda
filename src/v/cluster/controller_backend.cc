@@ -9,6 +9,9 @@
 
 #include "cluster/controller_backend.h"
 
+#include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
+#include "absl/container/node_hash_map.h"
 #include "base/outcome.h"
 #include "base/vassert.h"
 #include "cloud_storage/remote_path_provider.h"
@@ -51,9 +54,6 @@
 #include <seastar/util/later.hh>
 #include <seastar/util/variant_utils.hh>
 
-#include <absl/container/flat_hash_map.h>
-#include <absl/container/flat_hash_set.h>
-#include <absl/container/node_hash_map.h>
 #include <fmt/ranges.h>
 
 #include <algorithm>
@@ -276,6 +276,8 @@ controller_backend::controller_backend(
   config::binding<std::optional<size_t>> retention_local_target_bytes_default,
   config::binding<std::chrono::milliseconds> retention_local_target_ms_default,
   config::binding<bool> retention_local_strict,
+  config::binding<uint32_t> controller_backend_reconciliation_concurrency,
+  ss::scheduling_group scheduling_group,
   ss::sharded<ss::abort_source>& as)
   : _topics(tp_state)
   , _shard_placement(shard_placement.local())
@@ -298,6 +300,9 @@ controller_backend::controller_backend(
   , _retention_local_target_ms_default(
       std::move(retention_local_target_ms_default))
   , _retention_local_strict(std::move(retention_local_strict))
+  , _controller_backend_reconciliation_concurrency(
+      std::move(controller_backend_reconciliation_concurrency))
+  , _scheduling_group(scheduling_group)
   , _as(as) {
     _housekeeping_interval.watch([this] {
         _housekeeping_jitter = simple_time_jitter<ss::lowres_clock>(
@@ -392,29 +397,38 @@ create_topic_table_snapshot(
 
 ss::future<> controller_backend::start() {
     setup_metrics();
-    return bootstrap_controller_backend().then([this] {
-        if (ss::this_shard_id() == cluster::controller_stm_shard) {
-            auto bootstrap_revision = _topics.local().last_applied_revision();
-            auto snapshot = create_topic_table_snapshot(_topics, _self);
-            ssx::spawn_with_gate(
-              _gate,
-              [this, bootstrap_revision, snapshot = std::move(snapshot)] {
-                  return clear_orphan_topic_files(
-                           bootstrap_revision, std::move(snapshot))
-                    .handle_exception([](const std::exception_ptr& err) {
-                        vlog(
-                          clusterlog.error,
-                          "Exception while cleaning orphan files {}",
-                          err);
-                    });
-              });
-        }
+    return ss::with_scheduling_group(_scheduling_group, [this] {
+        return bootstrap_controller_backend().then([this] {
+            if (ss::this_shard_id() == cluster::controller_stm_shard) {
+                auto bootstrap_revision
+                  = _topics.local().last_applied_revision();
+                auto snapshot = create_topic_table_snapshot(_topics, _self);
+                ssx::spawn_with_gate(
+                  _gate,
+                  [this, bootstrap_revision, snapshot = std::move(snapshot)] {
+                      return clear_orphan_topic_files(
+                               bootstrap_revision, std::move(snapshot))
+                        .handle_exception([](const std::exception_ptr& err) {
+                            vlog(
+                              clusterlog.error,
+                              "Exception while cleaning orphan files {}",
+                              err);
+                        });
+                  });
+            }
 
-        // unblock reconciliation fibers
-        constexpr size_t max_reconciliation_concurrency = 1024;
-        _reconciliation_sem.signal(max_reconciliation_concurrency);
+            // unblock reconciliation fibers
+            _reconciliation_sem.set_capacity(
+              _controller_backend_reconciliation_concurrency());
 
-        ssx::background = stuck_ntp_watchdog_fiber();
+            // register for any future updates
+            _controller_backend_reconciliation_concurrency.watch([this]() {
+                _reconciliation_sem.set_capacity(
+                  _controller_backend_reconciliation_concurrency());
+            });
+
+            ssx::background = stuck_ntp_watchdog_fiber();
+        });
     });
 }
 
@@ -491,12 +505,39 @@ controller_backend::calculate_learner_initial_offset(
      * Initial learner start offset only makes sense for partitions with cloud
      * storage data
      */
+    if (auto tp_cfg = p->get_topic_config();
+        tp_cfg.has_value() && tp_cfg->get().is_internal()) {
+        vlog(clusterlog.trace, "{} is part of an internal topic", p->ntp());
+        return std::nullopt;
+    }
+
     if (!p->cloud_data_available()) {
         vlog(clusterlog.trace, "no cloud data available for: {}", p->ntp());
         return std::nullopt;
     }
 
+    if (p->get_cloud_storage_mode() != cluster::cloud_storage_mode::full) {
+        vlog(
+          clusterlog.trace,
+          "cloud storage not fully enabled for: {}",
+          p->ntp());
+        return std::nullopt;
+    }
+
+    if (
+      config::shard_local_cfg().cloud_storage_enable_segment_uploads()
+      == false) {
+        vlog(clusterlog.trace, "segment uploads are paused");
+        return std::nullopt;
+    }
+
+    if (p->archival_meta_stm() == nullptr) {
+        vlog(clusterlog.trace, "no archival_meta_stm for {}", p->ntp());
+        return std::nullopt;
+    }
+
     auto log = p->log();
+
     /**
      * Calculate retention targets based on cluster and topic configuration
      */
@@ -569,27 +610,46 @@ controller_backend::calculate_learner_initial_offset(
           model::timestamp::now().value() - initial_retention_ms->count());
     }
 
-    auto retention_offset = log->retention_offset(storage::gc_config(
-      retention_timestamp_threshold, initial_retention_bytes));
+    auto retention_offset = log->retention_offset(
+      storage::gc_config(
+        retention_timestamp_threshold, initial_retention_bytes));
 
     if (!retention_offset) {
         return std::nullopt;
     }
 
-    const auto max_removable_local_log_offset
-      = p->max_removable_local_log_offset();
+    auto max_removable_local_log_offset = p->max_removable_local_log_offset();
+    auto archival_safe_removable
+      = p->archival_meta_stm()->cloud_recoverable_offset();
+
     /**
      * Last offset uploaded to the cloud is target learner retention upper
      * bound. We can not start retention recover from the point which is not yet
      * uploaded to Cloud Storage.
+     *
+     * In general max_removable_local_log_offset should not exceed
+     * last_uploaded, but can if, for example, archival is disabled or paused.
      */
+
+    if (max_removable_local_log_offset > archival_safe_removable) {
+        vlog(
+          clusterlog.info,
+          "[{}] max_removable_local_log_offset {} exceeds last uploaded to "
+          "cloud {}, clamping to {}",
+          p->ntp(),
+          max_removable_local_log_offset,
+          archival_safe_removable,
+          archival_safe_removable);
+        max_removable_local_log_offset = archival_safe_removable;
+    }
+
     vlog(
       clusterlog.info,
       "[{}] calculated retention offset: {}, last uploaded to cloud: {}, "
       "manifest clean offset: {}, max_removable_local_log_offset: {}",
       p->ntp(),
       *retention_offset,
-      p->archival_meta_stm()->manifest().get_last_offset(),
+      archival_safe_removable,
       p->archival_meta_stm()->get_last_clean_at(),
       max_removable_local_log_offset);
 
@@ -675,6 +735,8 @@ controller_backend::force_replica_set_update(
         // will be cleaned up as a part of update_finished command.
         co_return ss::stop_iteration::yes;
     }
+    auto [voters, learners] = split_voters_learners_for_force_reconfiguration(
+      previous_replicas, new_replicas, initial_replicas_revisions, cmd_rev);
     if (partition->cloud_data_available()) {
         auto last_cloud_offset
           = co_await partition->fetch_latest_cloud_offset_from_manifest(
@@ -690,7 +752,45 @@ controller_backend::force_replica_set_update(
               last_cloud_offset.error());
             co_return last_cloud_offset.error();
         }
-        if (last_cloud_offset.value() > partition->dirty_offset()) {
+
+        vlog(
+          clusterlog.info,
+          "[{}] force-update replica set - last cloud offset {}, dirty offset: "
+          "{}",
+          partition->ntp(),
+          last_cloud_offset.value(),
+          partition->dirty_offset());
+
+        /**
+         * This variable indicates whether the partition can be recovered
+         * by the leader.
+         *
+         * When force reconfiguring partition controller backend decides which
+         * of the new replicas should be added to the partition configuration as
+         * learners. The logic here is relatively simple: if a replica is
+         * already in the replica set (it is the disaster survivor), it is
+         * added to the replica set as a voter serving as a source of truth.
+         * Nodes that join the replica set are added to the configuration as
+         * learners in order to prevent them from reaching a majority and
+         * overcoming the current minority (the survivors).
+         *
+         * After establishing which replicas are learners vs voters the
+         * condition below decides if the survivor should be treated as a
+         * source of truth or if cloud data contains more up to date state.
+         *
+         * If replica dirty offset is greater than last cloud offset it means
+         * that the replica is more up to date, otherwise data in the bucket are
+         * newer and they should be used. This condition should only be verified
+         * if a node is not a learner and can not be recovered from the cloud.
+         * Otherwise all learners would face multiple deletions while being
+         * recovered by the leader as their dirty offset may be smaller than
+         * last cloud offset for a very long time.
+         *
+         */
+        const auto can_be_recovered_by_leader = contains_node(learners, _self);
+        if (
+          !can_be_recovered_by_leader
+          && last_cloud_offset.value() > partition->dirty_offset()) {
             vlog(
               clusterlog.info,
               "[{}] force-update replica set - last cloud offset {} is greater "
@@ -712,8 +812,6 @@ controller_backend::force_replica_set_update(
         }
     }
 
-    auto [voters, learners] = split_voters_learners_for_force_reconfiguration(
-      previous_replicas, new_replicas, initial_replicas_revisions, cmd_rev);
     vlog(
       clusterlog.debug,
       "[{}] force updating replica set with: [voters: {}, learners: {}]",
@@ -792,7 +890,7 @@ ss::future<> controller_backend::reconcile_ntp_fiber(
         }
 
         try {
-            auto sem_units = co_await ss::get_units(_reconciliation_sem, 1);
+            auto sem_units = co_await _reconciliation_sem.get_units(1);
             rs->last_retried_at = ss::lowres_clock::now();
             co_await try_reconcile_ntp(ntp, *rs);
             if (rs->is_reconciled()) {
@@ -1054,6 +1152,15 @@ ss::future<result<ss::stop_iteration>> controller_backend::reconcile_ntp_step(
         }
         co_return ss::stop_iteration::no;
     }
+    case shard_placement_table::reconciliation_action::remake: {
+        auto ec = co_await do_remake_partition(ntp);
+
+        if (ec) {
+            co_return ec;
+        }
+
+        co_return ss::stop_iteration::no;
+    }
     case shard_placement_table::reconciliation_action::create:
         // After this point the partition object is expected to exist on current
         // shard, it will be created below.
@@ -1121,6 +1228,20 @@ ss::future<result<ss::stop_iteration>> controller_backend::reconcile_ntp_step(
           topic_md->get());
         if (ec) {
             co_return ec;
+        }
+
+        if (
+          placement.current().has_value()
+          && placement.current()->remake_state
+               != shard_placement_table::remake_partition_state::none) {
+            ec = co_await _shard_placement.set_remake_state(
+              ntp,
+              shard_placement_table::remake_partition_state::none,
+              expected_log_revision.value());
+
+            if (ec) {
+                co_return ec;
+            }
         }
 
         // The partition that we just created uses topic properties queried from
@@ -1344,9 +1465,38 @@ ss::future<std::error_code> controller_backend::create_partition(
           log_revision,
           topic_rev,
           remote_rev);
+
+        if (
+          model::topic_namespace_view(ntp_config.ntp())
+          == model::kafka_consumer_offsets_nt) [[unlikely]] {
+            vassert(
+              ntp_config.has_overrides(),
+              "there must be an override for "
+              "__consumer_offsets topic");
+            auto cache_enabled
+              = config::shard_local_cfg()
+                  .consumer_offsets_topic_batch_cache_enabled();
+            ntp_config.get_overrides().cache_enabled = storage::with_cache(
+              config::shard_local_cfg()
+                .consumer_offsets_topic_batch_cache_enabled());
+            /**
+             * Log with an info level as this is not a common case, but
+             * rather an exception. The __consumer_offsets topic is
+             * created without batch cache enabled by default.
+             */
+            if (cache_enabled) {
+                vlog(
+                  clusterlog.info,
+                  "[{}] enabling batch cache for __consumer_offsets topic "
+                  "partition",
+                  ntp_config.ntp());
+            }
+        }
+
         auto rtp = cfg.properties.remote_topic_properties;
-        const bool is_cloud_topic = ntp_config.is_archival_enabled()
-                                    || ntp_config.is_remote_fetch_enabled();
+        const bool is_tiered_storage_topic
+          = ntp_config.is_archival_enabled()
+            || ntp_config.is_remote_fetch_enabled();
         const bool is_internal = ntp.ns == model::kafka_internal_namespace;
         /**
          * Here we decide if a partition needs recovery from tiered storage, it
@@ -1355,7 +1505,7 @@ ss::future<std::error_code> controller_backend::create_partition(
          * from the tiered storage.
          */
         if (
-          is_force_reconfigured && is_cloud_topic && !is_internal
+          is_force_reconfigured && is_tiered_storage_topic && !is_internal
           && !ntp_config.get_overrides().recovery_enabled) {
             // topic being cloud enabled implies existence of overrides
             ntp_config.get_overrides().recovery_enabled
@@ -1797,6 +1947,7 @@ ss::future<> controller_backend::transfer_partition_from_extra_shard(
               case reconciliation_action::create:
               case reconciliation_action::transfer:
               case reconciliation_action::wait_for_target_update:
+              case reconciliation_action::remake:
                   vassert(
                     false,
                     "[{}] unexpected reconciliation action, placement: {}",
@@ -2003,6 +2154,79 @@ std::ostream& operator<<(
       op.last_error,
       std::error_code{op.last_error}.message());
     return o;
+}
+
+ss::future<std::error_code>
+controller_backend::do_remake_partition(const model::ntp& ntp) {
+    auto maybe_placement = _shard_placement.state_on_this_shard(ntp);
+
+    if (!maybe_placement.has_value()) {
+        co_return errc::partition_not_exists;
+    }
+
+    auto& current = maybe_placement->current();
+
+    if (!current.has_value()) {
+        co_return errc::waiting_for_shard_placement_update;
+    }
+
+    if (
+      current->remake_state
+      == shard_placement_table::remake_partition_state::none) {
+        co_return errc::waiting_for_shard_placement_update;
+    }
+
+    if (
+      current->remake_state
+      < shard_placement_table::remake_partition_state::deleted) {
+        auto p = _partition_manager.local().get(ntp);
+        if (p) {
+            co_await _partition_manager.local().remove(
+              ntp, partition_removal_mode::local_only);
+        }
+
+        co_await remove_persistent_state(
+          ntp, current->group, _storage.local().kvs());
+    }
+
+    auto ec = co_await _shard_placement.set_remake_state(
+      ntp,
+      shard_placement_table::remake_partition_state::deleted,
+      current->log_revision);
+
+    if (ec) {
+        co_return ec;
+    }
+
+    co_return errc::success;
+}
+
+ss::future<std::error_code>
+controller_backend::remake_partition(const model::ntp& ntp) {
+    auto maybe_placement = _shard_placement.state_on_this_shard(ntp);
+
+    if (!maybe_placement.has_value()) {
+        co_return errc::partition_not_exists;
+    }
+
+    auto& current = maybe_placement->current();
+
+    if (!current.has_value()) {
+        co_return errc::waiting_for_shard_placement_update;
+    }
+
+    auto ec = co_await _shard_placement.set_remake_state(
+      ntp,
+      shard_placement_table::remake_partition_state::initiated,
+      current->log_revision);
+
+    if (ec) {
+        co_return ec;
+    }
+
+    notify_reconciliation(ntp);
+
+    co_return errc::success;
 }
 
 } // namespace cluster

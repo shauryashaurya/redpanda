@@ -22,6 +22,7 @@ redpanda_cc_btest(
     ],
     deps = [
         "//src/v/base",
+        "//src/v/cloud_io/tests:s3_imposter",
         "//src/v/cloud_storage_clients",
         "//src/v/test_utils:seastar_boost",
         "@boost//:test",
@@ -107,5 +108,23 @@ redpanda_cc_gtest(
         "//src/v/cloud_storage_clients",
         "//src/v/config",
         "//src/v/test_utils:gtest",
+    ],
+)
+
+redpanda_cc_btest(
+    name = "client_pool_mt_test",
+    timeout = "short",
+    srcs = [
+        "client_pool_mt_test.cc",
+    ],
+    cpu = 2,
+    deps = [
+        "//src/v/base",
+        "//src/v/cloud_storage_clients",
+        "//src/v/test_utils:seastar_boost",
+        "@boost//:range",
+        "@boost//:test",
+        "@seastar",
+        "@seastar//:testing",
     ],
 )

@@ -10,14 +10,13 @@
 
 #include "cloud_storage/segment_meta_cstore.h"
 
+#include "absl/container/btree_map.h"
 #include "cloud_storage/types.h"
 #include "config/configuration.h"
 #include "model/fundamental.h"
-#include "model/metadata.h"
 #include "model/timestamp.h"
 #include "utils/delta_for.h"
 
-#include <bitset>
 #include <exception>
 #include <functional>
 #include <limits>
@@ -557,8 +556,9 @@ public:
         auto maybe_hint = [&]() -> std::optional<hint_vec_t> {
             // escape hatch: disable the use of _hints if their value causes
             // std::out_of_bound exceptions.
-            if (unlikely(config::shard_local_cfg()
-                           .storage_ignore_cstore_hints.value())) {
+            if (unlikely(
+                  config::shard_local_cfg()
+                    .storage_ignore_cstore_hints.value())) {
                 return std::nullopt;
             }
 
@@ -1120,7 +1120,8 @@ bool segment_meta_cstore::operator==(const segment_meta_cstore& oth) const {
     if (size() != oth.size()) {
         return false;
     }
-    for (auto lhs = begin(), rhs = oth.begin(); lhs != end(); ++lhs, ++rhs) {
+    for (auto lhs = begin(), rhs = oth.begin(), e = end(); lhs != e;
+         ++lhs, ++rhs) {
         if (*lhs != *rhs) {
             return false;
         }

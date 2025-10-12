@@ -15,9 +15,8 @@ def data_dependency():
     http_archive(
         name = "ada",
         build_file = "//bazel/thirdparty:ada.BUILD",
-        sha256 = "8e222d536d237269488f7d454544eedf12847f47b3d42651e8c9963c3fb0cf5e",
-        strip_prefix = "ada-2.7.3",
-        url = "https://vectorized-public.s3.us-west-2.amazonaws.com/dependencies/ada-2.7.3.tar.gz",
+        sha256 = "bd89fcf57c93e965e6e2488448ab9d1cf8005311808c563b288f921d987e4924",
+        url = "https://vectorized-public.s3.us-west-2.amazonaws.com/dependencies/ada-3.2.4.single-header.zip",
     )
 
     http_archive(
@@ -68,6 +67,8 @@ def data_dependency():
         sha256 = "078ba32cd1198cbeb1903fbf4881d4960b226bdf8083d9f5a927b96f0aa8d6dd",
         strip_prefix = "jsoncons-ffd2540bc9cfb54c16ef4d29d80622605d8dfbe8",
         url = "https://github.com/danielaparker/jsoncons/archive/ffd2540bc9cfb54c16ef4d29d80622605d8dfbe8.tar.gz",
+        patches = ["//bazel/thirdparty:jsoncons-pr-603.patch"],
+        patch_args = ["-p1"],
     )
 
     http_archive(
@@ -91,17 +92,17 @@ def data_dependency():
     http_archive(
         name = "libprotobuf_mutator",
         build_file = "//bazel/thirdparty:libprotobuf-mutator.BUILD",
-        integrity = "sha256-KWUbFgNpDJtAO6Kr0eTo1v6iczEOta72jSle9oivFhg=",
-        strip_prefix = "libprotobuf-mutator-b922c8ab9004ef9944982e4f165e2747b13223fa",
-        url = "https://github.com/google/libprotobuf-mutator/archive/b922c8ab9004ef9944982e4f165e2747b13223fa.zip",
+        sha256 = "0847a2ee65552a92643131e934b50164e8b79fadc7be24b180a1c8d6dbb05952",
+        strip_prefix = "libprotobuf-mutator-dc4ced337a9fb4047e2dc727268fbac55ca82f73",
+        url = "https://github.com/google/libprotobuf-mutator/archive/dc4ced337a9fb4047e2dc727268fbac55ca82f73.zip",
     )
 
     http_archive(
         name = "libxml2",
         build_file = "//bazel/thirdparty:libxml2.BUILD",
-        sha256 = "cdf9f952582c32a00513468585fb517270047ac0cfaed013ef08aa7b775fd6b4",
-        strip_prefix = "libxml2-3b1742b8391e966be780bdc43fdf959f7b3a118c",
-        url = "https://github.com/GNOME/libxml2/archive/3b1742b8391e966be780bdc43fdf959f7b3a118c.tar.gz",
+        sha256 = "f52638e4d67135c49f676d1c8fcc4f9f35afb7ec9bfb4aee743e2e86d56e006b",
+        strip_prefix = "libxml2-2.14.5",
+        url = "https://vectorized-public.s3.us-west-2.amazonaws.com/dependencies/libxml2-v2.14.5.tar.gz",
     )
 
     http_archive(
@@ -129,9 +130,9 @@ def data_dependency():
     http_archive(
         name = "openssl",
         build_file = "//bazel/thirdparty:openssl.BUILD",
-        sha256 = "57e03c50feab5d31b152af2b764f10379aecd8ee92f16c985983ce4a99f7ef86",
-        strip_prefix = "openssl-3.0.16",
-        url = "https://github.com/openssl/openssl/releases/download/openssl-3.0.16/openssl-3.0.16.tar.gz",
+        sha256 = "d80c34f5cf902dccf1f1b5df5ebb86d0392e37049e5d73df1b3abae72e4ffe8b",
+        strip_prefix = "openssl-3.0.18",
+        url = "https://github.com/openssl/openssl/releases/download/openssl-3.0.18/openssl-3.0.18.tar.gz",
     )
 
     http_archive(
@@ -161,9 +162,9 @@ def data_dependency():
     http_archive(
         name = "seastar",
         build_file = "//bazel/thirdparty:seastar.BUILD",
-        integrity = "sha256-ttlG4lNYD9VNKzUeshYwvUm6LJWlRyryMsDQlZGowQA=",
-        strip_prefix = "seastar-398be413afad0b6fca48b5d781c9bd9bf10033ff",
-        url = "https://github.com/redpanda-data/seastar/archive/398be413afad0b6fca48b5d781c9bd9bf10033ff.tar.gz",
+        sha256 = "0c87b316697c9722c28f1826bb2f37f4fe7391cc8422193122ed2d9ab3beff16",
+        strip_prefix = "seastar-28a0d0062a3c1f4889cc2e074ce413d6d4e010a4",
+        url = "https://github.com/redpanda-data/seastar/archive/28a0d0062a3c1f4889cc2e074ce413d6d4e010a4.tar.gz",
     )
 
     http_archive(
